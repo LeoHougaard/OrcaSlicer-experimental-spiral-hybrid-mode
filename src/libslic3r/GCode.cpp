@@ -2467,7 +2467,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     //m_volumetric_speed = DoExport::autospeed_volumetric_limit(print);
     print.throw_if_canceled();
 
-    if (print.config().spiral_mode.value)
+    if (print.config().spiral_mode.value && !print.config().spiral_hybrid_non_crossing.value)
         m_spiral_vase = make_unique<SpiralVase>(print.config());
 
     if (print.config().max_volumetric_extrusion_rate_slope.value > 0){

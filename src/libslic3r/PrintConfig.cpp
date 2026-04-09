@@ -413,6 +413,12 @@ static const t_config_enum_values s_keys_map_TimelapseType = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(TimelapseType)
 
+static const t_config_enum_values s_keys_map_SpiralHybridFlowMode = {
+    {"adaptive", int(SpiralHybridFlowMode::Adaptive)},
+    {"constant", int(SpiralHybridFlowMode::Constant)}
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(SpiralHybridFlowMode)
+
 static const t_config_enum_values s_keys_map_SkirtType = {
     { "combined", stCombined },
     { "perobject", stPerObject }
@@ -5375,6 +5381,33 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloatOrPercent(200, true));
 
+    def = this->add("spiral_hybrid_non_crossing", coBool);
+    def->label = L("Spiral hybrid non-crossing");
+    def->tooltip = L("Experimental: Keep spiral-style continuous motion while allowing walls and infill. "
+                     "When enabled, OrcaSlicer avoids crossing walls aggressively and can carve out interior area before infill.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("spiral_hybrid_interior_clearance", coFloat);
+    def->label = L("Spiral hybrid interior clearance");
+    def->tooltip = L("Experimental: Amount of interior clearance removed from each layer before infill in spiral hybrid mode.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.2));
+
+    def = this->add("spiral_hybrid_flow_mode", coEnum);
+    def->label = L("Spiral hybrid flow mode");
+    def->tooltip = L("Controls extrusion behavior in spiral hybrid mode. Adaptive transitions flow in/out across loops; Constant keeps uniform flow.");
+    def->enum_keys_map = &ConfigOptionEnum<SpiralHybridFlowMode>::get_enum_values();
+    def->enum_values.emplace_back("adaptive");
+    def->enum_values.emplace_back("constant");
+    def->enum_labels.emplace_back(L("Adaptive"));
+    def->enum_labels.emplace_back(L("Constant"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<SpiralHybridFlowMode>(SpiralHybridFlowMode::Adaptive));
+
     def = this->add("spiral_starting_flow_ratio", coFloat);
     def->label = L("Spiral starting flow ratio");
     // xgettext:no-c-format, no-boost-format
@@ -7967,6 +8000,7 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
         this->option("solid_infill_filament", true)->setInt(this->option("sparse_infill_filament")->getInt());
 
     if (this->has("spiral_mode") && this->opt<ConfigOptionBool>("spiral_mode", true)->value) {
+        const bool spiral_hybrid_non_crossing = this->opt<ConfigOptionBool>("spiral_hybrid_non_crossing", true)->value;
         {
             // this should be actually done only on the spiral layers instead of all
             auto* opt = this->opt<ConfigOptionBools>("retract_when_changing_layer", true);
@@ -7975,11 +8009,20 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
             auto* opt_n = this->opt<ConfigOptionBoolsNullable>("filament_retract_when_changing_layer", true);
             opt_n->values.assign(opt_n->values.size(), false);  // Set all values to false.
         }
-        {
+        if (!spiral_hybrid_non_crossing) {
             this->opt<ConfigOptionInt>("wall_loops", true)->value       = 1;
             this->opt<ConfigOptionBool>("alternate_extra_wall", true)->value = false;
             this->opt<ConfigOptionInt>("top_shell_layers", true)->value = 0;
             this->opt<ConfigOptionPercent>("sparse_infill_density", true)->value = 0;
+        } else {
+            this->opt<ConfigOptionBool>("reduce_crossing_wall", true)->value = true;
+            const double interior_clearance = this->opt<ConfigOptionFloat>("spiral_hybrid_interior_clearance", true)->value;
+            if (interior_clearance > 0.0) {
+                this->opt<ConfigOptionPercent>("infill_wall_overlap", true)->value = 0;
+                this->opt<ConfigOptionPercent>("top_bottom_infill_wall_overlap", true)->value = 0;
+                auto *gap_filter = this->opt<ConfigOptionFloat>("filter_out_gap_fill", true);
+                gap_filter->value = std::max(gap_filter->value, interior_clearance);
+            }
         }
     }
 
@@ -8040,6 +8083,7 @@ void DynamicPrintConfig::normalize_fdm_1()
         this->option("solid_infill_filament", true)->setInt(this->option("sparse_infill_filament")->getInt());
 
     if (this->has("spiral_mode") && this->opt<ConfigOptionBool>("spiral_mode", true)->value) {
+        const bool spiral_hybrid_non_crossing = this->opt<ConfigOptionBool>("spiral_hybrid_non_crossing", true)->value;
         {
             // this should be actually done only on the spiral layers instead of all
             auto* opt = this->opt<ConfigOptionBools>("retract_when_changing_layer", true);
@@ -8048,11 +8092,20 @@ void DynamicPrintConfig::normalize_fdm_1()
             auto* opt_n = this->opt<ConfigOptionBoolsNullable>("filament_retract_when_changing_layer", true);
             opt_n->values.assign(opt_n->values.size(), false);  // Set all values to false.
         }
-        {
+        if (!spiral_hybrid_non_crossing) {
             this->opt<ConfigOptionInt>("wall_loops", true)->value       = 1;
             this->opt<ConfigOptionBool>("alternate_extra_wall", true)->value = false;
             this->opt<ConfigOptionInt>("top_shell_layers", true)->value = 0;
             this->opt<ConfigOptionPercent>("sparse_infill_density", true)->value = 0;
+        } else {
+            this->opt<ConfigOptionBool>("reduce_crossing_wall", true)->value = true;
+            const double interior_clearance = this->opt<ConfigOptionFloat>("spiral_hybrid_interior_clearance", true)->value;
+            if (interior_clearance > 0.0) {
+                this->opt<ConfigOptionPercent>("infill_wall_overlap", true)->value = 0;
+                this->opt<ConfigOptionPercent>("top_bottom_infill_wall_overlap", true)->value = 0;
+                auto *gap_filter = this->opt<ConfigOptionFloat>("filter_out_gap_fill", true);
+                gap_filter->value = std::max(gap_filter->value, interior_clearance);
+            }
         }
     }
 
@@ -9723,21 +9776,23 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
 
     // --spiral-vase
     //for non-cli case, we will popup dialog for spiral mode correction
+    const ConfigOptionBool *spiral_hybrid_non_crossing_opt = cfg.option<ConfigOptionBool>("spiral_hybrid_non_crossing");
+    const bool              spiral_hybrid_non_crossing = spiral_hybrid_non_crossing_opt != nullptr && spiral_hybrid_non_crossing_opt->value;
     if (cfg.spiral_mode && under_cli) {
         // Note that we might want to have more than one perimeter on the bottom
         // solid layers.
-        if (cfg.wall_loops != 1) {
+        if (!spiral_hybrid_non_crossing && cfg.wall_loops != 1) {
             error_message.emplace("wall_loops", L("Invalid value when spiral vase mode is enabled: ") + std::to_string(cfg.wall_loops));
             //return "Can't make more than one perimeter when spiral vase mode is enabled";
             //return "Can't make less than one perimeter when spiral vase mode is enabled";
         }
 
-        if (cfg.sparse_infill_density > 0) {
+        if (!spiral_hybrid_non_crossing && cfg.sparse_infill_density > 0) {
             error_message.emplace("sparse_infill_density", L("Invalid value when spiral vase mode is enabled: ") + std::to_string(cfg.sparse_infill_density));
             //return "Spiral vase mode can only print hollow objects, so you need to set Fill density to 0";
         }
 
-        if (cfg.top_shell_layers > 0) {
+        if (!spiral_hybrid_non_crossing && cfg.top_shell_layers > 0) {
             error_message.emplace("top_shell_layers", L("Invalid value when spiral vase mode is enabled: ") + std::to_string(cfg.top_shell_layers));
             //return "Spiral vase mode is not compatible with top solid layers";
         }

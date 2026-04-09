@@ -369,6 +369,10 @@ void PartPlate::set_spiral_vase_mode(bool spiral_mode, bool as_global)
 	if (as_global)
 		m_config.erase(key);
 	else {
+        const DynamicPrintConfig &global_print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+        const bool hybrid_non_crossing = m_config.has("spiral_hybrid_non_crossing") ?
+            m_config.opt_bool("spiral_hybrid_non_crossing") :
+            (global_print_config.has("spiral_hybrid_non_crossing") && global_print_config.opt_bool("spiral_hybrid_non_crossing"));
 		if (spiral_mode) {
 			if (get_spiral_vase_mode())
 				return;
@@ -376,7 +380,8 @@ void PartPlate::set_spiral_vase_mode(bool spiral_mode, bool as_global)
 			auto answer = static_cast<TabPrintPlate*>(wxGetApp().plate_tab)->show_spiral_mode_settings_dialog(false);
 			if (answer == wxID_YES) {
 				m_config.set_key_value(key, new ConfigOptionBool(true));
-				set_vase_mode_related_object_config();
+                if (!hybrid_non_crossing)
+				    set_vase_mode_related_object_config();
 			}
 		}
 		else
@@ -4986,8 +4991,12 @@ int PartPlateList::notify_instance_update(int obj_id, int instance_id, bool is_n
 			//found a new plate, add it to plate
 			plate->add_instance(obj_id, instance_id, false, &boundingbox);
 
+            const DynamicPrintConfig &global_print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+            const bool plate_hybrid_non_crossing = plate->config()->has("spiral_hybrid_non_crossing") ?
+                plate->config()->opt_bool("spiral_hybrid_non_crossing") :
+                (global_print_config.has("spiral_hybrid_non_crossing") && global_print_config.opt_bool("spiral_hybrid_non_crossing"));
 			// spiral mode, update object setting
-			if (plate->config()->has("spiral_mode") && plate->config()->opt_bool("spiral_mode") && !is_object_config_compatible_with_spiral_vase(object)) {
+			if (plate->config()->has("spiral_mode") && plate->config()->opt_bool("spiral_mode") && !plate_hybrid_non_crossing && !is_object_config_compatible_with_spiral_vase(object)) {
 				if (!is_new) {
 					auto answer = static_cast<TabPrintPlate*>(wxGetApp().plate_tab)->show_spiral_mode_settings_dialog(true);
 					if (answer == wxID_YES) {

@@ -165,7 +165,7 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                 params.extra_offset = extra_offset;
             if (layer_ranges.size() == 1) {
                 if (const PrintObjectRegions::LayerRangeRegions &layer_range = layer_ranges.front(); layer_range.has_volume(model_volume->id())) {
-                    if (model_volume->is_model_part() && print_config.spiral_mode) {
+                    if (model_volume->is_model_part() && print_config.spiral_mode && !print_config.spiral_hybrid_non_crossing) {
                         auto it = std::find_if(layer_range.volume_regions.begin(), layer_range.volume_regions.end(),
                             [model_volume](const auto &slice){ return model_volume == slice.model_volume; });
                         params.mode = MeshSlicingParams::SlicingMode::PositiveLargestContour;

@@ -77,7 +77,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     const PrintRegionConfig &region_config = this->region().config();
     const PrintObjectConfig& object_config = this->layer()->object()->config();
     // This needs to be in sync with PrintObject::_slice() slicing_mode_normal_below_layer!
-    bool spiral_mode = print_config.spiral_mode &&
+    const bool classic_spiral_mode = print_config.spiral_mode && !print_config.spiral_hybrid_non_crossing &&
         //FIXME account for raft layers.
         (this->layer()->id() >= size_t(region_config.bottom_shell_layers.value) &&
          this->layer()->print_z >= region_config.bottom_shell_thickness - EPSILON);
@@ -92,7 +92,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         &region_config,
         &this->layer()->object()->config(),
         &print_config,
-        spiral_mode,
+        classic_spiral_mode,
         
         // output:
         &this->perimeters,
@@ -117,7 +117,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
 
-    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
+    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !classic_spiral_mode)
         g.process_arachne();
     else
         g.process_classic();
@@ -545,7 +545,7 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     Surfaces tops = expand_merge_surfaces(this->fill_surfaces.surfaces, stTop, expansion_zones, closing_radius);
 
     // turn too small internal regions into solid regions according to the user setting
-    if (!this->layer()->object()->print()->config().spiral_mode && this->region().config().sparse_infill_density.value > 0) {
+    if ((!this->layer()->object()->print()->config().spiral_mode || this->layer()->object()->print()->config().spiral_hybrid_non_crossing) && this->region().config().sparse_infill_density.value > 0) {
         // scaling an area requires two calls!
         double min_area = scale_(scale_(this->region().config().minimum_sparse_infill_area.value));
         ExPolygons small_regions{};
@@ -895,10 +895,11 @@ void LayerRegion::prepare_fill_surfaces()
         alter fill_surfaces boundaries on which our idempotency relies since that's
         the only meaningful information returned by psPerimeters. */
     
-    bool spiral_mode = this->layer()->object()->print()->config().spiral_mode;
+    const bool classic_spiral_mode = this->layer()->object()->print()->config().spiral_mode &&
+        !this->layer()->object()->print()->config().spiral_hybrid_non_crossing;
 
     // if no solid layers are requested, turn top/bottom surfaces to internal
-    if (! spiral_mode && this->region().config().top_shell_layers == 0) {
+    if (! classic_spiral_mode && this->region().config().top_shell_layers == 0) {
         for (Surface &surface : this->fill_surfaces.surfaces)
             if (surface.is_top())
                 //BBS
@@ -911,7 +912,7 @@ void LayerRegion::prepare_fill_surfaces()
                 surface.surface_type = stInternal;
     }
 
-    if (!spiral_mode && fabs(this->region().config().sparse_infill_density.value - 100.) < EPSILON) {
+    if (!classic_spiral_mode && fabs(this->region().config().sparse_infill_density.value - 100.) < EPSILON) {
         // Turn all internal sparse infill into solid infill, if sparse_infill_density is 100%
         for (Surface &surface : this->fill_surfaces.surfaces)
             if (surface.surface_type == stInternal)

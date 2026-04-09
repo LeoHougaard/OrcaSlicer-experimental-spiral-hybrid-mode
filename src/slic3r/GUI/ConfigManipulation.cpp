@@ -317,9 +317,13 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     double sparse_infill_density = config->option<ConfigOptionPercent>("sparse_infill_density")->value;
     int    fill_multiline        = config->option<ConfigOptionInt>("fill_multiline")->value;
     auto timelapse_type = config->opt_enum<TimelapseType>("timelapse_type");
+    const bool spiral_hybrid_non_crossing =
+        config->option<ConfigOptionBool>("spiral_hybrid_non_crossing") != nullptr &&
+        config->option<ConfigOptionBool>("spiral_hybrid_non_crossing")->value;
 
     if (!is_plate_config &&
         config->opt_bool("spiral_mode") &&
+        !spiral_hybrid_non_crossing &&
         ! (config->opt_int("wall_loops") == 1 &&
            config->opt_int("top_shell_layers") == 0 &&
            sparse_infill_density == 0 &&
@@ -640,10 +644,20 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     toggle_line("symmetric_infill_y_axis", is_zig_zag || is_cross_zag || is_locked_zig);
 
     bool has_spiral_vase         = config->opt_bool("spiral_mode");
+    // spiral_hybrid_* may be absent from a DynamicPrintConfig until merged with defaults; opt_bool/opt_enum dereference nullptr.
+    const ConfigOptionBool *spiral_hybrid_non_crossing_opt = config->option<ConfigOptionBool>("spiral_hybrid_non_crossing");
+    bool hybrid_non_crossing     = has_spiral_vase && spiral_hybrid_non_crossing_opt != nullptr && spiral_hybrid_non_crossing_opt->value;
+    const ConfigOptionEnum<SpiralHybridFlowMode> *spiral_hybrid_flow_mode_opt =
+        config->option<ConfigOptionEnum<SpiralHybridFlowMode>>("spiral_hybrid_flow_mode");
+    bool adaptive_hybrid_flow =
+        !hybrid_non_crossing || spiral_hybrid_flow_mode_opt == nullptr || spiral_hybrid_flow_mode_opt->value == SpiralHybridFlowMode::Adaptive;
     toggle_line("spiral_mode_smooth", has_spiral_vase);
     toggle_line("spiral_mode_max_xy_smoothing", has_spiral_vase && config->opt_bool("spiral_mode_smooth"));
-    toggle_line("spiral_starting_flow_ratio", has_spiral_vase);
-    toggle_line("spiral_finishing_flow_ratio", has_spiral_vase);
+    toggle_line("spiral_hybrid_non_crossing", has_spiral_vase);
+    toggle_line("spiral_hybrid_interior_clearance", hybrid_non_crossing);
+    toggle_line("spiral_hybrid_flow_mode", hybrid_non_crossing);
+    toggle_line("spiral_starting_flow_ratio", has_spiral_vase && adaptive_hybrid_flow);
+    toggle_line("spiral_finishing_flow_ratio", has_spiral_vase && adaptive_hybrid_flow);
     bool has_top_shell    = config->opt_int("top_shell_layers") > 0 || (has_spiral_vase && config->opt_int("bottom_shell_layers") > 1);
     bool has_bottom_shell = config->opt_int("bottom_shell_layers") > 0;
     bool has_solid_infill = has_top_shell || has_bottom_shell;

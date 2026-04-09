@@ -1018,6 +1018,10 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
 	case coPercents:
 	case coFloats:
 	case coFloat:{
+        if (!config.has(opt_key)) {
+            ret = double_to_string(opt->default_value->getFloat());
+            break;
+        }
         if (opt_key == "extruder_printable_height") {
             auto opt_values = dynamic_cast<const ConfigOptionFloatsNullable *>(config.option(opt_key))->values;
             if (!opt_values.empty()) {
@@ -1055,10 +1059,16 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
 			ret = from_u8(config.opt_string(opt_key, static_cast<unsigned int>(idx)));
 		break;
 	case coBool:
-		ret = config.opt_bool(opt_key);
+        if (!config.has(opt_key))
+            ret = opt->default_value->getBool();
+        else
+            ret = config.opt_bool(opt_key);
 		break;
 	case coBools:
-		ret = config.opt_bool(opt_key, idx);
+        if (!config.has(opt_key))
+            ret = static_cast<unsigned char>(opt->default_value->getBool());
+        else
+            ret = config.opt_bool(opt_key, idx);
 		break;
 	case coInt:
 		ret = config.opt_int(opt_key);
@@ -1083,7 +1093,10 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
             ret = global_cfg.option("curr_bed_type")->getInt();
             break;
         }
-        ret = config.option(opt_key)->getInt();
+        if (!config.has(opt_key))
+            ret = opt->default_value->getInt();
+        else
+            ret = config.option(opt_key)->getInt();
         break;
     // BBS
     case coEnums:
@@ -1209,10 +1222,16 @@ boost::any ConfigOptionsGroup::get_config_value2(const DynamicPrintConfig& confi
             ret = config.opt_string(opt_key, static_cast<unsigned int>(idx));
         break;
     case coBool:
-        ret = config.opt_bool(opt_key);
+        if (!config.has(opt_key))
+            ret = opt->default_value->getBool();
+        else
+            ret = config.opt_bool(opt_key);
         break;
     case coBools:
-        ret = static_cast<unsigned char>(config.opt_bool(opt_key, idx));
+        if (!config.has(opt_key))
+            ret = static_cast<unsigned char>(opt->default_value->getBool());
+        else
+            ret = static_cast<unsigned char>(config.opt_bool(opt_key, idx));
         break;
     case coInt:
         ret = config.opt_int(opt_key);
@@ -1221,7 +1240,10 @@ boost::any ConfigOptionsGroup::get_config_value2(const DynamicPrintConfig& confi
         ret = config.opt_int(opt_key, idx);
         break;
     case coEnum:
-        ret = config.option(opt_key)->getInt();
+        if (!config.has(opt_key))
+            ret = opt->default_value->getInt();
+        else
+            ret = config.option(opt_key)->getInt();
         break;
     case coEnums:
         ret = config.opt_int(opt_key, idx);

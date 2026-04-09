@@ -2668,6 +2668,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("spiral_mode", "others_settings_special_mode#spiral-vase");
         optgroup->append_single_option_line("spiral_mode_smooth", "others_settings_special_mode#smooth-spiral");
         optgroup->append_single_option_line("spiral_mode_max_xy_smoothing", "others_settings_special_mode#max-xy-smoothing");
+        optgroup->append_single_option_line("spiral_hybrid_non_crossing");
+        optgroup->append_single_option_line("spiral_hybrid_interior_clearance");
+        optgroup->append_single_option_line("spiral_hybrid_flow_mode");
         optgroup->append_single_option_line("spiral_starting_flow_ratio", "others_settings_special_mode#spiral-starting-flow-ratio");
         optgroup->append_single_option_line("spiral_finishing_flow_ratio", "others_settings_special_mode#spiral-finishing-flow-ratio");
 

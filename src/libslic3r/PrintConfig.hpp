@@ -271,6 +271,11 @@ enum TimelapseType : int {
     tlSmooth
 };
 
+enum class SpiralHybridFlowMode : int {
+    Adaptive = 0,
+    Constant
+};
+
 enum SkirtType {
     stCombined, stPerObject
 };
@@ -1494,6 +1499,9 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionBool,               spiral_mode))
     ((ConfigOptionBool,               spiral_mode_smooth))
     ((ConfigOptionFloatOrPercent,     spiral_mode_max_xy_smoothing))
+    ((ConfigOptionBool,               spiral_hybrid_non_crossing))
+    ((ConfigOptionFloat,              spiral_hybrid_interior_clearance))
+    ((ConfigOptionEnum<SpiralHybridFlowMode>, spiral_hybrid_flow_mode))
     ((ConfigOptionFloat,              spiral_finishing_flow_ratio))
     ((ConfigOptionFloat,              spiral_starting_flow_ratio))
     ((ConfigOptionInt,                standby_temperature_delta))

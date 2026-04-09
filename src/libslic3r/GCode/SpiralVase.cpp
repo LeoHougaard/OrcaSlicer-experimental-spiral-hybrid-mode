@@ -121,6 +121,10 @@ std::string SpiralVase::process_layer(const std::string &gcode, bool last_layer)
     // layer.
     bool  transition_in = m_transition_layer && m_config.use_relative_e_distances.value;
     bool  transition_out = last_layer && m_config.use_relative_e_distances.value;
+    if (m_constant_flow) {
+        transition_in = false;
+        transition_out = false;
+    }
 
     float starting_flowrate  = float(m_config.spiral_starting_flow_ratio.value);
     float finishing_flowrate = float(m_config.spiral_finishing_flow_ratio.value);
