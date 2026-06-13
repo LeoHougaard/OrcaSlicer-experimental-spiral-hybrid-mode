@@ -1,6 +1,10 @@
 # Experimental Continuous Slicing Mode
 
-This branch adds an experimental continuous-style slicing workflow on top of OrcaSlicer's existing **Spiral vase** setting. It is intended for parts where classic vase mode is too restrictive, but where you still want slicer behavior that avoids disruptive wall crossings as much as possible.
+This documentation describes a fork-specific feature, not standard upstream OrcaSlicer behavior.
+
+This fork adds a new **continuous extrusion slicing mode** on top of OrcaSlicer's existing **Spiral vase** setting. The mode is still highly experimental. It is intended for parts where classic vase mode is too restrictive, but where you still want slicer behavior that avoids disruptive wall crossings as much as possible.
+
+Do not assume this mode produces true vase-mode output or production-ready continuous extrusion G-code. Always inspect the generated toolpath in preview before printing.
 
 In the UI, enable **Spiral vase** first, then enable **Spiral hybrid non-crossing** in the advanced print settings.
 
@@ -71,7 +75,7 @@ Then tune walls, top shells, and sparse infill as needed for the part.
 
 ## Known Limitations
 
-This mode is experimental. Preview the generated toolpath before printing.
+This mode is highly experimental and fork-specific. Preview the generated toolpath before printing, and expect behavior to change as the implementation evolves.
 
 - It is not the same as classic single-wall vase mode.
 - The hybrid path currently bypasses the classic SpiralVase G-code post-processor.

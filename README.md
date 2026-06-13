@@ -42,10 +42,17 @@ If you come across any of these in search results, please <b>report them</b> as 
 
 </div>
 
+# Fork notice
+
+This repository is a fork of upstream [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer). The main fork-specific change is a new **experimental continuous extrusion slicing mode** built around the Spiral vase workflow.
+
+> [!CAUTION]
+> The continuous extrusion slicing mode is still highly experimental. Generated G-code must be previewed carefully before printing, and this mode should not be treated as equivalent to upstream OrcaSlicer behavior.
+
 # Main features
 
 - **[Experimental Continuous Slicing Mode](docs/continuous-slicing-mode.md)**  
-  This fork adds a Spiral vase hybrid mode that permits walls, top shells, and sparse infill while prioritizing non-crossing continuous-style toolpaths.
+  This fork introduces a highly experimental continuous extrusion slicing mode. It adds a Spiral vase hybrid mode that permits walls, top shells, and sparse infill while prioritizing non-crossing, continuous-style toolpaths.
 - **[Advanced Calibration Tools](https://www.orcaslicer.com/wiki/Calibration)**  
   Comprehensive suite: temperature towers, flow rate, retraction & more for optimal performance.
 - **[Precise Wall](https://www.orcaslicer.com/wiki/quality_settings_precision#precise-wall) and [Seam Control](https://www.orcaslicer.com/wiki/quality_settings_seam)**  
