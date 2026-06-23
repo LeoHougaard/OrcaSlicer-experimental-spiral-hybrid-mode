@@ -448,6 +448,40 @@ Points resample_closed_loop(const Points &points, const double target_step)
     return out;
 }
 
+Points densify_closed_loop_preserving_vertices(const Points &points, const double max_step)
+{
+    if (points.size() < 2)
+        return points;
+
+    Points simplified;
+    simplified.reserve(points.size());
+    const double collinear_tolerance = std::max(max_step * 0.002, 1.0);
+    for (size_t i = 0; i < points.size(); ++i) {
+        const Point &prev = points[(i + points.size() - 1) % points.size()];
+        const Point &point = points[i];
+        const Point &next = points[(i + 1) % points.size()];
+        if (point_distance(prev, next) > EPS && point_segment_distance(point, prev, next) <= collinear_tolerance)
+            continue;
+        simplified.emplace_back(point);
+    }
+    const Points &source = simplified.size() >= 3 ? simplified : points;
+
+    Points out;
+    out.reserve(source.size());
+    for (size_t i = 0; i < source.size(); ++i) {
+        const Point &a = source[i];
+        const Point &b = source[(i + 1) % source.size()];
+        append_point(out, a);
+
+        const double length = point_distance(a, b);
+        const size_t parts = size_t(std::ceil(length / std::max(max_step, EPS)));
+        for (size_t part = 1; part < parts; ++part)
+            append_point(out, lerp_point(a, b, double(part) / double(parts)));
+    }
+
+    return out;
+}
+
 std::map<size_t, std::vector<ContourLoop>> loops_by_level(const std::vector<ContourLoop> &contours)
 {
     std::map<size_t, std::vector<ContourLoop>> grouped;
@@ -476,20 +510,31 @@ std::vector<ContourLoop> filter_ring_medial_overlap(const std::vector<ContourLoo
     return stable.empty() ? contours : stable;
 }
 
-std::vector<ContourLoop> generate_offset_contours(const ExPolygons &printable_area, const Flow &flow)
+std::vector<ContourLoop> generate_offset_contours(
+    const ExPolygons &printable_area,
+    const double line_width,
+    const double spacing,
+    const size_t precise_wall_levels)
 {
-    const double spacing = double(flow.scaled_spacing());
-    const double first_offset = double(flow.scaled_width()) * 0.5;
+    const double first_offset = line_width * 0.5;
     const double min_area = spacing * spacing * 8.0;
     const double min_length = spacing * 5.0;
 
     std::vector<ContourLoop> contours;
     ExPolygons source = union_ex(printable_area);
+    ExPolygons incremental_source;
     for (size_t level = 0; level < 512; ++level) {
         const double offset = first_offset + double(level) * spacing;
-        ExPolygons inset = offset_ex(source, float(-offset), ClipperLib::jtMiter, 3.0);
+        ExPolygons inset;
+        if (level <= precise_wall_levels) {
+            inset = offset_ex(source, float(-offset), ClipperLib::jtMiter, 3.0);
+        } else {
+            inset = offset_ex(incremental_source, float(-spacing), ClipperLib::jtMiter, 3.0);
+        }
         if (inset.empty())
             break;
+        if (level >= precise_wall_levels)
+            incremental_source = inset;
 
         for (const ExPolygon &expoly : inset) {
             auto add_polygon = [&](const Polygon &polygon) {
@@ -497,7 +542,9 @@ std::vector<ContourLoop> generate_offset_contours(const ExPolygons &printable_ar
                     return;
                 ContourLoop loop;
                 loop.level_index = level;
-                loop.points = resample_closed_loop(polygon.points, std::max(spacing * 0.45, 1.0));
+                loop.points = level < precise_wall_levels ?
+                    densify_closed_loop_preserving_vertices(polygon.points, std::max(spacing * 0.25, 1.0)) :
+                    resample_closed_loop(polygon.points, std::max(spacing * 0.65, 1.0));
                 loop.area = std::abs(double(polygon.area()));
                 loop.length = polyline_length(loop.points, true);
                 loop.centroid = polygon_centroid_or_first(loop.points);
@@ -520,6 +567,11 @@ std::vector<ContourLoop> generate_offset_contours(const ExPolygons &printable_ar
     }
 
     return contours;
+}
+
+std::vector<ContourLoop> generate_offset_contours(const ExPolygons &printable_area, const Flow &flow)
+{
+    return generate_offset_contours(printable_area, double(flow.scaled_width()), double(flow.scaled_spacing()), 3);
 }
 
 std::vector<ContourLoop> ordered_loops_for_spiral(const std::vector<ContourLoop> &contours)
@@ -892,41 +944,38 @@ PairMetrics path_pair_metrics(const Points &path, const double spacing)
         const long long bx1 = (long long)std::floor(max_x / bin_size);
         const long long by1 = (long long)std::floor(max_y / bin_size);
 
-        std::vector<size_t> candidates;
         for (long long by = by0; by <= by1; ++by)
             for (long long bx = bx0; bx <= bx1; ++bx)
-                if (auto it = bins.find((bx << 32) ^ (by & 0xffffffffLL)); it != bins.end())
-                    candidates.insert(candidates.end(), it->second.begin(), it->second.end());
-        std::sort(candidates.begin(), candidates.end());
-        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+                if (auto it = bins.find((bx << 32) ^ (by & 0xffffffffLL)); it != bins.end()) {
+                    for (const size_t j : it->second) {
+                        if (j <= i)
+                            continue;
+                        const unsigned long long pair_key = (unsigned long long(i) << 32) ^ unsigned(j);
+                        if (!checked.insert(pair_key).second)
+                            continue;
 
-        for (const size_t j : candidates) {
-            if (j <= i)
-                continue;
-            size_t index_distance = j - i;
-            if (closed_path)
-                index_distance = std::min(index_distance, segments.size() - index_distance);
-            if (index_distance <= 6)
-                continue;
+                        size_t index_distance = j - i;
+                        if (closed_path)
+                            index_distance = std::min(index_distance, segments.size() - index_distance);
+                        if (index_distance <= 6)
+                            continue;
 
-            double path_gap = std::max(0.0, prefix[j] - prefix[i + 1]);
-            if (closed_path) {
-                const double occupied_span = prefix[j + 1] - prefix[i];
-                path_gap = std::min(path_gap, std::max(0.0, path_length - occupied_span));
-            }
-            if (path_gap <= local_skip_distance)
-                continue;
-            const unsigned long long pair_key = (unsigned long long(i) << 32) ^ unsigned(j);
-            if (!checked.insert(pair_key).second)
-                continue;
+                        double path_gap = std::max(0.0, prefix[j] - prefix[i + 1]);
+                        if (closed_path) {
+                            const double occupied_span = prefix[j + 1] - prefix[i];
+                            path_gap = std::min(path_gap, std::max(0.0, path_length - occupied_span));
+                        }
+                        if (path_gap <= local_skip_distance)
+                            continue;
 
-            const double d = segment_distance(seg.a, seg.b, segments[j].a, segments[j].b);
-            metrics.min_spacing = std::min(metrics.min_spacing, d);
-            if (d <= 1e-7)
-                ++metrics.crossings;
-            else if (d < min_allowed)
-                ++metrics.close_pairs;
-        }
+                        const double d = segment_distance(seg.a, seg.b, segments[j].a, segments[j].b);
+                        metrics.min_spacing = std::min(metrics.min_spacing, d);
+                        if (d <= 1e-7)
+                            ++metrics.crossings;
+                        else if (d < min_allowed)
+                            ++metrics.close_pairs;
+                    }
+                }
     }
 
     return metrics;
@@ -1579,40 +1628,41 @@ Points try_insert_pocket_group(
     }
 
     const std::vector<ContourLoop> ordered = ordered_loops_for_spiral(group);
-    const double half_width = spacing * 1.35;
-    for (double center_index : unique_port_candidates(std::move(port_candidates), 2)) {
+    const std::vector<double> half_widths { spacing * 1.35, spacing * 2.25, spacing * 3.25 };
+    for (double center_index : unique_port_candidates(std::move(port_candidates), 6)) {
         center_index = std::clamp(center_index, 3.0, double(parent_path.size() - 4));
         const double center_length = open_path_length_at_index(parent_path, prefix, center_index);
-        const double left_index = open_path_index_at_length(parent_path, prefix, center_length - half_width);
-        const double right_index = open_path_index_at_length(parent_path, prefix, center_length + half_width);
-        const Point left_port = open_path_point_at_index(parent_path, left_index);
-        const Point right_port = open_path_point_at_index(parent_path, right_index);
-        if (point_distance(left_port, right_port) < spacing * 0.5)
-            continue;
+        for (const double half_width : half_widths) {
+            const double left_index = open_path_index_at_length(parent_path, prefix, center_length - half_width);
+            const double right_index = open_path_index_at_length(parent_path, prefix, center_length + half_width);
+            const Point left_port = open_path_point_at_index(parent_path, left_index);
+            const Point right_port = open_path_point_at_index(parent_path, right_index);
+            if (point_distance(left_port, right_port) < spacing * 0.5)
+                continue;
 
-        for (const bool reverse_anchors : { false, true }) {
-            const Point &start_anchor = reverse_anchors ? right_port : left_port;
-            const Point &exit_anchor = reverse_anchors ? left_port : right_port;
-            Points child_path = build_single_minimum_connected_fermat(
-                ordered, start_anchor, spacing, exit_anchor, true);
+            for (const bool reverse_anchors : { false, true }) {
+                const Point &start_anchor = reverse_anchors ? right_port : left_port;
+                const Point &exit_anchor = reverse_anchors ? left_port : right_port;
+                Points child_path = build_single_minimum_connected_fermat(ordered, start_anchor, spacing, exit_anchor, true);
 
-            for (const bool reverse_child : { false, true }) {
-                Points candidate_child = child_path;
-                if (reverse_child)
-                    std::reverse(candidate_child.begin(), candidate_child.end());
+                for (const bool reverse_child : { false, true }) {
+                    Points candidate_child = child_path;
+                    if (reverse_child)
+                        std::reverse(candidate_child.begin(), candidate_child.end());
 
-                CutOpenPolyline parent_start = cut_open_polyline(parent_path, left_index);
-                CutOpenPolyline parent_end = cut_open_polyline(parent_path, right_index);
-                Points candidate;
-                candidate.reserve(parent_path.size() + candidate_child.size() + 4);
-                append_points(candidate, parent_start.before);
-                append_points(candidate, candidate_child);
-                append_points(candidate, parent_end.after);
+                    CutOpenPolyline parent_start = cut_open_polyline(parent_path, left_index);
+                    CutOpenPolyline parent_end = cut_open_polyline(parent_path, right_index);
+                    Points candidate;
+                    candidate.reserve(parent_path.size() + candidate_child.size() + 4);
+                    append_points(candidate, parent_start.before);
+                    append_points(candidate, candidate_child);
+                    append_points(candidate, parent_end.after);
 
-                const PairMetrics metrics = path_pair_metrics(candidate, spacing);
-                if (metrics.crossings == 0 && metrics.close_pairs == 0 &&
-                    count_containment_violations(printable_area, candidate, spacing) == 0)
-                    return candidate;
+                    const PairMetrics metrics = path_pair_metrics(candidate, spacing);
+                    if (metrics.crossings == 0 && metrics.close_pairs == 0 &&
+                        count_containment_violations(printable_area, candidate, spacing) == 0)
+                        return candidate;
+                }
             }
         }
     }
@@ -1631,6 +1681,150 @@ Points insert_uncovered_pocket_spirals(
         if (!candidate.empty())
             path = std::move(candidate);
     }
+    return path;
+}
+
+double contour_group_area(const std::vector<ContourLoop> &group)
+{
+    double area = 0.0;
+    for (const ContourLoop &loop : group)
+        area += loop.area;
+    return area;
+}
+
+std::vector<std::vector<ContourLoop>> residual_gap_groups(const std::vector<ContourLoop> &contours)
+{
+    if (contours.empty())
+        return {};
+
+    size_t first_level = std::numeric_limits<size_t>::max();
+    for (const ContourLoop &loop : contours)
+        first_level = std::min(first_level, loop.level_index);
+
+    std::vector<ContourLoop> seeds;
+    for (const ContourLoop &loop : contours)
+        if (loop.level_index == first_level)
+            seeds.emplace_back(loop);
+
+    if (seeds.size() <= 1)
+        return { contours };
+
+    std::vector<std::vector<ContourLoop>> groups(seeds.size());
+    for (const ContourLoop &loop : contours) {
+        size_t best = 0;
+        double best_distance = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < seeds.size(); ++i) {
+            const double d = point_distance2(loop.centroid, seeds[i].centroid);
+            if (d < best_distance) {
+                best_distance = d;
+                best = i;
+            }
+        }
+        groups[best].emplace_back(loop);
+    }
+
+    groups.erase(std::remove_if(groups.begin(), groups.end(), [](const std::vector<ContourLoop> &group) { return group.empty(); }), groups.end());
+    return groups;
+}
+
+Points try_merge_gap_group(
+    const ExPolygons &printable_area,
+    const Points &parent_path,
+    const std::vector<ContourLoop> &group,
+    const double spacing)
+{
+    if (parent_path.size() < 4 || group.empty())
+        return {};
+
+    const std::vector<ContourLoop> ordered = ordered_loops_for_spiral(group);
+    if (ordered.empty())
+        return {};
+
+    const ContourLoop &first_loop = ordered.front();
+    std::vector<std::pair<double, Point>> nearest_samples;
+    const size_t stride = std::max<size_t>(1, first_loop.points.size() / 24);
+    for (size_t i = 0; i < first_loop.points.size(); i += stride) {
+        const OpenProjection projection = project_open_polyline(parent_path, first_loop.points[i]);
+        nearest_samples.emplace_back(projection.distance, first_loop.points[i]);
+    }
+    std::sort(nearest_samples.begin(), nearest_samples.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+
+    std::vector<Point> anchor_candidates;
+    for (size_t i = 0; i < std::min<size_t>(4, nearest_samples.size()); ++i)
+        anchor_candidates.emplace_back(nearest_samples[i].second);
+    for (const double fraction : { 0.0, 0.25, 0.5, 0.75 })
+        anchor_candidates.emplace_back(point_at_closed_fraction(first_loop.points, fraction));
+
+    for (const Point &start_anchor : anchor_candidates) {
+        for (const double exit_fraction : { 0.5, 0.25, 0.75 }) {
+            const Point exit_anchor = point_at_closed_fraction(first_loop.points, exit_fraction);
+            Points child_path = build_single_minimum_connected_fermat(ordered, start_anchor, spacing, exit_anchor, true);
+            if (child_path.size() < 2)
+                continue;
+
+            for (const bool reverse_child : { false, true }) {
+                Points candidate_child = child_path;
+                if (reverse_child)
+                    std::reverse(candidate_child.begin(), candidate_child.end());
+                Points candidate = merge_child_spiral(parent_path, std::move(candidate_child));
+                const PairMetrics metrics = path_pair_metrics(candidate, spacing);
+                if (metrics.crossings == 0 && metrics.close_pairs == 0 &&
+                    count_containment_violations(printable_area, candidate, spacing) == 0)
+                    return candidate;
+            }
+        }
+    }
+
+    return {};
+}
+
+ExPolygons residual_gap_area(const ExPolygons &printable_area, const Points &path, const Flow &flow, const double spacing)
+{
+    if (path.size() < 2)
+        return {};
+
+    const double stroke_radius = double(flow.scaled_width()) * 0.5 + spacing * 0.10;
+    Polygons covered = offset(Polyline(path), float(stroke_radius), ClipperLib::jtRound, SCALED_RESOLUTION, ClipperLib::etOpenRound);
+    if (covered.empty())
+        return {};
+
+    return diff_ex(printable_area, covered);
+}
+
+Points insert_residual_gap_spirals(
+    const ExPolygons &printable_area,
+    const Flow &flow,
+    Points path,
+    const double spacing)
+{
+    const ExPolygons residual_area = residual_gap_area(printable_area, path, flow, spacing);
+    if (residual_area.empty())
+        return path;
+
+    const double residual_spacing = spacing * 1.25;
+    std::vector<ContourLoop> residual_contours =
+        generate_offset_contours(residual_area, double(flow.scaled_width()), residual_spacing, 0);
+    residual_contours.erase(
+        std::remove_if(
+            residual_contours.begin(),
+            residual_contours.end(),
+            [&](const ContourLoop &loop) { return loop_uncovered_fraction(loop, path, spacing) <= 0.65; }),
+        residual_contours.end());
+    if (residual_contours.empty())
+        return path;
+
+    std::vector<std::vector<ContourLoop>> groups = residual_gap_groups(residual_contours);
+    std::sort(groups.begin(), groups.end(), [](const auto &a, const auto &b) { return contour_group_area(a) > contour_group_area(b); });
+
+    const size_t max_groups = std::min<size_t>(8, groups.size());
+    for (size_t i = 0; i < max_groups; ++i) {
+        Points candidate = try_insert_pocket_group(printable_area, path, groups[i], spacing);
+        if (candidate.empty())
+            candidate = try_merge_gap_group(printable_area, path, groups[i], spacing);
+        if (!candidate.empty())
+            path = std::move(candidate);
+    }
+
     return path;
 }
 
@@ -1682,6 +1876,8 @@ Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow)
     best_path = complete_outer_boundary_cycle(best_path, *outer_loop, spacing);
     if (multi_hole)
         best_path = insert_uncovered_pocket_spirals(printable_area, contours, std::move(best_path), spacing);
+    if (multi_loop)
+        best_path = insert_residual_gap_spirals(printable_area, flow, std::move(best_path), spacing);
 
     return Polyline(std::move(best_path));
 }

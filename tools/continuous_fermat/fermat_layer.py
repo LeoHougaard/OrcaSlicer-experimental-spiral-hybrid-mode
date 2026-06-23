@@ -516,7 +516,38 @@ def resample_closed_loop(points: Sequence[Point], target_step: float) -> list[Po
     return out
 
 
-def extract_contours(grid: SDFGrid, level_index: int, offset: float, spacing: float) -> list[ContourLoop]:
+def densify_closed_loop_preserving_vertices(points: Sequence[Point], max_step: float) -> list[Point]:
+    if len(points) < 2:
+        return list(points)
+
+    collinear_tolerance = max(max_step * 0.002, EPS)
+    simplified: list[Point] = []
+    for i, point in enumerate(points):
+        prev = points[(i - 1) % len(points)]
+        nxt = points[(i + 1) % len(points)]
+        if dist(prev, nxt) > EPS and point_segment_distance(point, prev, nxt) <= collinear_tolerance:
+            continue
+        simplified.append(point)
+    source = simplified if len(simplified) >= 3 else list(points)
+
+    out: list[Point] = []
+    for i, a in enumerate(source):
+        b = source[(i + 1) % len(source)]
+        append_point(out, a)
+        parts = max(1, int(math.ceil(dist(a, b) / max(max_step, EPS))))
+        for part in range(1, parts):
+            append_point(out, lerp(a, b, part / parts))
+
+    return out
+
+
+def extract_contours(
+    grid: SDFGrid,
+    level_index: int,
+    offset: float,
+    spacing: float,
+    preserve_vertices: bool,
+) -> list[ContourLoop]:
     segments: list[tuple[Point, Point]] = []
     for j in range(grid.ny):
         for i in range(grid.nx):
@@ -525,7 +556,11 @@ def extract_contours(grid: SDFGrid, level_index: int, offset: float, spacing: fl
     raw_loops = assemble_loops(segments, quant=grid.step * 0.01, min_length=spacing * 2.5)
     loops: list[ContourLoop] = []
     for raw in raw_loops:
-        points = resample_closed_loop(raw, target_step=max(spacing * 0.45, grid.step * 0.75))
+        points = (
+            densify_closed_loop_preserving_vertices(raw, max_step=max(spacing * 0.25, grid.step * 0.75))
+            if preserve_vertices
+            else resample_closed_loop(raw, target_step=max(spacing * 0.65, grid.step * 0.75))
+        )
         area = signed_area(points)
         if abs(area) < spacing * spacing:
             continue
@@ -559,8 +594,15 @@ def generate_offset_contours(
 
     offset = first_offset
     level_index = 0
+    precise_wall_levels = 3
     while offset <= max_sdf - spacing * 0.15 and level_index < max_levels:
-        loops = extract_contours(grid, level_index, offset, spacing)
+        loops = extract_contours(
+            grid,
+            level_index,
+            offset,
+            spacing,
+            preserve_vertices=level_index < precise_wall_levels,
+        )
         contours.extend(loops)
         offset += spacing
         level_index += 1
@@ -1618,11 +1660,11 @@ def try_insert_pocket_group(
 
     ordered = ordered_loops_for_spiral(group)
     best: tuple[tuple[int, int, int, float], list[Point]] | None = None
-    for center_index in unique_port_candidates(port_candidates, limit=2):
+    for center_index in unique_port_candidates(port_candidates, limit=6):
         center_index = max(3.0, min(center_index, len(parent_path) - 4.0))
         center_length = open_path_length_at_index(parent_path, prefix, center_index)
 
-        for half_width in (spacing * 1.35,):
+        for half_width in (spacing * 1.35, spacing * 2.25, spacing * 3.25):
             left_index = open_path_index_at_length(parent_path, prefix, center_length - half_width)
             right_index = open_path_index_at_length(parent_path, prefix, center_length + half_width)
 
@@ -1688,6 +1730,212 @@ def insert_uncovered_pocket_spirals(
             current = candidate
             inserted += 1
     return current, inserted
+
+
+class PathDistanceIndex:
+    def __init__(self, path: Sequence[Point], bin_size: float) -> None:
+        self.bin_size = max(bin_size, EPS)
+        self.segments = list(zip(path, path[1:]))
+        self.bins: dict[tuple[int, int], list[int]] = {}
+        for idx, (a, b) in enumerate(self.segments):
+            min_x = min(a[0], b[0])
+            min_y = min(a[1], b[1])
+            max_x = max(a[0], b[0])
+            max_y = max(a[1], b[1])
+            bx0, by0 = self.key((min_x, min_y))
+            bx1, by1 = self.key((max_x, max_y))
+            for by in range(by0, by1 + 1):
+                for bx in range(bx0, bx1 + 1):
+                    self.bins.setdefault((bx, by), []).append(idx)
+
+    def key(self, p: Point) -> tuple[int, int]:
+        return (math.floor(p[0] / self.bin_size), math.floor(p[1] / self.bin_size))
+
+    def distance(self, p: Point, max_search: float) -> float:
+        if not self.segments:
+            return float("inf")
+
+        bx, by = self.key(p)
+        ring_count = max(1, int(math.ceil(max_search / self.bin_size)) + 1)
+        best = float("inf")
+        checked: set[int] = set()
+        for ring in range(ring_count + 1):
+            for cy in range(by - ring, by + ring + 1):
+                for cx in range(bx - ring, bx + ring + 1):
+                    if ring > 0 and bx - ring < cx < bx + ring and by - ring < cy < by + ring:
+                        continue
+                    for idx in self.bins.get((cx, cy), []):
+                        if idx in checked:
+                            continue
+                        checked.add(idx)
+                        a, b = self.segments[idx]
+                        best = min(best, point_segment_distance(p, a, b))
+            if best <= max(0.0, (ring - 1) * self.bin_size):
+                break
+        return best if best <= max_search else float("inf")
+
+
+def build_residual_gap_grid(
+    model: PolygonModel,
+    source_grid: SDFGrid,
+    path: Sequence[Point],
+    line_width: float,
+    spacing: float,
+) -> SDFGrid:
+    index = PathDistanceIndex(path, bin_size=max(spacing * 2.0, line_width))
+    extrusion_radius = line_width * 0.5 + spacing * 0.10
+    max_search = max(spacing * 5.0, line_width * 4.0)
+    values: list[float] = []
+    for j in range(source_grid.ny + 1):
+        for i in range(source_grid.nx + 1):
+            p = source_grid.point(i, j)
+            model_sdf = source_grid.value(i, j)
+            if model_sdf <= 0.0:
+                values.append(model_sdf)
+                continue
+            path_distance = index.distance(p, max_search)
+            stroke_sdf = max_search if path_distance == float("inf") else path_distance - extrusion_radius
+            values.append(min(model_sdf, stroke_sdf))
+
+    return SDFGrid(
+        model=model,
+        min_x=source_grid.min_x,
+        min_y=source_grid.min_y,
+        max_x=source_grid.max_x,
+        max_y=source_grid.max_y,
+        nx=source_grid.nx,
+        ny=source_grid.ny,
+        values=values,
+    )
+
+
+def residual_gap_groups(contours: Sequence[ContourLoop]) -> list[list[ContourLoop]]:
+    if not contours:
+        return []
+
+    first_level = min(loop.level_index for loop in contours)
+    seeds = [loop for loop in contours if loop.level_index == first_level]
+    if len(seeds) <= 1:
+        return [list(contours)]
+
+    groups: list[list[ContourLoop]] = [[] for _ in seeds]
+    for loop in contours:
+        seed_index = min(range(len(seeds)), key=lambda idx: dist2(loop.centroid, seeds[idx].centroid))
+        groups[seed_index].append(loop)
+
+    return [group for group in groups if group]
+
+
+def insert_residual_gap_spirals(
+    model: PolygonModel,
+    source_grid: SDFGrid,
+    path: Sequence[Point],
+    line_width: float,
+    spacing: float,
+    max_levels: int,
+    spacing_tolerance: float,
+) -> tuple[list[Point], int, int]:
+    residual_cells = max(48, min(120, max(source_grid.nx, source_grid.ny)))
+    residual_source_grid = build_sdf_grid(model, grid_cells=residual_cells, margin=line_width * 2.0)
+    residual_grid = build_residual_gap_grid(model, residual_source_grid, path, line_width, spacing)
+    residual_spacing = spacing * 1.25
+    residual_contours = filter_printable_contours(
+        generate_offset_contours(
+            residual_grid,
+            line_width=line_width,
+            spacing=residual_spacing,
+            max_levels=max(1, min(max_levels, 64)),
+        ),
+        spacing=residual_spacing,
+    )
+    residual_contours = [
+        loop
+        for loop in residual_contours
+        if loop_uncovered_fraction(loop, path, spacing) > 0.65
+    ]
+    if not residual_contours:
+        return list(path), 0, 0
+
+    current = list(path)
+    inserted = 0
+    groups = sorted(residual_gap_groups(residual_contours), key=lambda group: -sum(loop.area for loop in group))
+    for group in groups[:8]:
+        candidate = try_insert_pocket_group(
+            model,
+            current,
+            group,
+            spacing=spacing,
+            spacing_tolerance=spacing_tolerance,
+        )
+        if candidate is None:
+            candidate = try_merge_gap_group(
+                model,
+                current,
+                group,
+                spacing=spacing,
+                spacing_tolerance=spacing_tolerance,
+            )
+        if candidate is not None:
+            current = candidate
+            inserted += 1
+
+    return current, inserted, len(residual_contours)
+
+
+def try_merge_gap_group(
+    model: PolygonModel,
+    parent_path: Sequence[Point],
+    group: Sequence[ContourLoop],
+    spacing: float,
+    spacing_tolerance: float,
+) -> list[Point] | None:
+    if len(parent_path) < 4 or not group:
+        return None
+
+    ordered = ordered_loops_for_spiral(group)
+    if not ordered:
+        return None
+
+    first_loop = ordered[0]
+    anchor_candidates: list[Point] = []
+    stride = max(1, len(first_loop.points) // 24)
+    sampled = first_loop.points[::stride]
+    sampled.sort(key=lambda p: project_open_polyline(parent_path, p)[2])
+    anchor_candidates.extend(sampled[:4])
+    for fraction in (0.0, 0.25, 0.5, 0.75):
+        anchor_candidates.append(point_at_closed_fraction(first_loop.points, fraction))
+
+    best: tuple[tuple[int, int, int, float], list[Point]] | None = None
+    for start_anchor in anchor_candidates:
+        for exit_fraction in (0.5, 0.25, 0.75):
+            exit_anchor = point_at_closed_fraction(first_loop.points, exit_fraction)
+            child_path, _ = build_single_minimum_connected_fermat(
+                ordered,
+                start_anchor=start_anchor,
+                spacing=spacing,
+                port_spacing=spacing * 2.5,
+                exit_anchor=exit_anchor,
+                preserve_medial_pockets=True,
+            )
+            for candidate_child in (child_path, list(reversed(child_path))):
+                candidate = merge_child_spiral(parent_path, candidate_child, spacing)
+                crossings, close_pairs, min_spacing = path_pair_metrics(
+                    candidate,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                )
+                containment = 0
+                if crossings == 0:
+                    containment = count_containment_violations(model, candidate, spacing)
+                score = (crossings, close_pairs, containment, -min_spacing)
+                if best is None or score < best[0]:
+                    best = (score, candidate)
+                if crossings == 0 and close_pairs == 0 and containment == 0:
+                    return candidate
+
+    if best is not None and best[0][0] == 0 and best[0][1] == 0 and best[0][2] == 0:
+        return best[1]
+    return None
 
 
 def build_branch_connected_fermat(
@@ -2562,38 +2810,36 @@ def path_pair_metrics(
         max_y = max(a[1], b[1]) + min_allowed
         k0 = key(min_x, min_y)
         k1 = key(max_x, max_y)
-        candidates: set[int] = set()
         for by in range(k0[1], k1[1] + 1):
             for bx in range(k0[0], k1[0] + 1):
-                candidates.update(bins.get((bx, by), []))
+                for j in bins.get((bx, by), []):
+                    if j <= i:
+                        continue
+                    pair = (i, j)
+                    if pair in checked:
+                        continue
+                    checked.add(pair)
 
-        for j in candidates:
-            if j <= i:
-                continue
-            index_distance = abs(i - j)
-            if closed_path:
-                index_distance = min(index_distance, len(segments) - index_distance)
-            if index_distance <= local_skip:
-                continue
-            path_gap = max(0.0, prefix_lengths[j] - prefix_lengths[i + 1])
-            if closed_path:
-                occupied_span = prefix_lengths[j + 1] - prefix_lengths[i]
-                path_gap = min(path_gap, max(0.0, path_length - occupied_span))
-            if path_gap <= local_skip_distance:
-                continue
-            pair = (i, j)
-            if pair in checked:
-                continue
-            checked.add(pair)
+                    index_distance = abs(i - j)
+                    if closed_path:
+                        index_distance = min(index_distance, len(segments) - index_distance)
+                    if index_distance <= local_skip:
+                        continue
+                    path_gap = max(0.0, prefix_lengths[j] - prefix_lengths[i + 1])
+                    if closed_path:
+                        occupied_span = prefix_lengths[j + 1] - prefix_lengths[i]
+                        path_gap = min(path_gap, max(0.0, path_length - occupied_span))
+                    if path_gap <= local_skip_distance:
+                        continue
 
-            c, d = segments[j]
-            pair_distance = segment_distance(a, b, c, d)
-            min_nonlocal_spacing = min(min_nonlocal_spacing, pair_distance)
+                    c, d = segments[j]
+                    pair_distance = segment_distance(a, b, c, d)
+                    min_nonlocal_spacing = min(min_nonlocal_spacing, pair_distance)
 
-            if pair_distance <= 1e-7:
-                self_intersections += 1
-            elif pair_distance < min_allowed:
-                spacing_violations += 1
+                    if pair_distance <= 1e-7:
+                        self_intersections += 1
+                    elif pair_distance < min_allowed:
+                        spacing_violations += 1
 
     return self_intersections, spacing_violations, min_nonlocal_spacing
 
@@ -2871,6 +3117,24 @@ def plan_one_layer(
         if inserted_pockets:
             diagnostics.append(f"Inserted {inserted_pockets} uncovered pocket Fermat spiral(s) into the global path.")
             path = pocket_path
+
+    if multi_loop:
+        gap_path, inserted_gaps, gap_contours = insert_residual_gap_spirals(
+            model,
+            grid,
+            path,
+            line_width=line_width,
+            spacing=spacing,
+            max_levels=max_levels,
+            spacing_tolerance=spacing_tolerance,
+        )
+        if inserted_gaps:
+            diagnostics.append(
+                f"Inserted {inserted_gaps} residual gap Fermat spiral(s) from {gap_contours} uncovered contour(s)."
+            )
+            path = gap_path
+        elif gap_contours:
+            diagnostics.append(f"Detected {gap_contours} residual gap contour(s), but no non-crossing splice was found.")
 
     elapsed = time.perf_counter() - started
     metrics = validate_path(

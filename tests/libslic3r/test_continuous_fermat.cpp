@@ -124,6 +124,26 @@ Polyline require_continuous_fermat_path(const ExPolygon &area)
     return path;
 }
 
+void require_rectangle_outer_wall_corners(
+    const Polyline &path,
+    const Flow &flow,
+    const double min_x,
+    const double min_y,
+    const double max_x,
+    const double max_y)
+{
+    const double inset = double(flow.width()) * 0.5;
+    const double tolerance = scale_(0.02);
+    for (const Point &corner : {
+             p(min_x + inset, min_y + inset),
+             p(max_x - inset, min_y + inset),
+             p(max_x - inset, max_y - inset),
+             p(min_x + inset, max_y - inset),
+         }) {
+        REQUIRE(path_distance_to_point(path, corner) <= tolerance);
+    }
+}
+
 } // namespace
 
 TEST_CASE("Continuous Fermat generates one non-crossing path for a rectangle", "[ContinuousFermat]")
@@ -134,7 +154,9 @@ TEST_CASE("Continuous Fermat generates one non-crossing path for a rectangle", "
         p( 30.0,  18.0),
         p(-30.0,  18.0),
     });
-    require_continuous_fermat_path(rectangle);
+    Polyline path = require_continuous_fermat_path(rectangle);
+    Flow flow(1.2f, 0.2f, 0.4f);
+    require_rectangle_outer_wall_corners(path, flow, -30.0, -18.0, 30.0, 18.0);
 }
 
 TEST_CASE("Continuous Fermat generates one non-crossing path for a square hole", "[ContinuousFermat]")
@@ -152,7 +174,12 @@ TEST_CASE("Continuous Fermat generates one non-crossing path for a square hole",
             p( 9.0,  9.0),
             p( 9.0, -9.0),
         });
-    require_continuous_fermat_path(square_with_hole);
+    Polyline path = require_continuous_fermat_path(square_with_hole);
+
+    Flow flow(1.2f, 0.2f, 0.4f);
+    const double gap_tolerance = double(flow.scaled_spacing()) * 1.6;
+    for (const Point &gap_point : { p(-22.0, 0.0), p(22.0, 0.0) })
+        REQUIRE(path_distance_to_point(path, gap_point) <= gap_tolerance);
 }
 
 TEST_CASE("Continuous Fermat handles concave and branched island shapes", "[ContinuousFermat]")
