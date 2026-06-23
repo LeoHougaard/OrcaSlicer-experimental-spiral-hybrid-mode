@@ -1,14 +1,19 @@
 #include "ContinuousFermat.hpp"
 
 #include "ClipperUtils.hpp"
+#include "Exception.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "Layer.hpp"
 #include "Print.hpp"
 
 #include <algorithm>
+#include <boost/log/trivial.hpp>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -117,6 +122,28 @@ double segment_distance(const Point &a, const Point &b, const Point &c, const Po
         point_segment_distance(c, a, b),
         point_segment_distance(d, a, b),
     });
+}
+
+bool debug_fallback_enabled()
+{
+    const char *value = std::getenv("ORCA_CONTINUOUS_FERMAT_ALLOW_FALLBACK");
+    return value != nullptr && (std::string(value) == "1" || std::string(value) == "true" || std::string(value) == "TRUE");
+}
+
+std::string layer_diagnostics(const Layer &layer, const ExPolygons &printable_area, const Flow *flow = nullptr)
+{
+    size_t non_empty_regions = 0;
+    for (const LayerRegion *region : layer.regions())
+        if (region != nullptr && !region->slices.empty())
+            ++non_empty_regions;
+
+    std::ostringstream out;
+    out << "layer=" << layer.id() << " print_z=" << layer.print_z << " regions=" << layer.regions().size()
+        << " non_empty_regions=" << non_empty_regions << " printable_expolygons=" << printable_area.size();
+    if (flow != nullptr)
+        out << " flow_width=" << flow->width() << " flow_height=" << flow->height()
+            << " flow_spacing=" << unscale<double>(flow->scaled_spacing());
+    return out.str();
 }
 
 Point polygon_centroid_or_first(const Points &points)
@@ -1888,24 +1915,45 @@ bool apply_to_layer(Layer &layer)
     if (!config.spiral_mode.value || !config.spiral_hybrid_non_crossing.value)
         return false;
 
+    auto fail = [](const std::string &reason) -> bool {
+        const std::string message = "Continuous Fermat path generation failed: " + reason;
+        BOOST_LOG_TRIVIAL(error) << message;
+        if (debug_fallback_enabled()) {
+            BOOST_LOG_TRIVIAL(warning) << "ORCA_CONTINUOUS_FERMAT_ALLOW_FALLBACK is set; falling back to normal slicing.";
+            return false;
+        }
+        throw Slic3r::SlicingError(message + ". Set ORCA_CONTINUOUS_FERMAT_ALLOW_FALLBACK=1 to allow fallback for debugging.");
+    };
+
+    if (layer.empty()) {
+        BOOST_LOG_TRIVIAL(debug) << "Continuous Fermat active on empty layer " << layer.id() << "; skipping normal fill generation.";
+        return true;
+    }
+
     LayerRegion *target_region = nullptr;
+    size_t non_empty_regions = 0;
     for (LayerRegion *region : layer.regions()) {
         if (region != nullptr && !region->slices.empty()) {
-            target_region = region;
-            break;
+            ++non_empty_regions;
+            if (target_region == nullptr)
+                target_region = region;
         }
     }
     if (target_region == nullptr)
-        return false;
+        return fail("no layer region has printable slices; " + layer_diagnostics(layer, {}));
+    if (non_empty_regions > 1)
+        return fail("multiple print regions are not supported in strict continuous mode; " + layer_diagnostics(layer, {}));
 
     ExPolygons printable_area = layer.lslices.empty() ? to_expolygons(target_region->slices.surfaces) : layer.lslices;
     if (printable_area.empty())
-        return false;
+        return fail("printable area is empty; " + layer_diagnostics(layer, printable_area));
+    if (printable_area.size() != 1)
+        return fail("disconnected islands are not supported in strict continuous mode; " + layer_diagnostics(layer, printable_area));
 
     const Flow flow = target_region->flow(frExternalPerimeter);
     Polyline path = generate_layer_path(printable_area, flow);
     if (path.points.size() < 2)
-        return false;
+        return fail("generated path is empty or degenerate; " + layer_diagnostics(layer, printable_area, &flow));
 
     for (LayerRegion *region : layer.regions()) {
         region->perimeters.clear();
@@ -1915,10 +1963,16 @@ bool apply_to_layer(Layer &layer)
 
     ExtrusionPath extrusion(erExternalPerimeter, flow.mm3_per_mm(), flow.width(), flow.height());
     extrusion.polyline = std::move(path);
+    extrusion.set_continuous_fermat();
+    extrusion.set_reverse();
 
     auto *collection = new ExtrusionEntityCollection();
+    collection->no_sort = true;
     collection->entities.emplace_back(new ExtrusionPath(std::move(extrusion)));
     target_region->perimeters.entities.emplace_back(collection);
+
+    BOOST_LOG_TRIVIAL(info) << "Continuous Fermat replaced normal layer entities: " << layer_diagnostics(layer, printable_area, &flow)
+                            << " path_points=" << static_cast<const ExtrusionPath*>(collection->entities.front())->polyline.points.size();
     return true;
 }
 

@@ -30,6 +30,13 @@ Run one case:
 python tools/continuous_fermat/fermat_layer.py --shape annulus --draw-contours
 ```
 
+Validate an OrcaSlicer-generated G-code file with integrated Continuous Fermat
+sections:
+
+```powershell
+python tools/continuous_fermat/validate_gcode.py path\to\model.gcode
+```
+
 Outputs are written to `build/continuous_fermat/`:
 
 - `*.svg` shows the model boundary, optional raw contours, generated path,
@@ -49,3 +56,6 @@ Important limitations:
 - A passing prototype result means the path is one continuous extrusion stroke
   for the sampled geometry. It does not yet prove the final Orca integration has
   disabled all travel-generating G-code features.
+- The G-code validator expects `;_CONTINUOUS_FERMAT_BEGIN` and
+  `;_CONTINUOUS_FERMAT_END` comments around the integrated path. It checks for
+  internal XY travel, retract/unretract moves, and extrusion continuity.

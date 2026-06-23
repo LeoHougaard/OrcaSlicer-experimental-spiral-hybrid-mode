@@ -170,6 +170,7 @@ public:
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
+        , m_continuous_fermat(rhs.m_continuous_fermat)
     {}
     ExtrusionPath(ExtrusionPath &&rhs)
         : polyline(std::move(rhs.polyline))
@@ -179,6 +180,7 @@ public:
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
+        , m_continuous_fermat(rhs.m_continuous_fermat)
     {}
     ExtrusionPath(const Polyline &polyline, const ExtrusionPath &rhs)
         : polyline(polyline)
@@ -188,6 +190,7 @@ public:
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
+        , m_continuous_fermat(rhs.m_continuous_fermat)
     {}
     ExtrusionPath(Polyline &&polyline, const ExtrusionPath &rhs)
         : polyline(std::move(polyline))
@@ -197,12 +200,14 @@ public:
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
+        , m_continuous_fermat(rhs.m_continuous_fermat)
     {}
 
     ExtrusionPath& operator=(const ExtrusionPath& rhs) {
         m_can_reverse = rhs.m_can_reverse;
         m_role = rhs.m_role;
         m_no_extrusion = rhs.m_no_extrusion;
+        m_continuous_fermat = rhs.m_continuous_fermat;
         this->mm3_per_mm = rhs.mm3_per_mm;
         this->width = rhs.width;
         this->height = rhs.height;
@@ -213,6 +218,7 @@ public:
         m_can_reverse = rhs.m_can_reverse;
         m_role = rhs.m_role;
         m_no_extrusion = rhs.m_no_extrusion;
+        m_continuous_fermat = rhs.m_continuous_fermat;
         this->mm3_per_mm = rhs.mm3_per_mm;
         this->width = rhs.width;
         this->height = rhs.height;
@@ -262,6 +268,8 @@ public:
     //BBS:
     bool is_force_no_extrusion() const { return m_no_extrusion; }
     void set_force_no_extrusion(bool no_extrusion) { m_no_extrusion = no_extrusion; }
+    bool is_continuous_fermat() const { return m_continuous_fermat; }
+    void set_continuous_fermat(bool continuous_fermat = true) { m_continuous_fermat = continuous_fermat; }
     void set_extrusion_role(ExtrusionRole extrusion_role) { m_role = extrusion_role; }
     void set_reverse() override { m_can_reverse = false; }
     bool can_reverse() const override { return m_can_reverse; }
@@ -272,6 +280,7 @@ private:
     ExtrusionRole m_role;
     //BBS
     bool m_no_extrusion = false;
+    bool m_continuous_fermat = false;
 };
 
 class ExtrusionPathSloped : public ExtrusionPath

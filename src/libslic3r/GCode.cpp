@@ -5867,6 +5867,12 @@ std::string GCode::extrude_entity(const ExtrusionEntity &entity, std::string des
         return this->extrude_multi_path(*multipath, description, speed);
     else if (const ExtrusionLoop* loop = dynamic_cast<const ExtrusionLoop*>(&entity))
         return this->extrude_loop(*loop, description, speed, region_perimeters);
+    else if (const ExtrusionEntityCollection* collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+        std::string gcode;
+        for (const ExtrusionEntity *nested : collection->entities)
+            gcode += this->extrude_entity(*nested, description, speed, region_perimeters);
+        return gcode;
+    }
     else
         throw Slic3r::InvalidArgument("Invalid argument supplied to extrude()");
     return "";
@@ -6115,6 +6121,7 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
 std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed)
 {
     std::string gcode;
+    const bool continuous_fermat = path.is_continuous_fermat();
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -6703,6 +6710,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
                 apply_role_based_fan_speed();
             }
+            if (continuous_fermat)
+                gcode += ";_CONTINUOUS_FERMAT_BEGIN\n";
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
             const bool classic_spiral_mode = m_config.spiral_mode && !m_config.spiral_hybrid_non_crossing;
@@ -6817,6 +6826,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             total_length = l.length() * SCALING_FACTOR;
         }
         gcode += m_writer.set_speed(last_set_speed, "", comment);
+        if (continuous_fermat)
+            gcode += ";_CONTINUOUS_FERMAT_BEGIN\n";
         Vec2d prev = this->point_to_gcode_quantized(new_points[0].p);
         bool pre_fan_enabled = false;
         bool cur_fan_enabled = false;
@@ -6927,6 +6938,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
         }
     }
+    if (continuous_fermat)
+        gcode += ";_CONTINUOUS_FERMAT_END\n";
     if (m_enable_cooling_markers) {
             gcode += ";_EXTRUDE_END\n";
     }
