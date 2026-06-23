@@ -739,41 +739,44 @@ Points build_single_minimum_connected_fermat(
                         distance_to_loop(loop_point_at_index(points, out_backward), next_loop.points)) {
                         out_index = out_backward;
                         out_forward_in = false;
-            } else {
-                const Point in0 = loop_point_at_index(points, in_index);
-                const double out_forward = loop_forward_by_distance(points, in_index, port_spacing);
-                const double out_backward = loop_back_by_distance(points, in_index, port_spacing);
-                const Point p_forward = loop_point_at_index(points, out_forward);
-                const Point p_backward = loop_point_at_index(points, out_backward);
-                const Point &prev_in = in_branch.back();
-                const Point &prev_out = out_branch.back();
-
-                const double forward_score = std::min(point_distance(in0, prev_in) + point_distance(p_forward, prev_out),
-                                                       point_distance(p_forward, prev_in) + point_distance(in0, prev_out));
-                const double backward_score = std::min(point_distance(in0, prev_in) + point_distance(p_backward, prev_out),
-                                                       point_distance(p_backward, prev_in) + point_distance(in0, prev_out));
-                if (forward_score < backward_score) {
-                    if (point_distance(in0, prev_in) + point_distance(p_forward, prev_out) <=
-                        point_distance(p_forward, prev_in) + point_distance(in0, prev_out)) {
+                    } else {
                         out_index = out_forward;
                         out_forward_in = true;
-                    } else {
-                        out_index = in_index;
-                        in_index = out_forward;
-                        out_forward_in = false;
                     }
-                } else {
-                    if (point_distance(in0, prev_in) + point_distance(p_backward, prev_out) <=
-                        point_distance(p_backward, prev_in) + point_distance(in0, prev_out)) {
-                        out_index = out_backward;
-                        out_forward_in = false;
+                } else if (!in_branch.empty() && !out_branch.empty()) {
+                    const Point in0 = loop_point_at_index(points, in_index);
+                    const double out_forward = loop_forward_by_distance(points, in_index, port_spacing);
+                    const double out_backward = loop_back_by_distance(points, in_index, port_spacing);
+                    const Point p_forward = loop_point_at_index(points, out_forward);
+                    const Point p_backward = loop_point_at_index(points, out_backward);
+                    const Point &prev_in = in_branch.back();
+                    const Point &prev_out = out_branch.back();
+
+                    const double forward_score = std::min(point_distance(in0, prev_in) + point_distance(p_forward, prev_out),
+                                                           point_distance(p_forward, prev_in) + point_distance(in0, prev_out));
+                    const double backward_score = std::min(point_distance(in0, prev_in) + point_distance(p_backward, prev_out),
+                                                            point_distance(p_backward, prev_in) + point_distance(in0, prev_out));
+                    if (forward_score < backward_score) {
+                        if (point_distance(in0, prev_in) + point_distance(p_forward, prev_out) <=
+                            point_distance(p_forward, prev_in) + point_distance(in0, prev_out)) {
+                            out_index = out_forward;
+                            out_forward_in = true;
+                        } else {
+                            out_index = in_index;
+                            in_index = out_forward;
+                            out_forward_in = false;
+                        }
                     } else {
-                        out_index = in_index;
-                        in_index = out_backward;
-                        out_forward_in = true;
+                        if (point_distance(in0, prev_in) + point_distance(p_backward, prev_out) <=
+                            point_distance(p_backward, prev_in) + point_distance(in0, prev_out)) {
+                            out_index = out_backward;
+                            out_forward_in = false;
+                        } else {
+                            out_index = in_index;
+                            in_index = out_backward;
+                            out_forward_in = true;
+                        }
                     }
-                }
-            }
                 } else {
                     out_index = out_forward;
                     out_forward_in = true;
