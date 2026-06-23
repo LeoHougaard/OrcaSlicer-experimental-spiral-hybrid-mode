@@ -1,6 +1,9 @@
 # Add individual tests as executables in separate directories at the bottom of this file
 
 add_subdirectory(catch2)
+if (WIN32)
+    target_compile_definitions(Catch2WithMain PRIVATE DO_NOT_USE_WMAIN)
+endif()
 
 set(TEST_DATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/data)
 file(TO_NATIVE_PATH "${TEST_DATA_DIR}" TEST_DATA_DIR)

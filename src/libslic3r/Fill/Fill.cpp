@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "../ClipperUtils.hpp"
+#include "../ContinuousFermat.hpp"
 #include "../Geometry.hpp"
 #include "../Layer.hpp"
 #include "../Print.hpp"
@@ -1195,6 +1196,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 
+    if (ContinuousFermat::apply_to_layer(*this))
+        return;
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");

@@ -1404,9 +1404,10 @@ void PrintObject::detect_surfaces_type()
     // are completely hidden inside a collective body of intersecting parts.
     // This is useful if one of the parts is to be dissolved, or if it is transparent and the internal shells
     // should be visible.
-    bool spiral_mode      = this->print()->config().spiral_mode.value;
-    bool interface_shells = ! spiral_mode && m_config.interface_shells.value;
-    size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
+    const PrintConfig &print_config = this->print()->config();
+    const bool classic_spiral_mode  = print_config.spiral_mode.value && !print_config.spiral_hybrid_non_crossing.value;
+    bool interface_shells = ! classic_spiral_mode && m_config.interface_shells.value;
+    size_t num_layers     = classic_spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
         BOOST_LOG_TRIVIAL(debug) << "Detecting solid surfaces for region " << region_id << " in parallel - start";
@@ -1423,11 +1424,11 @@ void PrintObject::detect_surfaces_type()
 
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0,
-            	spiral_mode ?
-            		// In spiral vase mode, reserve the last layer for the top surface if more than 1 layer is planned for the vase bottom.
-            		((num_layers > 1) ? num_layers - 1 : num_layers) :
-            		// In non-spiral vase mode, go over all layers.
-            		m_layers.size()),
+                classic_spiral_mode ?
+                    // In spiral vase mode, reserve the last layer for the top surface if more than 1 layer is planned for the vase bottom.
+                    ((num_layers > 1) ? num_layers - 1 : num_layers) :
+                    // In non-spiral vase mode, go over all layers.
+                    m_layers.size()),
             [this, region_id, interface_shells, &surfaces_new](const tbb::blocked_range<size_t>& range) {
                 // If we have soluble support material, don't bridge. The overhang will be squished against a soluble layer separating
                 // the support from the print.
@@ -1602,7 +1603,7 @@ void PrintObject::detect_surfaces_type()
                 m_layers[idx_layer]->m_regions[region_id]->slices.surfaces = std::move(surfaces_new[idx_layer]);
         }
 
-        if (spiral_mode) {
+        if (classic_spiral_mode) {
         	if (num_layers > 1)
 	        	// Turn the last bottom layer infill to a top infill, so it will be extruded with a proper pattern.
 	        	m_layers[num_layers - 1]->m_regions[region_id]->slices.set_type(stTop);
@@ -1831,8 +1832,9 @@ void PrintObject::discover_vertical_shells()
         Polygons    bottom_surfaces;
         Polygons    holes;
     };
-    bool     spiral_mode      = this->print()->config().spiral_mode.value;
-    size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
+    const PrintConfig &print_config = this->print()->config();
+    const bool classic_spiral_mode  = print_config.spiral_mode.value && !print_config.spiral_hybrid_non_crossing.value;
+    size_t   num_layers       = classic_spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
     bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;

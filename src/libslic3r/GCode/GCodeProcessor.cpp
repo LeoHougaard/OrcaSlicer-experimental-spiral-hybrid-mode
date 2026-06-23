@@ -2041,8 +2041,10 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
 
     const ConfigOptionBool* spiral_vase = config.option<ConfigOptionBool>("spiral_mode");
     if (spiral_vase != nullptr) {
-        m_detect_layer_based_on_tag = spiral_vase->value;
-        m_result.spiral_vase_mode = spiral_vase->value;
+        const ConfigOptionBool* spiral_hybrid_non_crossing = config.option<ConfigOptionBool>("spiral_hybrid_non_crossing");
+        const bool classic_spiral_mode = spiral_vase->value && (spiral_hybrid_non_crossing == nullptr || !spiral_hybrid_non_crossing->value);
+        m_detect_layer_based_on_tag = classic_spiral_mode;
+        m_result.spiral_vase_mode = classic_spiral_mode;
     }
 
     const ConfigOptionBool* has_scarf_joint_seam = config.option<ConfigOptionBool>("has_scarf_joint_seam");
@@ -2371,8 +2373,10 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
 
     const ConfigOptionBool* spiral_vase = config.option<ConfigOptionBool>("spiral_mode");
     if (spiral_vase != nullptr) {
-        m_detect_layer_based_on_tag = spiral_vase->value;
-        m_result.spiral_vase_mode = spiral_vase->value;
+        const ConfigOptionBool* spiral_hybrid_non_crossing = config.option<ConfigOptionBool>("spiral_hybrid_non_crossing");
+        const bool classic_spiral_mode = spiral_vase->value && (spiral_hybrid_non_crossing == nullptr || !spiral_hybrid_non_crossing->value);
+        m_detect_layer_based_on_tag = classic_spiral_mode;
+        m_result.spiral_vase_mode = classic_spiral_mode;
     }
 
     const ConfigOptionBool* has_scarf_joint_seam = config.option<ConfigOptionBool>("has_scarf_joint_seam");

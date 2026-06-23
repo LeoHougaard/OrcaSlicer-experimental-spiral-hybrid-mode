@@ -5547,7 +5547,8 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
 
     bool is_hole = (loop.loop_role() & elrHole) == elrHole;
 
-    if (m_config.spiral_mode && !is_hole) {
+    const bool classic_spiral_mode = m_config.spiral_mode && !m_config.spiral_hybrid_non_crossing;
+    if (classic_spiral_mode && !is_hole) {
         // if spiral vase, we have to ensure that all contour are in the same orientation.
         loop.make_counter_clockwise();
     }
@@ -5559,7 +5560,7 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
     // or, if `start_point` is specified, start the loop at point closest to it
     Point last_pos = start_point ? *start_point : this->last_pos();
     float seam_overhang = std::numeric_limits<float>::lowest();
-    if (!m_config.spiral_mode && description == "perimeter") {
+    if (!classic_spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
         m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
     } else
@@ -5567,7 +5568,7 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
 
     const auto seam_scarf_type = m_config.seam_slope_type.value;
     bool enable_seam_slope = ((seam_scarf_type == SeamScarfType::External && !is_hole) || seam_scarf_type == SeamScarfType::All) &&
-        !m_config.spiral_mode &&
+        !classic_spiral_mode &&
         (loop.role() == erExternalPerimeter || (loop.role() == erPerimeter && m_config.seam_slope_inner_walls)) &&
         layer_id() > 0;
     const auto nozzle_diameter = EXTRUDER_CONFIG(nozzle_diameter);
@@ -6704,7 +6705,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
-            if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr) {
+            const bool classic_spiral_mode = m_config.spiral_mode && !m_config.spiral_hybrid_non_crossing;
+            if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || classic_spiral_mode || sloped != nullptr) {
                 double path_length = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
                 for (const Line& line : path.polyline.lines()) {

@@ -5382,10 +5382,9 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloatOrPercent(200, true));
 
     def = this->add("spiral_hybrid_non_crossing", coBool);
-    def->label = L("Spiral hybrid non-crossing");
-    def->tooltip = L("Experimental: Keep spiral-style continuous motion while allowing walls and infill. "
-                     "When enabled, OrcaSlicer avoids crossing walls aggressively and can carve out interior area before infill.");
-    def->mode = comAdvanced;
+    def->label = L("Continuous slicing");
+    def->tooltip = L("Experimental: Enables the spiral hybrid non-crossing path, allowing walls and infill while avoiding wall crossings more aggressively.");
+    def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("spiral_hybrid_interior_clearance", coFloat);

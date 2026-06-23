@@ -321,6 +321,12 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         config->option<ConfigOptionBool>("spiral_hybrid_non_crossing") != nullptr &&
         config->option<ConfigOptionBool>("spiral_hybrid_non_crossing")->value;
 
+    if (spiral_hybrid_non_crossing && !config->opt_bool("spiral_mode")) {
+        DynamicPrintConfig new_conf = *config;
+        new_conf.set_key_value("spiral_mode", new ConfigOptionBool(true));
+        apply(config, &new_conf);
+    }
+
     if (!is_plate_config &&
         config->opt_bool("spiral_mode") &&
         !spiral_hybrid_non_crossing &&
@@ -646,19 +652,20 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     bool has_spiral_vase         = config->opt_bool("spiral_mode");
     // spiral_hybrid_* may be absent from a DynamicPrintConfig until merged with defaults; opt_bool/opt_enum dereference nullptr.
     const ConfigOptionBool *spiral_hybrid_non_crossing_opt = config->option<ConfigOptionBool>("spiral_hybrid_non_crossing");
-    bool hybrid_non_crossing     = has_spiral_vase && spiral_hybrid_non_crossing_opt != nullptr && spiral_hybrid_non_crossing_opt->value;
+    bool hybrid_non_crossing     = spiral_hybrid_non_crossing_opt != nullptr && spiral_hybrid_non_crossing_opt->value;
+    const bool classic_spiral_mode = has_spiral_vase && !hybrid_non_crossing;
     const ConfigOptionEnum<SpiralHybridFlowMode> *spiral_hybrid_flow_mode_opt =
         config->option<ConfigOptionEnum<SpiralHybridFlowMode>>("spiral_hybrid_flow_mode");
     bool adaptive_hybrid_flow =
         !hybrid_non_crossing || spiral_hybrid_flow_mode_opt == nullptr || spiral_hybrid_flow_mode_opt->value == SpiralHybridFlowMode::Adaptive;
-    toggle_line("spiral_mode_smooth", has_spiral_vase);
-    toggle_line("spiral_mode_max_xy_smoothing", has_spiral_vase && config->opt_bool("spiral_mode_smooth"));
-    toggle_line("spiral_hybrid_non_crossing", has_spiral_vase);
+    toggle_line("spiral_mode_smooth", classic_spiral_mode);
+    toggle_line("spiral_mode_max_xy_smoothing", classic_spiral_mode && config->opt_bool("spiral_mode_smooth"));
+    toggle_line("spiral_hybrid_non_crossing", true);
     toggle_line("spiral_hybrid_interior_clearance", hybrid_non_crossing);
     toggle_line("spiral_hybrid_flow_mode", hybrid_non_crossing);
-    toggle_line("spiral_starting_flow_ratio", has_spiral_vase && adaptive_hybrid_flow);
-    toggle_line("spiral_finishing_flow_ratio", has_spiral_vase && adaptive_hybrid_flow);
-    bool has_top_shell    = config->opt_int("top_shell_layers") > 0 || (has_spiral_vase && config->opt_int("bottom_shell_layers") > 1);
+    toggle_line("spiral_starting_flow_ratio", has_spiral_vase && !hybrid_non_crossing && adaptive_hybrid_flow);
+    toggle_line("spiral_finishing_flow_ratio", has_spiral_vase && !hybrid_non_crossing && adaptive_hybrid_flow);
+    bool has_top_shell    = config->opt_int("top_shell_layers") > 0 || (classic_spiral_mode && config->opt_int("bottom_shell_layers") > 1);
     bool has_bottom_shell = config->opt_int("bottom_shell_layers") > 0;
     bool has_solid_infill = has_top_shell || has_bottom_shell;
     toggle_field("top_surface_pattern", has_top_shell);
@@ -672,10 +679,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         })
         toggle_field(el, have_infill || has_solid_infill);
 
-    toggle_field("top_shell_thickness", ! has_spiral_vase && has_top_shell);
-    toggle_field("bottom_shell_thickness", ! has_spiral_vase && has_bottom_shell);
+    toggle_field("top_shell_thickness", !classic_spiral_mode && has_top_shell);
+    toggle_field("bottom_shell_thickness", !classic_spiral_mode && has_bottom_shell);
 
-    toggle_field("wall_direction", !has_spiral_vase);
+    toggle_field("wall_direction", !classic_spiral_mode);
 
     // Gap fill is newly allowed in between perimeter lines even for empty infill (see GH #1476).
     toggle_field("gap_infill_speed", have_perimeters);
@@ -920,7 +927,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     bool has_detect_overhang_wall = config->opt_bool("detect_overhang_wall");
     bool has_overhang_reverse     = config->opt_bool("overhang_reverse");
     bool force_wall_direction     = config->opt_enum<WallDirection>("wall_direction") != WallDirection::Auto;
-    bool allow_overhang_reverse   = !has_spiral_vase && !force_wall_direction;
+    bool allow_overhang_reverse   = !classic_spiral_mode && !force_wall_direction;
     toggle_line("overhang_reverse", allow_overhang_reverse);
     toggle_line("overhang_reverse_internal_only", allow_overhang_reverse && has_overhang_reverse);
     bool has_overhang_reverse_internal_only = config->opt_bool("overhang_reverse_internal_only");
@@ -937,8 +944,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     toggle_line("small_area_infill_flow_compensation_model", have_small_area_infill_flow_compensation);
 
 
-    toggle_field("seam_slope_type", !has_spiral_vase);
-    bool has_seam_slope = !has_spiral_vase && config->opt_enum<SeamScarfType>("seam_slope_type") != SeamScarfType::None;
+    toggle_field("seam_slope_type", !classic_spiral_mode);
+    bool has_seam_slope = !classic_spiral_mode && config->opt_enum<SeamScarfType>("seam_slope_type") != SeamScarfType::None;
     toggle_line("seam_slope_conditional", has_seam_slope);
     toggle_line("seam_slope_start_height", has_seam_slope);
     toggle_line("seam_slope_entire_loop", has_seam_slope);

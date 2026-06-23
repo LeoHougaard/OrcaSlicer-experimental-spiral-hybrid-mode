@@ -1255,7 +1255,8 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
         }
     }
 
-    if (m_config.spiral_mode) {
+    const bool classic_spiral_mode = m_config.spiral_mode && !m_config.spiral_hybrid_non_crossing;
+    if (classic_spiral_mode) {
         size_t total_copies_count = 0;
         for (const PrintObject* object : m_objects)
             total_copies_count += object->instances().size();
@@ -3040,7 +3041,8 @@ bool Print::has_wipe_tower() const
         if (enable_timelapse_print())
             return true;
 
-        return !m_config.spiral_mode.value && m_config.filament_diameter.values.size() > 1;
+        const bool classic_spiral_mode = m_config.spiral_mode.value && !m_config.spiral_hybrid_non_crossing.value;
+        return !classic_spiral_mode && m_config.filament_diameter.values.size() > 1;
     }
     return false;
 }

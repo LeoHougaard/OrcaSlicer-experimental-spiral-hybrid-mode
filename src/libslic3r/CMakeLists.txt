@@ -100,6 +100,8 @@ set(lisbslic3r_sources
     CommonDefs.hpp
     Config.cpp
     Config.hpp
+    ContinuousFermat.cpp
+    ContinuousFermat.hpp
     CustomGCode.cpp
     CustomGCode.hpp
     CutUtils.cpp
