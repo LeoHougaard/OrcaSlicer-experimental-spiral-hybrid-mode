@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from collections.abc import Sequence as RuntimeSequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -952,6 +953,208 @@ def semantic_path_pair_metrics(
     return self_intersections, spacing_violations, min_nonlocal_spacing, semantic_ignored
 
 
+def turn_angle_degrees(a: Point, b: Point, c: Point) -> float:
+    incoming = v_sub(b, a)
+    outgoing = v_sub(c, b)
+    in_len = v_len(incoming)
+    out_len = v_len(outgoing)
+    if in_len <= EPS or out_len <= EPS:
+        return 0.0
+    cosine = max(-1.0, min(1.0, (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]) / (in_len * out_len)))
+    return math.degrees(math.acos(cosine))
+
+
+def turnback_violation_count(
+    path: Sequence[Point],
+    line_width: float,
+    max_safe_turn_degrees: float = 135.0,
+) -> tuple[int, float]:
+    violations = 0
+    max_angle = 0.0
+    min_leg = line_width * 0.35
+    points = list(path)
+    closed_path = len(points) > 3 and cf.dist(points[0], points[-1]) <= max(line_width * 0.05, EPS)
+    if closed_path:
+        # The duplicate closing vertex represents the same physical point.  Add
+        # the seam turn once, without inventing a zero-length leg.
+        points = points[:-1]
+        triples = [
+            (points[idx - 1], points[idx], points[(idx + 1) % len(points)])
+            for idx in range(len(points))
+        ]
+    else:
+        triples = zip(points, points[1:], points[2:])
+
+    for a, b, c in triples:
+        if cf.dist(a, b) < min_leg or cf.dist(b, c) < min_leg:
+            continue
+        angle = turn_angle_degrees(a, b, c)
+        max_angle = max(max_angle, angle)
+        if angle > max_safe_turn_degrees:
+            violations += 1
+    return violations, max_angle
+
+
+def bead_collision_metrics(
+    path: Sequence[Point],
+    line_width: float,
+    spacing: float,
+    segment_widths: Sequence[float] | None = None,
+) -> dict[str, Any]:
+    """Validate the physical bead swept by the toolpath.
+
+    Each segment is treated as a capsule: a rectangle with radius
+    line_width / 2 and semicircular ends.  Adjacent short polyline segments are
+    one continuous bead and are not counted as non-local capsule overlaps, but
+    sharp local reversals are counted separately as turnback over-extrusion.
+    """
+
+    segments = list(zip(path, path[1:]))
+    if len(segments) < 2:
+        turnbacks, max_turn = turnback_violation_count(path, line_width)
+        return {
+            "extrusionCrossings": 0,
+            "beadOverlapViolations": 0,
+            "turnbackViolations": turnbacks,
+            "extrusionViolationCount": turnbacks,
+            "minBeadClearance": 0.0,
+            "maxTurnAngleDegrees": max_turn,
+        }
+
+    widths = (
+        list(segment_widths)
+        if segment_widths is not None and len(segment_widths) == len(segments)
+        else [line_width] * len(segments)
+    )
+    max_width = max([line_width, *widths])
+    bead_tolerance = max(line_width * 0.02, EPS)
+    search_margin = max(max_width, spacing)
+    bin_size = max(search_margin * 1.5, EPS)
+    prefix_lengths = [0.0]
+    for a, b in segments:
+        prefix_lengths.append(prefix_lengths[-1] + cf.dist(a, b))
+    path_length = prefix_lengths[-1]
+    closed_path = cf.dist(path[0], path[-1]) <= max(line_width * 0.05, EPS)
+
+    def key(x: float, y: float) -> tuple[int, int]:
+        return (math.floor(x / bin_size), math.floor(y / bin_size))
+
+    bins: dict[tuple[int, int], list[int]] = {}
+    for idx, (a, b) in enumerate(segments):
+        radius = widths[idx] * 0.5
+        k0 = key(min(a[0], b[0]) - radius, min(a[1], b[1]) - radius)
+        k1 = key(max(a[0], b[0]) + radius, max(a[1], b[1]) + radius)
+        for by in range(k0[1], k1[1] + 1):
+            for bx in range(k0[0], k1[0] + 1):
+                bins.setdefault((bx, by), []).append(idx)
+
+    checked: set[tuple[int, int]] = set()
+    crossings = 0
+    bead_overlaps = 0
+    min_clearance = float("inf")
+    local_connected_distance = spacing * 4.0
+
+    for i, (a, b) in enumerate(segments):
+        radius_i = widths[i] * 0.5
+        k0 = key(min(a[0], b[0]) - search_margin, min(a[1], b[1]) - search_margin)
+        k1 = key(max(a[0], b[0]) + search_margin, max(a[1], b[1]) + search_margin)
+        for by in range(k0[1], k1[1] + 1):
+            for bx in range(k0[0], k1[0] + 1):
+                for j in bins.get((bx, by), []):
+                    if j <= i:
+                        continue
+                    pair = (i, j)
+                    if pair in checked:
+                        continue
+                    checked.add(pair)
+
+                    index_distance = j - i
+                    if closed_path:
+                        index_distance = min(index_distance, len(segments) - index_distance)
+                    if index_distance <= 1:
+                        continue
+
+                    c, d = segments[j]
+                    pair_distance = cf.segment_distance(a, b, c, d)
+                    if pair_distance <= 1e-7:
+                        crossings += 1
+
+                    radius_sum = radius_i + widths[j] * 0.5
+                    clearance = pair_distance - radius_sum
+                    min_clearance = min(min_clearance, clearance)
+                    path_gap = max(0.0, prefix_lengths[j] - prefix_lengths[i + 1])
+                    if closed_path:
+                        occupied_span = prefix_lengths[j + 1] - prefix_lengths[i]
+                        path_gap = min(path_gap, max(0.0, path_length - occupied_span))
+                    if path_gap <= local_connected_distance:
+                        continue
+                    if clearance < -bead_tolerance:
+                        bead_overlaps += 1
+
+    turnbacks, max_turn = turnback_violation_count(path, line_width)
+    if min_clearance == float("inf"):
+        min_clearance = 0.0
+    violation_count = crossings + bead_overlaps + turnbacks
+    return {
+        "extrusionCrossings": crossings,
+        "beadOverlapViolations": bead_overlaps,
+        "turnbackViolations": turnbacks,
+        "extrusionViolationCount": violation_count,
+        "minBeadClearance": min_clearance,
+        "maxTurnAngleDegrees": max_turn,
+    }
+
+
+def segment_safe_to_append(path: Sequence[Point], p: Point, line_width: float, spacing: float) -> bool:
+    if not path:
+        return True
+    a = path[-1]
+    if cf.dist(a, p) <= EPS:
+        return True
+
+    if len(path) >= 2:
+        angle = turn_angle_degrees(path[-2], a, p)
+        if angle > 135.0 and cf.dist(path[-2], a) >= line_width * 0.35 and cf.dist(a, p) >= line_width * 0.35:
+            return False
+
+    bead_min_distance = max(line_width - line_width * 0.02, EPS)
+    local_connected_distance = spacing * 4.0
+    suffix_lengths = [0.0] * len(path)
+    for idx in range(len(path) - 2, -1, -1):
+        suffix_lengths[idx] = suffix_lengths[idx + 1] + cf.dist(path[idx], path[idx + 1])
+    new_segment = (a, p)
+    for idx, (c, d) in enumerate(zip(path, path[1:])):
+        if idx >= len(path) - 2:
+            continue
+        path_gap = suffix_lengths[idx + 1]
+        if path_gap <= local_connected_distance:
+            continue
+        distance = cf.segment_distance(new_segment[0], new_segment[1], c, d)
+        if distance <= 1e-7:
+            return False
+        if distance < bead_min_distance:
+            return False
+    return True
+
+
+def enforce_physical_drawing_guard(
+    path: Sequence[Point],
+    line_width: float,
+    spacing: float,
+) -> tuple[list[Point], int]:
+    guarded: list[Point] = []
+    rejected = 0
+    for point in path:
+        if not guarded:
+            guarded.append(point)
+            continue
+        if segment_safe_to_append(guarded, point, line_width, spacing):
+            append_point(guarded, point)
+        else:
+            rejected += 1
+    return guarded, rejected
+
+
 def containment_violations(model: cf.PolygonModel, path: Sequence[Point], spacing: float) -> int:
     violations = 0
     for a, b in zip(path, path[1:]):
@@ -1181,6 +1384,232 @@ def segment_inside_model(model: cf.PolygonModel, a: Point, b: Point, spacing: fl
     return True
 
 
+def option_point(options: dict[str, Any], name: str) -> Point | None:
+    raw = options.get(name)
+    if not isinstance(raw, RuntimeSequence) or isinstance(raw, (str, bytes)) or len(raw) < 2:
+        return None
+    try:
+        return (float(raw[0]), float(raw[1]))
+    except (TypeError, ValueError):
+        return None
+
+
+def nearest_printable_point(model: cf.PolygonModel, p: Point, spacing: float) -> Point:
+    if model.contains(p):
+        return p
+
+    min_x, min_y, max_x, max_y = model.bounds(0.0)
+    span = max(max_x - min_x, max_y - min_y, spacing)
+    best: tuple[float, Point] | None = None
+    steps = 42
+    for y_idx in range(steps + 1):
+        y = min_y + (max_y - min_y) * y_idx / steps
+        for x_idx in range(steps + 1):
+            q = (min_x + (max_x - min_x) * x_idx / steps, y)
+            if not model.contains(q):
+                continue
+            score = cf.dist2(p, q) - min(model.sdf(q), spacing * 2.0) * span * 0.01
+            if best is None or score < best[0]:
+                best = (score, q)
+    if best is not None:
+        return best[1]
+
+    return cf.polygon_centroid(model.outer)
+
+
+def segment_projection_point(a: Point, b: Point, p: Point) -> tuple[float, Point, float]:
+    ab = v_sub(b, a)
+    denom = ab[0] * ab[0] + ab[1] * ab[1]
+    if denom <= EPS:
+        return 0.0, a, cf.dist(a, p)
+    t = max(0.0, min(1.0, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / denom))
+    q = cf.lerp(a, b, t)
+    return t, q, cf.dist(q, p)
+
+
+def nearest_outer_projection(model: cf.PolygonModel, p: Point) -> tuple[Point, Point, float]:
+    points = model.outer
+    best: tuple[float, Point, Point] | None = None
+    area_sign = 1.0 if cf.signed_area(points) >= 0.0 else -1.0
+    for a, b in zip(points, [*points[1:], points[0]]):
+        _t, q, distance = segment_projection_point(a, b, p)
+        edge = v_sub(b, a)
+        normal = v_mul(v_unit(v_perp(edge)), area_sign)
+        if not model.contains(v_add(q, v_mul(normal, max(distance, 1.0) * 0.02))):
+            normal = v_mul(normal, -1.0)
+        if best is None or distance < best[0]:
+            best = (distance, q, normal)
+    if best is None:
+        return p, (1.0, 0.0), 0.0
+    distance, q, normal = best
+    return q, normal, distance
+
+
+def point_from_outer_fraction(model: cf.PolygonModel, fraction: float, spacing: float) -> Point:
+    boundary = cf.point_at_closed_fraction(model.outer, fraction)
+    _q, inward, _distance = nearest_outer_projection(model, boundary)
+    return nearest_printable_point(model, v_add(boundary, v_mul(inward, max(spacing * 1.5, EPS))), spacing)
+
+
+def point_from_bounds_fraction(model: cf.PolygonModel, tx: float, ty: float, spacing: float) -> Point:
+    min_x, min_y, max_x, max_y = model.bounds(0.0)
+    preferred = (min_x + (max_x - min_x) * tx, min_y + (max_y - min_y) * ty)
+    return nearest_printable_point(model, preferred, spacing)
+
+
+def path_to_outer_normal(model: cf.PolygonModel, p: Point, spacing: float) -> list[Point]:
+    start = nearest_printable_point(model, p, spacing)
+    boundary, inward, distance = nearest_outer_projection(model, start)
+    path = [start]
+    if distance > spacing * 0.35:
+        normal_len = min(max(spacing * 1.5, distance * 0.40), max(spacing * 0.6, distance * 0.85))
+        bend = v_add(boundary, v_mul(inward, normal_len))
+        if cf.dist(start, bend) > spacing * 0.15 and segment_inside_model(model, start, bend, spacing):
+            append_point(path, bend)
+    append_point(path, boundary)
+    return path
+
+
+def path_segments(path: Sequence[Point]) -> list[tuple[Point, Point]]:
+    return [(a, b) for a, b in zip(path, path[1:]) if cf.dist(a, b) > EPS]
+
+
+def full_loop_from_index(points: Sequence[Point], start_idx: int, direction: int) -> list[Point]:
+    if not points:
+        return []
+    n = len(points)
+    idx = start_idx % n
+    out = [points[idx]]
+    for _ in range(n):
+        idx = (idx + direction) % n
+        out.append(points[idx])
+    return out
+
+
+def hole_wall_loops(model: cf.PolygonModel, line_width: float, spacing: float, grid_cells: int) -> list[cf.ContourLoop | None]:
+    if not model.holes:
+        return []
+
+    wall_grid = cf.build_sdf_grid(model, grid_cells=max(80, grid_cells), margin=line_width * 2.0)
+    wall_contours = cf.generate_offset_contours(wall_grid, line_width=line_width, spacing=spacing, max_levels=1)
+    loops: list[cf.ContourLoop | None] = []
+    used: set[int] = set()
+    for hole in model.holes:
+        center = cf.polygon_centroid(hole)
+        best: tuple[float, int, cf.ContourLoop] | None = None
+        for idx, loop in enumerate(wall_contours):
+            if idx in used or loop.level_index != 0 or not loop.points:
+                continue
+            centroid_in_hole = cf.point_in_polygon(loop.centroid, hole)
+            boundary_gap = abs(cf.distance_to_loop(loop.points[0], hole) - line_width * 0.5)
+            center_gap = cf.distance_to_loop(center, loop.points)
+            if not centroid_in_hole and boundary_gap > line_width * 0.65:
+                continue
+            score = boundary_gap + center_gap * 0.02
+            if best is None or score < best[0]:
+                best = (score, idx, loop)
+        if best is None:
+            loops.append(None)
+        else:
+            used.add(best[1])
+            loops.append(best[2])
+    return loops
+
+
+def ordered_hole_indices(model: cf.PolygonModel, start: Point) -> list[int]:
+    remaining = set(range(len(model.holes)))
+    order: list[int] = []
+    current = start
+    while remaining:
+        selected = min(remaining, key=lambda idx: cf.dist2(current, cf.polygon_centroid(model.holes[idx])))
+        order.append(selected)
+        remaining.remove(selected)
+        current = cf.polygon_centroid(model.holes[selected])
+    return order
+
+
+def build_v7_start_path(
+    model: cf.PolygonModel,
+    start_point: Point,
+    line_width: float,
+    spacing: float,
+    grid_cells: int,
+    diagnostics: list[str],
+) -> list[Point]:
+    start = nearest_printable_point(model, start_point, spacing)
+    walls = hole_wall_loops(model, line_width, spacing, grid_cells)
+    available_walls = {idx: wall for idx, wall in enumerate(walls) if wall is not None}
+    if not available_walls:
+        if model.holes:
+            diagnostics.append("v7 could not identify first-offset hole wall loops; start cut falls back to the outer wall.")
+        return path_to_outer_normal(model, start, spacing)
+
+    order = [idx for idx in ordered_hole_indices(model, start) if idx in available_walls]
+    path: list[Point] = [start]
+    current = start
+    for order_pos, hole_idx in enumerate(order):
+        loop = available_walls[hole_idx]
+        assert loop is not None
+        next_target = (
+            cf.polygon_centroid(model.holes[order[order_pos + 1]])
+            if order_pos + 1 < len(order)
+            else nearest_outer_projection(model, loop.centroid)[0]
+        )
+        entry_idx = loop_vertex_index(loop.points, current)
+        exit_idx = loop_vertex_index(loop.points, next_target)
+        append_point(path, loop.points[entry_idx])
+        append_points(path, full_loop_from_index(loop.points, entry_idx, 1))
+        if exit_idx != entry_idx:
+            append_points(path, arc_points(loop.points, entry_idx, exit_idx, 1))
+        current = loop.points[exit_idx]
+
+    outer_path = path_to_outer_normal(model, current, spacing)
+    append_points(path, outer_path[1:] if outer_path and cf.dist(path[-1], outer_path[0]) <= spacing * 0.05 else outer_path)
+    diagnostics.append(f"v7 preprints full first-offset wall loop(s) for {len(order)} hole(s).")
+    return path
+
+
+def build_v7_endpoint_planning_model(
+    model: cf.PolygonModel,
+    options: dict[str, Any],
+    line_width: float,
+    spacing: float,
+    grid_cells: int,
+) -> tuple[BarrierModel, list[Point], list[Point], list[dict[str, Any]], list[str]]:
+    diagnostics: list[str] = []
+    start_point = option_point(options, "startPoint")
+    end_point = option_point(options, "endPoint")
+    if start_point is None:
+        if model.holes:
+            first_hole = min(model.holes, key=lambda hole: (cf.polygon_centroid(hole)[0], cf.polygon_centroid(hole)[1]))
+            center = cf.polygon_centroid(first_hole)
+            start_point = nearest_printable_point(model, v_add(center, (spacing * 1.25, 0.0)), spacing)
+        else:
+            start_point = point_from_outer_fraction(model, 0.08, spacing)
+    if end_point is None:
+        end_point = point_from_outer_fraction(model, 0.075, spacing)
+
+    start_path = build_v7_start_path(model, start_point, line_width, spacing, grid_cells, diagnostics)
+    end_path_from_point = path_to_outer_normal(model, end_point, spacing)
+    end_path = list(reversed(end_path_from_point))
+
+    barriers = path_segments(start_path) + path_segments(end_path)
+    cut_paths = [
+        {"kind": "start", "points": [[p[0], p[1]] for p in start_path]},
+        {"kind": "end", "points": [[p[0], p[1]] for p in end_path]},
+    ]
+    diagnostics.append(
+        f"v7 added {len(barriers)} endpoint/hole cut segment(s) to the planning SDF."
+    )
+    return (
+        BarrierModel(f"{model.name}_v7_cuts", model.outer, model.holes, barriers, [], line_width * 0.5),
+        start_path,
+        end_path,
+        cut_paths,
+        diagnostics,
+    )
+
+
 def fair_underfill_detours(
     model: cf.PolygonModel,
     path: Sequence[Point],
@@ -1277,6 +1706,434 @@ def fair_underfill_detours(
 
     audit = strict_coverage_audit(model, current, model.bounds(margin=line_width), line_width, coverage_cells)
     return current, inserted, float(audit["coverageRatio"])
+
+
+def principal_axes(points: Sequence[Point]) -> tuple[Point, Point]:
+    if len(points) < 2:
+        return (1.0, 0.0), (0.0, 1.0)
+    center = (
+        sum(p[0] for p in points) / len(points),
+        sum(p[1] for p in points) / len(points),
+    )
+    xx = 0.0
+    xy = 0.0
+    yy = 0.0
+    for p in points:
+        dx = p[0] - center[0]
+        dy = p[1] - center[1]
+        xx += dx * dx
+        xy += dx * dy
+        yy += dy * dy
+    if xx + yy <= EPS:
+        return (1.0, 0.0), (0.0, 1.0)
+    angle = 0.5 * math.atan2(2.0 * xy, xx - yy)
+    major = (math.cos(angle), math.sin(angle))
+    minor = (-major[1], major[0])
+    return major, minor
+
+
+def dot_point(p: Point, axis: Point) -> float:
+    return p[0] * axis[0] + p[1] * axis[1]
+
+
+def simplify_stitch_points(points: Sequence[Point], min_step: float) -> list[Point]:
+    out: list[Point] = []
+    for p in points:
+        if out and cf.dist(out[-1], p) < min_step:
+            continue
+        append_point(out, p)
+    return out
+
+
+def underfill_group_stitch_paths(group: dict[str, Any], line_width: float, spacing: float) -> list[list[Point]]:
+    raw_points = group.get("points") or []
+    points: list[Point] = []
+    for raw in raw_points:
+        if isinstance(raw, RuntimeSequence) and not isinstance(raw, (str, bytes)) and len(raw) >= 2:
+            try:
+                points.append((float(raw[0]), float(raw[1])))
+            except (TypeError, ValueError):
+                continue
+    if len(points) < 2:
+        return []
+
+    major, minor = principal_axes(points)
+    row_gap = max(line_width * 0.82, spacing * 0.70)
+    rows: dict[int, list[Point]] = {}
+    for p in points:
+        row = int(round(dot_point(p, minor) / row_gap))
+        rows.setdefault(row, []).append(p)
+
+    zigzag: list[Point] = []
+    reverse = False
+    for row_key in sorted(rows):
+        row_points = sorted(rows[row_key], key=lambda p: dot_point(p, major))
+        if reverse:
+            row_points.reverse()
+        if len(row_points) <= 2:
+            selected = row_points
+        else:
+            selected = [row_points[0], row_points[len(row_points) // 2], row_points[-1]]
+            if reverse:
+                selected.reverse()
+        append_points(zigzag, selected)
+        reverse = not reverse
+
+    major_sorted = sorted(points, key=lambda p: dot_point(p, major))
+    candidates = [
+        simplify_stitch_points(zigzag, line_width * 0.12),
+        simplify_stitch_points(major_sorted, line_width * 0.12),
+        simplify_stitch_points([major_sorted[0], major_sorted[-1]], line_width * 0.12),
+    ]
+    out: list[list[Point]] = []
+    seen: set[tuple[tuple[int, int], ...]] = set()
+    quant = max(line_width * 0.02, 1e-5)
+    for candidate in candidates:
+        if len(candidate) < 2:
+            continue
+        key = tuple((round(p[0] / quant), round(p[1] / quant)) for p in candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def candidate_insert_indices(path: Sequence[Point], points: Sequence[Point], spacing: float, limit: int = 10) -> list[int]:
+    if len(path) < 2 or len(points) < 2:
+        return []
+    centroid = (
+        sum(p[0] for p in points) / len(points),
+        sum(p[1] for p in points) / len(points),
+    )
+    scored: list[tuple[float, int]] = []
+    for idx, (a, b) in enumerate(zip(path, path[1:])):
+        if cf.dist(a, b) < spacing * 0.25:
+            continue
+        _t, _q, center_distance = segment_projection(a, b, centroid)
+        endpoint_distance = min(
+            segment_projection(a, b, points[0])[2],
+            segment_projection(a, b, points[-1])[2],
+        )
+        score = center_distance + endpoint_distance * 0.35
+        scored.append((score, idx))
+    scored.sort(key=lambda item: item[0])
+    return [idx for _score, idx in scored[:limit]]
+
+
+def inserted_path(path: Sequence[Point], idx: int, stitch: Sequence[Point]) -> list[Point]:
+    out = list(path[: idx + 1])
+    append_points(out, stitch)
+    append_points(out, path[idx + 1 :])
+    return out
+
+
+def candidate_new_segments(path: Sequence[Point], idx: int, stitch: Sequence[Point]) -> list[tuple[Point, Point]]:
+    if idx + 1 >= len(path) or not stitch:
+        return []
+    local = [path[idx], *stitch, path[idx + 1]]
+    return path_segments(local)
+
+
+def local_new_segment_violations(
+    path: Sequence[Point],
+    replaced_idx: int,
+    new_segments: Sequence[tuple[Point, Point]],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+) -> tuple[int, int, int]:
+    min_allowed = max(line_width - line_width * 0.02, spacing * (1.0 - spacing_tolerance))
+    existing = list(zip(path, path[1:]))
+    crossings = 0
+    bead_overlaps = 0
+
+    def boxes_far(a: Point, b: Point, c: Point, d: Point) -> bool:
+        return (
+            max(a[0], b[0]) + min_allowed < min(c[0], d[0])
+            or max(c[0], d[0]) + min_allowed < min(a[0], b[0])
+            or max(a[1], b[1]) + min_allowed < min(c[1], d[1])
+            or max(c[1], d[1]) + min_allowed < min(a[1], b[1])
+        )
+
+    for local_idx, (a, b) in enumerate(new_segments):
+        for other_idx, (c, d) in enumerate(new_segments):
+            if other_idx <= local_idx + 1:
+                continue
+            if boxes_far(a, b, c, d):
+                continue
+            distance = cf.segment_distance(a, b, c, d)
+            if distance <= 1e-7:
+                crossings += 1
+            elif distance < min_allowed:
+                bead_overlaps += 1
+
+        for existing_idx, (c, d) in enumerate(existing):
+            if existing_idx in {replaced_idx - 1, replaced_idx, replaced_idx + 1}:
+                continue
+            if boxes_far(a, b, c, d):
+                continue
+            distance = cf.segment_distance(a, b, c, d)
+            if distance <= 1e-7:
+                crossings += 1
+            elif distance < min_allowed:
+                bead_overlaps += 1
+
+    local_points: list[Point] = []
+    if replaced_idx > 0:
+        local_points.append(path[replaced_idx - 1])
+    if replaced_idx < len(path):
+        local_points.append(path[replaced_idx])
+    for _a, b in new_segments:
+        append_point(local_points, b)
+    if replaced_idx + 2 < len(path):
+        append_point(local_points, path[replaced_idx + 2])
+    turnbacks, _max_turn = turnback_violation_count(local_points, line_width)
+
+    return crossings, bead_overlaps, turnbacks
+
+
+def local_segments_inside_model(model: cf.PolygonModel, segments: Sequence[tuple[Point, Point]], spacing: float) -> bool:
+    return all(segment_inside_model(model, a, b, spacing) for a, b in segments)
+
+
+def insert_underfill_component_stitches(
+    model: cf.PolygonModel,
+    path: Sequence[Point],
+    nodes: Sequence[TreeNode],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+    coverage_cells: int,
+    coverage_threshold: float,
+    max_stitches: int,
+) -> tuple[list[Point], int, float, int]:
+    current = list(path)
+    if len(current) < 2 or max_stitches <= 0:
+        audit = strict_coverage_audit(model, current, model.bounds(margin=line_width), line_width, coverage_cells)
+        return current, 0, float(audit["coverageRatio"]), 0
+
+    accepted = 0
+    rejected = 0
+    min_improvement = 1.0 / max(1.0, coverage_cells * coverage_cells * 8.0)
+    audit = strict_coverage_audit(model, current, model.bounds(margin=line_width), line_width, coverage_cells)
+    coverage_ratio = float(audit["coverageRatio"])
+    overlap_cells = int(audit["overlapCells"])
+    while accepted < max_stitches and coverage_ratio < coverage_threshold:
+        groups = list(audit.get("underfillGroups") or [])
+        groups.sort(key=lambda group: int(group.get("size") or 0), reverse=True)
+        best: tuple[tuple[float, int, float], list[Point], dict[str, Any]] | None = None
+
+        for group in groups[:2]:
+            if int(group.get("size") or 0) < 2:
+                continue
+            for stitch in underfill_group_stitch_paths(group, line_width, spacing)[:2]:
+                if cf.path_pair_metrics(stitch, spacing=spacing, spacing_tolerance=spacing_tolerance)[0] != 0:
+                    rejected += 1
+                    continue
+                for idx in candidate_insert_indices(current, stitch, spacing, limit=3):
+                    a = current[idx]
+                    b = current[idx + 1]
+                    group_bounds = group.get("bounds") or [0.0, 0.0, 0.0, 0.0]
+                    group_diag = math.hypot(float(group_bounds[2]) - float(group_bounds[0]), float(group_bounds[3]) - float(group_bounds[1]))
+                    max_connector = max(spacing * 7.0, group_diag * 1.8 + spacing)
+                    for oriented in (stitch, list(reversed(stitch))):
+                        connector_length = cf.dist(a, oriented[0]) + cf.dist(oriented[-1], b)
+                        if connector_length > max_connector:
+                            rejected += 1
+                            continue
+                        local_segments = candidate_new_segments(current, idx, oriented)
+                        if not local_segments_inside_model(model, local_segments, spacing):
+                            rejected += 1
+                            continue
+                        local_crossings, local_bead_overlaps, local_turnbacks = local_new_segment_violations(
+                            current,
+                            idx,
+                            local_segments,
+                            line_width,
+                            spacing,
+                            spacing_tolerance,
+                        )
+                        if local_crossings or local_bead_overlaps or local_turnbacks:
+                            rejected += 1
+                            continue
+                        candidate = inserted_path(current, idx, oriented)
+                        candidate_audit = strict_coverage_audit(
+                            model,
+                            candidate,
+                            model.bounds(margin=line_width),
+                            line_width,
+                            coverage_cells,
+                        )
+                        candidate_overlap_cells = int(candidate_audit["overlapCells"])
+                        if candidate_overlap_cells > overlap_cells:
+                            rejected += 1
+                            continue
+                        candidate_coverage = float(candidate_audit["coverageRatio"])
+                        improvement = candidate_coverage - coverage_ratio
+                        if improvement <= min_improvement:
+                            rejected += 1
+                            continue
+                        score = (
+                            improvement,
+                            -int(candidate_audit["underfillCells"]),
+                            -connector_length,
+                        )
+                        if best is None or score > best[0]:
+                            best = (score, candidate, candidate_audit)
+
+        if best is None:
+            break
+        _score, current, audit = best
+        coverage_ratio = float(audit["coverageRatio"])
+        overlap_cells = int(audit["overlapCells"])
+        accepted += 1
+
+    return current, accepted, coverage_ratio, rejected
+
+
+def nearest_segment_indices(path: Sequence[Point], p: Point, limit: int) -> list[int]:
+    scored: list[tuple[float, int]] = []
+    for idx, (a, b) in enumerate(zip(path, path[1:])):
+        if cf.dist(a, b) <= EPS:
+            continue
+        _t, _q, distance = segment_projection(a, b, p)
+        scored.append((distance, idx))
+    scored.sort(key=lambda item: item[0])
+    return [idx for _distance, idx in scored[:limit]]
+
+
+def insert_safe_underfill_point_detours(
+    model: cf.PolygonModel,
+    path: Sequence[Point],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+    coverage_cells: int,
+    coverage_threshold: float,
+    max_detours: int,
+) -> tuple[list[Point], int, float, int]:
+    current = list(path)
+    accepted = 0
+    rejected = 0
+    audit = strict_coverage_audit(model, current, model.bounds(margin=line_width), line_width, coverage_cells)
+    coverage_ratio = float(audit["coverageRatio"])
+    overlap_cells = int(audit["overlapCells"])
+    min_improvement = 1.0 / max(1.0, coverage_cells * coverage_cells * 8.0)
+
+    while accepted < max_detours and coverage_ratio < coverage_threshold:
+        segments = list(zip(current, current[1:]))
+        bin_size = max(spacing * 2.0, line_width, EPS)
+        bins: dict[tuple[int, int], list[int]] = {}
+
+        def bin_key(p: Point) -> tuple[int, int]:
+            return (math.floor(p[0] / bin_size), math.floor(p[1] / bin_size))
+
+        for idx, (a, b) in enumerate(segments):
+            k0 = bin_key((min(a[0], b[0]) - line_width * 1.5, min(a[1], b[1]) - line_width * 1.5))
+            k1 = bin_key((max(a[0], b[0]) + line_width * 1.5, max(a[1], b[1]) + line_width * 1.5))
+            for by in range(k0[1], k1[1] + 1):
+                for bx in range(k0[0], k1[0] + 1):
+                    bins.setdefault((bx, by), []).append(idx)
+
+        def nearby_segment_indices(p: Point, limit: int) -> list[int]:
+            center = bin_key(p)
+            candidates: set[int] = set()
+            for by in range(center[1] - 2, center[1] + 3):
+                for bx in range(center[0] - 2, center[0] + 3):
+                    candidates.update(bins.get((bx, by), []))
+            if not candidates:
+                return nearest_segment_indices(current, p, limit)
+            scored: list[tuple[float, int]] = []
+            for idx in candidates:
+                a, b = segments[idx]
+                _t, _q, distance = segment_projection(a, b, p)
+                scored.append((distance, idx))
+            scored.sort(key=lambda item: item[0])
+            return [idx for _distance, idx in scored[:limit]]
+
+        samples: list[Point] = []
+        for group in list(audit.get("underfillGroups") or [])[:12]:
+            centroid = group.get("centroid")
+            if isinstance(centroid, RuntimeSequence) and len(centroid) >= 2:
+                samples.append((float(centroid[0]), float(centroid[1])))
+        for raw in list(audit.get("underfillSamples") or [])[:96]:
+            if isinstance(raw, RuntimeSequence) and len(raw) >= 2:
+                samples.append((float(raw[0]), float(raw[1])))
+
+        proposals: list[tuple[float, int, Point]] = []
+        for p in samples:
+            for idx in nearby_segment_indices(p, limit=3):
+                a = current[idx]
+                b = current[idx + 1]
+                length = cf.dist(a, b)
+                if length < line_width * 0.45:
+                    continue
+                t, _projection, distance = segment_projection(a, b, p)
+                if t < 0.08 or t > 0.92:
+                    continue
+                if distance > line_width * 1.25:
+                    continue
+                extra = cf.dist(a, p) + cf.dist(p, b) - length
+                if extra > spacing * 2.0:
+                    continue
+                local_segments = [(a, p), (p, b)]
+                if not local_segments_inside_model(model, local_segments, spacing):
+                    rejected += 1
+                    continue
+                local_crossings, local_bead_overlaps, local_turnbacks = local_new_segment_violations(
+                    current,
+                    idx,
+                    local_segments,
+                    line_width,
+                    spacing,
+                    spacing_tolerance,
+                )
+                if local_crossings or local_bead_overlaps or local_turnbacks:
+                    rejected += 1
+                    continue
+                proposals.append((distance + extra * 0.25, idx, p))
+
+        if not proposals:
+            break
+
+        best: tuple[tuple[float, float], list[Point], dict[str, Any]] | None = None
+        seen: set[tuple[int, int, int]] = set()
+        quant = max(line_width * 0.02, 1e-5)
+        for _score, idx, p in sorted(proposals, key=lambda item: item[0])[:8]:
+            key = (idx, round(p[0] / quant), round(p[1] / quant))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidate = list(current)
+            candidate.insert(idx + 1, p)
+            candidate_audit = strict_coverage_audit(
+                model,
+                candidate,
+                model.bounds(margin=line_width),
+                line_width,
+                coverage_cells,
+            )
+            if int(candidate_audit["overlapCells"]) > overlap_cells:
+                rejected += 1
+                continue
+            candidate_coverage = float(candidate_audit["coverageRatio"])
+            improvement = candidate_coverage - coverage_ratio
+            if improvement <= min_improvement:
+                rejected += 1
+                continue
+            candidate_score = (improvement, -float(candidate_audit["underfillCells"]))
+            if best is None or candidate_score > best[0]:
+                best = (candidate_score, candidate, candidate_audit)
+
+        if best is None:
+            break
+        _candidate_score, current, audit = best
+        coverage_ratio = float(audit["coverageRatio"])
+        overlap_cells = int(audit["overlapCells"])
+        accepted += 1
+
+    return current, accepted, coverage_ratio, rejected
 
 
 def fair_segment_widths(
@@ -1398,6 +2255,9 @@ def plan_v2_tree(
     algorithm_name: str = "contour_tree_v2",
     initial_diagnostics: Sequence[str] = (),
     initial_path: Sequence[Point] = (),
+    final_path: Sequence[Point] = (),
+    route_end_anchor: Point | None = None,
+    cut_paths: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     started = time.perf_counter()
     planning_model = planning_model or model
@@ -1415,6 +2275,11 @@ def plan_v2_tree(
     width_fairing = bool(options.get("widthFairing", False))
     underfill_fairing = bool(options.get("underfillFairing", False))
     max_underfill_detours = int(options.get("maxUnderfillDetours", 96))
+    component_stitching = bool(options.get("componentStitching", False))
+    max_component_stitches = int(options.get("maxComponentStitches", 24))
+    safe_detouring = bool(options.get("safeUnderfillDetours", False))
+    max_safe_detours = int(options.get("maxSafeUnderfillDetours", 24))
+    physical_drawing_guard = bool(options.get("physicalDrawingGuard", False))
     semantic_spacing = bool(options.get("semanticSpacing", False))
     start_fraction = float(options.get("startFraction", 0.0))
     direction_name = str(options.get("direction", "inward"))
@@ -1454,15 +2319,43 @@ def plan_v2_tree(
         root = nodes[root_id]
         start_point = initial_path[-1] if initial_path else cf.point_at_closed_fraction(root.loop.points, start_fraction)
         start_idx = loop_vertex_index(root.loop.points, start_point)
-        routed_path = route_open(nodes, root_id, start_idx, direction, spacing, debug_edges)
+        if route_end_anchor is not None:
+            end_idx = loop_vertex_index(root.loop.points, route_end_anchor)
+            forward = forward_distance_indices(root.loop.points, start_idx, end_idx, 1)
+            backward = forward_distance_indices(root.loop.points, start_idx, end_idx, -1)
+            direction = 1 if forward >= backward else -1
+            routed_path, _end_idx = route_cycle_with_children(
+                nodes,
+                root_id,
+                start_idx,
+                direction,
+                spacing,
+                debug_edges,
+                return_idx=end_idx,
+            )
+        else:
+            routed_path = route_open(nodes, root_id, start_idx, direction, spacing, debug_edges)
         if initial_path:
             path = list(initial_path)
             append_points(path, routed_path)
         else:
             path = routed_path
+        append_points(path, final_path)
 
     if direction_name == "outward":
         path = list(reversed(path))
+
+    physical_guard_rejected = 0
+    if physical_drawing_guard and path:
+        path, physical_guard_rejected = enforce_physical_drawing_guard(
+            path,
+            line_width=line_width,
+            spacing=spacing,
+        )
+        if physical_guard_rejected:
+            diagnostics.append(
+                f"Physical drawing guard rejected {physical_guard_rejected} segment endpoint(s) that would cross, bead-overlap, or turn back."
+            )
 
     residual_inserted = 0
     residual_candidates = 0
@@ -1519,6 +2412,51 @@ def plan_v2_tree(
             )
             segment_widths = [line_width] * max(0, len(path) - 1)
 
+    safe_detours = 0
+    safe_detour_rejected = 0
+    safe_detour_coverage = 0.0
+    if safe_detouring and path:
+        path, safe_detours, safe_detour_coverage, safe_detour_rejected = insert_safe_underfill_point_detours(
+            model,
+            path,
+            line_width=line_width,
+            spacing=spacing,
+            spacing_tolerance=spacing_tolerance,
+            coverage_cells=coverage_cells,
+            coverage_threshold=coverage_threshold,
+            max_detours=max_safe_detours,
+        )
+        if safe_detours:
+            diagnostics.append(
+                f"v7 inserted {safe_detours} safe underfill detour(s); interim strict coverage {safe_detour_coverage:.3f}."
+            )
+            segment_widths = [line_width] * max(0, len(path) - 1)
+        if safe_detour_rejected:
+            diagnostics.append(f"v7 rejected {safe_detour_rejected} unsafe or non-improving point detour candidate(s).")
+
+    component_stitches = 0
+    component_stitch_rejected = 0
+    component_stitch_coverage = 0.0
+    if component_stitching and path:
+        path, component_stitches, component_stitch_coverage, component_stitch_rejected = insert_underfill_component_stitches(
+            model,
+            path,
+            nodes,
+            line_width=line_width,
+            spacing=spacing,
+            spacing_tolerance=spacing_tolerance,
+            coverage_cells=coverage_cells,
+            coverage_threshold=coverage_threshold,
+            max_stitches=max_component_stitches,
+        )
+        if component_stitches:
+            diagnostics.append(
+                f"v7 inserted {component_stitches} strict-audit component stitch(es); interim strict coverage {component_stitch_coverage:.3f}."
+            )
+            segment_widths = [line_width] * max(0, len(path) - 1)
+        if component_stitch_rejected:
+            diagnostics.append(f"v7 rejected {component_stitch_rejected} unsafe or non-improving component stitch candidate(s).")
+
     elapsed = time.perf_counter() - started
     semantic_ignored_spacing = 0
     if semantic_spacing:
@@ -1554,6 +2492,16 @@ def plan_v2_tree(
     coverage_ratio = float(coverage_audit["coverageRatio"])
     underfill_ratio = float(coverage_audit["underfillRatio"])
     internal_overlap_ratio = float(coverage_audit["internalOverlapRatio"])
+    bead_metrics = bead_collision_metrics(
+        path,
+        line_width=line_width,
+        spacing=spacing,
+        segment_widths=segment_widths,
+    )
+    extrusion_crossings = int(bead_metrics["extrusionCrossings"])
+    bead_overlap_violations = int(bead_metrics["beadOverlapViolations"])
+    turnback_violations = int(bead_metrics["turnbackViolations"])
+    extrusion_violation_count = int(bead_metrics["extrusionViolationCount"])
     missed = [
         {
             "id": node.id,
@@ -1579,6 +2527,16 @@ def plan_v2_tree(
     if spacing_violations > spacing_warning_threshold:
         diagnostics.append(
             f"Spacing warnings {spacing_violations} exceed requested threshold {spacing_warning_threshold}."
+        )
+    if extrusion_crossings:
+        diagnostics.append(f"Physical bead model found {extrusion_crossings} centerline crossing/touch pair(s).")
+    if bead_overlap_violations:
+        diagnostics.append(
+            f"Physical bead model found {bead_overlap_violations} non-local capsule overlap(s) using line width {line_width:.3f}."
+        )
+    if turnback_violations:
+        diagnostics.append(
+            f"Physical bead model found {turnback_violations} sharp turnback(s) above 135 degrees; max turn {bead_metrics['maxTurnAngleDegrees']:.1f} degrees."
         )
     if coverage_ratio < coverage_threshold:
         diagnostics.append(f"Strict coverage {coverage_ratio:.3f} is below requested threshold {coverage_threshold:.3f}.")
@@ -1606,6 +2564,7 @@ def plan_v2_tree(
         and routed_root_ok
         and contain == 0
         and crossings == 0
+        and extrusion_violation_count == 0
         and spacing_violations <= spacing_warning_threshold
         and not missed_bad
         and coverage_ratio >= coverage_threshold
@@ -1641,6 +2600,13 @@ def plan_v2_tree(
             "spacingWarningThreshold": spacing_warning_threshold,
             "semanticIgnoredSpacingPairs": semantic_ignored_spacing,
             "minNonlocalSpacing": min_nonlocal_spacing if min_nonlocal_spacing < float("inf") else 0.0,
+            "extrusionCrossings": extrusion_crossings,
+            "beadOverlapViolations": bead_overlap_violations,
+            "turnbackViolations": turnback_violations,
+            "extrusionViolationCount": extrusion_violation_count,
+            "minBeadClearance": float(bead_metrics["minBeadClearance"]),
+            "maxTurnAngleDegrees": float(bead_metrics["maxTurnAngleDegrees"]),
+            "physicalGuardRejected": physical_guard_rejected,
             "coverageRatio": coverage_ratio,
             "underfillRatio": underfill_ratio,
             "overfillRatio": overfill_ratio,
@@ -1659,6 +2625,10 @@ def plan_v2_tree(
             "widthFairingSegments": width_fairing_segments,
             "maxSegmentWidth": max(segment_widths, default=line_width),
             "underfillDetours": fairing_detours,
+            "safeUnderfillDetours": safe_detours,
+            "safeUnderfillDetourRejected": safe_detour_rejected,
+            "componentStitches": component_stitches,
+            "componentStitchRejected": component_stitch_rejected,
             "missedContourCount": len(missed_bad),
             "start": list(path[0]) if path else None,
             "end": list(path[-1]) if path else None,
@@ -1667,6 +2637,7 @@ def plan_v2_tree(
         },
         "segmentWidths": segment_widths,
         "coverageAudit": coverage_audit,
+        "cutPaths": list(cut_paths),
         "missedContours": missed,
         "diagnostics": diagnostics,
     }
@@ -1688,9 +2659,19 @@ def plan_legacy_cfs(model: cf.PolygonModel, options: dict[str, Any]) -> dict[str
         exit_fraction=float(options.get("exitFraction", 0.5)),
     )
     nodes = [TreeNode(id=i, loop=loop) for i, loop in enumerate(result.contours)]
+    bead_metrics = bead_collision_metrics(result.path, line_width=line_width, spacing=spacing)
+    ok = result.metrics.ok and int(bead_metrics["extrusionViolationCount"]) == 0
+    diagnostics = list(result.diagnostics)
+    if bead_metrics["extrusionViolationCount"]:
+        diagnostics.append(
+            "Physical bead model failed legacy path: "
+            f"{bead_metrics['extrusionCrossings']} crossing(s), "
+            f"{bead_metrics['beadOverlapViolations']} bead overlap(s), "
+            f"{bead_metrics['turnbackViolations']} turnback(s)."
+        )
     payload = {
         "algorithm": "legacy_cfs",
-        "ok": result.metrics.ok,
+        "ok": ok,
         "model": model_payload(model),
         "grid": {
             "nx": result.grid.nx,
@@ -1703,7 +2684,7 @@ def plan_legacy_cfs(model: cf.PolygonModel, options: dict[str, Any]) -> dict[str
         "routeEdges": [],
         "path": [list(p) for p in result.path],
         "metrics": {
-            "ok": result.metrics.ok,
+            "ok": ok,
             "elapsedSeconds": result.metrics.elapsed_seconds,
             "pathPoints": result.metrics.path_points,
             "pathLength": result.metrics.path_length,
@@ -1715,6 +2696,12 @@ def plan_legacy_cfs(model: cf.PolygonModel, options: dict[str, Any]) -> dict[str
             "selfIntersections": result.metrics.self_intersections,
             "spacingViolations": result.metrics.spacing_violations,
             "minNonlocalSpacing": result.metrics.min_nonlocal_spacing,
+            "extrusionCrossings": int(bead_metrics["extrusionCrossings"]),
+            "beadOverlapViolations": int(bead_metrics["beadOverlapViolations"]),
+            "turnbackViolations": int(bead_metrics["turnbackViolations"]),
+            "extrusionViolationCount": int(bead_metrics["extrusionViolationCount"]),
+            "minBeadClearance": float(bead_metrics["minBeadClearance"]),
+            "maxTurnAngleDegrees": float(bead_metrics["maxTurnAngleDegrees"]),
             "coverageRatio": result.metrics.coverage_ratio,
             "underfillRatio": result.metrics.underfill_ratio,
             "overfillRatio": result.metrics.overfill_ratio,
@@ -1724,7 +2711,7 @@ def plan_legacy_cfs(model: cf.PolygonModel, options: dict[str, Any]) -> dict[str
             "direction": "cycle",
         },
         "missedContours": [],
-        "diagnostics": list(result.diagnostics),
+        "diagnostics": diagnostics,
     }
     return payload
 
@@ -1899,10 +2886,74 @@ def plan_v6_coverage(model: cf.PolygonModel, options: dict[str, Any]) -> dict[st
     )
 
 
+def plan_v7_coverage(model: cf.PolygonModel, options: dict[str, Any]) -> dict[str, Any]:
+    line_width = float(options.get("lineWidth", 1.2))
+    spacing = float(options.get("spacing", line_width))
+    grid_cells = int(options.get("grid", 180))
+    explicit_endpoints = option_point(options, "startPoint") is not None or option_point(options, "endPoint") is not None
+    if explicit_endpoints:
+        planning_model, start_path, end_path, cut_paths, diagnostics = build_v7_endpoint_planning_model(
+            model,
+            options,
+            line_width=line_width,
+            spacing=spacing,
+            grid_cells=grid_cells,
+        )
+        route_end_anchor = end_path[0] if end_path else None
+    else:
+        planning_model, diagnostics = barrier_model_for_holes(model, barrier_radius=line_width * 0.5)
+        start_path = list(getattr(planning_model, "entry_path", []))
+        end_path = []
+        cut_paths = []
+        route_end_anchor = None
+        diagnostics = [
+            "v7 did not receive dragged endpoints; using the v6 hole-barrier route baseline.",
+            *diagnostics,
+        ]
+    v7_options = dict(options)
+    v7_options["useAllContours"] = True
+    v7_options["residualRepair"] = False
+    v7_options["widthFairing"] = False
+    v7_options["underfillFairing"] = False
+    v7_options["semanticSpacing"] = True
+    # Never repair a collision by dropping the offending endpoint: doing so
+    # changes every following segment and v7 previously reduced a rectangle to
+    # 29% coverage.  Preserve the candidate and let the complete final audit
+    # reject it fail-closed.
+    v7_options["physicalDrawingGuard"] = False
+    v7_options["safeUnderfillDetours"] = True
+    v7_options.setdefault("maxSafeUnderfillDetours", 60)
+    v7_options["componentStitching"] = True
+    v7_options.setdefault("maxComponentStitches", 8)
+    v7_options["direction"] = "inward"
+    v7_options["routeWinding"] = 1
+    diagnostics = [
+        "v7 uses selectable endpoint cuts, full first-offset hole wall loops, one deterministic route, and strict-audit component stitches.",
+        *diagnostics,
+    ]
+    result = plan_v2_tree(
+        model,
+        v7_options,
+        planning_model=planning_model,
+        algorithm_name="contour_tree_v7",
+        initial_diagnostics=diagnostics,
+        initial_path=start_path,
+        final_path=end_path,
+        route_end_anchor=route_end_anchor,
+        cut_paths=cut_paths,
+    )
+    metrics = result.get("metrics", {})
+    metrics["endpointCutSegments"] = len(path_segments(start_path)) + len(path_segments(end_path))
+    result["metrics"] = metrics
+    return result
+
+
 def plan_model(model: cf.PolygonModel, options: dict[str, Any]) -> dict[str, Any]:
     algorithm = str(options.get("algorithm", "contour_tree_v2"))
     if algorithm == "legacy_cfs":
         return plan_legacy_cfs(model, options)
+    if algorithm == "contour_tree_v7":
+        return plan_v7_coverage(model, options)
     if algorithm == "contour_tree_v6":
         return plan_v6_coverage(model, options)
     if algorithm == "contour_tree_v5":

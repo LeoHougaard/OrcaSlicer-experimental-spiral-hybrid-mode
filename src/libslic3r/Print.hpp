@@ -909,6 +909,14 @@ public:
     // Exports G-code into a file name based on the path_template, returns the file path of the generated G-code file.
     // If preview_data is not null, the preview_data is filled in for the G-code visualization (not used by the command line Slic3r).
     std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // Continuous slicing is a pre-alpha geometry experiment without a certified
+    // machine homing, leveling, heating-pose, or first-approach contract.  All
+    // application export/upload paths must call this before exposing executable
+    // G-code.  The test-only escape hatch exists solely for serialized contract
+    // regression tests and must never be called by application code.
+    void                throw_if_continuous_slicing_export_blocked() const;
+    void                throw_if_continuous_slicing_artifact_blocked(const std::string &path) const;
+    void                enable_continuous_slicing_development_export_for_tests() { m_continuous_slicing_development_export_for_tests = true; }
     //return 0 means successful
     int                 export_cached_data(const std::string& dir_path, bool with_space=false);
     int                 load_cached_data(const std::string& directory);
@@ -1133,7 +1141,7 @@ private:
     PrintRegionPtrs                         m_print_regions;
     
     //SoftFever
-    bool m_isBBLPrinter;
+    bool m_isBBLPrinter { false };
 
     // Ordered collections of extrusion paths to build skirt loops and brim.
     ExtrusionEntityCollection               m_skirt;
@@ -1163,7 +1171,8 @@ private:
     std::vector<unsigned int> m_slice_used_filaments_first_layer;
 
     //BBS: plate's origin
-    Vec3d   m_origin;
+    Vec3d   m_origin { Vec3d::Zero() };
+    bool    m_continuous_slicing_development_export_for_tests { false };
     //BBS: modified_count
     int     m_modified_count {0};
     //BBS

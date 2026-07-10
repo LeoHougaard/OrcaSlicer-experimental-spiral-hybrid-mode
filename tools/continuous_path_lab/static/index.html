@@ -14,6 +14,8 @@
         <span id="backendText">Backend: checking</span>
       </div>
 
+      <p><strong>Pre-alpha research only. Never send a displayed lab path to a printer.</strong></p>
+
       <section>
         <h2>Input</h2>
         <label>
@@ -58,6 +60,7 @@
           Algorithm
           <select id="algorithm">
             <option value="contour_tree_v6">Contour tree v6</option>
+            <option value="contour_tree_v7">Contour tree v7 (endpoint research)</option>
             <option value="contour_tree_v5">Contour tree v5</option>
             <option value="contour_tree_v4">Contour tree v4</option>
             <option value="contour_tree_v3">Contour tree v3</option>
@@ -65,7 +68,7 @@
             <option value="legacy_cfs">Legacy CFS comparison</option>
           </select>
         </label>
-        <label>
+        <label id="directionRow">
           Direction
           <select id="direction">
             <option value="inward">Spiral inward</option>
@@ -97,15 +100,15 @@
             Spacing max
             <input id="spacingWarningThreshold" type="number" min="0" max="1000" step="1" value="3">
           </label>
-          <label>
+          <label id="startFractionRow">
             Start
             <input id="startFraction" type="number" min="0" max="1" step="0.01" value="0.00">
           </label>
-          <label>
+          <label id="exitFractionRow">
             End
             <input id="exitFraction" type="number" min="0" max="1" step="0.01" value="0.50">
           </label>
-          <label>
+          <label id="attemptsRow">
             Attempts
             <input id="retryAttempts" type="number" min="1" max="16" step="1" value="4">
           </label>

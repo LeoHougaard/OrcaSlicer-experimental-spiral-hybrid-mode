@@ -747,8 +747,23 @@ protected:
                 m_keys.emplace_back(kvp.first);
                 const ConfigOptionDef *def = defs->get(kvp.first);
                 assert(def != nullptr);
-                if (def->default_value)
+                if (def->default_value) {
                     opt->set(def->default_value.get());
+                    // Generic vector enums store their value-to-string map on
+                    // the option instance.  ConfigOptionEnumsGeneric::set()
+                    // copies only the values, so a statically cached default
+                    // would otherwise retain a null map and crash when a full
+                    // configuration is serialized (for example,
+                    // `extruder_type` in a G-code footer).
+                    if (def->type == coEnums) {
+                        assert(def->enum_keys_map != nullptr);
+                        if (auto *enums = dynamic_cast<ConfigOptionEnumsGeneric *>(opt); enums != nullptr)
+                            enums->keys_map = def->enum_keys_map;
+                        else if (auto *enums_nullable = dynamic_cast<ConfigOptionEnumsGenericNullable *>(opt);
+                                 enums_nullable != nullptr)
+                            enums_nullable->keys_map = def->enum_keys_map;
+                    }
+                }
             }
         }
 

@@ -31,12 +31,14 @@ def shape_score(result: dict[str, Any], coverage_target: float, spacing_target: 
     spacing = metric(result, "spacingViolations")
     crossings = metric(result, "selfIntersections")
     containment = metric(result, "containmentViolations")
+    extrusion = metric(result, "extrusionViolationCount")
     missed = metric(result, "missedContourCount")
     overlap = metric(result, "internalOverlapRatio")
     underfill = metric(result, "underfillRatio")
     return (
         max(0.0, coverage_target - coverage),
         max(0.0, spacing - spacing_target) / 1000.0,
+        extrusion,
         crossings,
         containment,
         missed,
@@ -77,7 +79,7 @@ def print_table(results: list[dict[str, Any]], args: argparse.Namespace) -> None
         reverse=True,
     )
     print(
-        "shape                 ok  cov    under  overlap spacing cross contain miss roots contours gaps insert largestUF  sec"
+        "shape                 ok  cov    under  overlap spacing cross bead turn contain miss roots contours gaps insert safe largestUF  sec"
     )
     for result in rows:
         metrics = result.get("metrics", {})
@@ -89,28 +91,24 @@ def print_table(results: list[dict[str, Any]], args: argparse.Namespace) -> None
             f"{metric(result, 'internalOverlapRatio'):.3f}   "
             f"{int(metric(result, 'spacingViolations')):7d} "
             f"{int(metric(result, 'selfIntersections')):5d} "
+            f"{int(metric(result, 'beadOverlapViolations')):4d} "
+            f"{int(metric(result, 'turnbackViolations')):4d} "
             f"{int(metric(result, 'containmentViolations')):7d} "
             f"{int(metric(result, 'missedContourCount')):4d} "
             f"{int(metric(result, 'treeRoots')):5d} "
             f"{int(metric(result, 'contourCount')):8d} "
             f"{int(metric(result, 'residualGapContours')):4d} "
             f"{int(metric(result, 'residualGapSpirals')):6d} "
+            f"{int(metric(result, 'safeUnderfillDetours')):4d} "
             f"{int(metric(result, 'largestUnderfillComponent')):9d} "
             f"{result['benchmark']['wallSeconds']:5.1f}"
         )
 
-    passed = [
-        result
-        for result in results
-        if metric(result, "coverageRatio") >= args.coverage_target
-        and metric(result, "spacingViolations") <= args.spacing_target
-        and metric(result, "selfIntersections") == 0
-        and metric(result, "containmentViolations") == 0
-    ]
+    passed = [result for result in results if bool(result.get("ok"))]
     print()
     print(
         f"passed {len(passed)}/{len(results)} "
-        f"(coverage >= {args.coverage_target:.3f}, spacing warnings <= {args.spacing_target})"
+        f"(coverage >= {args.coverage_target:.3f}, spacing warnings <= {args.spacing_target}, bead violations = 0)"
     )
 
 
@@ -136,16 +134,15 @@ def main() -> int:
     print_table(results, args)
 
     if args.json_path:
-        Path(args.json_path).write_text(json.dumps(results, indent=2), encoding="utf-8")
+        json_path = Path(args.json_path)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
-    failed = [
-        result
-        for result in results
-        if metric(result, "coverageRatio") < args.coverage_target
-        or metric(result, "spacingViolations") > args.spacing_target
-        or metric(result, "selfIntersections") != 0
-        or metric(result, "containmentViolations") != 0
-    ]
+    # The planner owns the complete contract (coverage, overlap, topology,
+    # missed contours, spacing, containment, and physical extrusion checks).
+    # Duplicating only a subset here previously reported unsafe results as
+    # benchmark passes.
+    failed = [result for result in results if not bool(result.get("ok"))]
     return 1 if failed else 0
 
 

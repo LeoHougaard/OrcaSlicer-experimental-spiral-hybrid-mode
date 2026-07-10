@@ -7,13 +7,14 @@
 #include "Print.hpp"
 
 #include <algorithm>
+#include <array>
 #include <boost/log/trivial.hpp>
 #include <cmath>
-#include <cstdlib>
 #include <limits>
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -31,6 +32,9 @@ struct ContourLoop
     double area { 0.0 };
     double length { 0.0 };
     Point centroid;
+    bool closed { true };
+    double line_width { 0.0 };
+    double flow_multiplier { 1.0 };
 };
 
 double point_distance(const Point &a, const Point &b)
@@ -122,12 +126,6 @@ double segment_distance(const Point &a, const Point &b, const Point &c, const Po
         point_segment_distance(c, a, b),
         point_segment_distance(d, a, b),
     });
-}
-
-bool debug_fallback_enabled()
-{
-    const char *value = std::getenv("ORCA_CONTINUOUS_FERMAT_ALLOW_FALLBACK");
-    return value != nullptr && (std::string(value) == "1" || std::string(value) == "true" || std::string(value) == "TRUE");
 }
 
 std::string layer_diagnostics(const Layer &layer, const ExPolygons &printable_area, const Flow *flow = nullptr)
@@ -537,6 +535,169 @@ std::vector<ContourLoop> filter_ring_medial_overlap(const std::vector<ContourLoo
     return stable.empty() ? contours : stable;
 }
 
+double open_polyline_distance(const Point &p, const Points &points)
+{
+    if (points.empty())
+        return std::numeric_limits<double>::infinity();
+    if (points.size() == 1)
+        return point_distance(p, points.front());
+
+    double best = std::numeric_limits<double>::infinity();
+    for (size_t i = 1; i < points.size(); ++i)
+        best = std::min(best, point_segment_distance(p, points[i - 1], points[i]));
+    return best;
+}
+
+double contour_distance(const Point &p, const ContourLoop &contour)
+{
+    return contour.closed ? distance_to_loop(p, contour.points) : open_polyline_distance(p, contour.points);
+}
+
+struct TerminalAxes
+{
+    Vec2d center;
+    Vec2d major;
+    Vec2d minor;
+    double min_major { 0.0 };
+    double max_major { 0.0 };
+    double min_minor { 0.0 };
+    double max_minor { 0.0 };
+};
+
+bool principal_terminal_axes(const Points &points, TerminalAxes &axes)
+{
+    if (points.size() < 4)
+        return false;
+
+    axes.center = Vec2d::Zero();
+    for (const Point &point : points)
+        axes.center += point.cast<double>();
+    axes.center /= double(points.size());
+
+    double xx = 0.0;
+    double xy = 0.0;
+    double yy = 0.0;
+    for (const Point &point : points) {
+        const Vec2d delta = point.cast<double>() - axes.center;
+        xx += delta.x() * delta.x();
+        xy += delta.x() * delta.y();
+        yy += delta.y() * delta.y();
+    }
+    if (xx + yy <= EPS)
+        return false;
+
+    const double angle = 0.5 * std::atan2(2.0 * xy, xx - yy);
+    axes.major = Vec2d(std::cos(angle), std::sin(angle));
+    axes.minor = Vec2d(-axes.major.y(), axes.major.x());
+
+    auto extrema = [&](const Vec2d &axis) {
+        double lo = std::numeric_limits<double>::infinity();
+        double hi = -std::numeric_limits<double>::infinity();
+        for (const Point &point : points) {
+            const double value = (point.cast<double>() - axes.center).dot(axis);
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+        }
+        return std::pair<double, double>(lo, hi);
+    };
+
+    std::tie(axes.min_major, axes.max_major) = extrema(axes.major);
+    std::tie(axes.min_minor, axes.max_minor) = extrema(axes.minor);
+    if (axes.max_minor - axes.min_minor > axes.max_major - axes.min_major) {
+        std::swap(axes.major, axes.minor);
+        std::swap(axes.min_major, axes.min_minor);
+        std::swap(axes.max_major, axes.max_minor);
+    }
+
+    return true;
+}
+
+std::vector<ContourLoop> add_terminal_medial_gap_fill(
+    const std::vector<ContourLoop> &contours,
+    const double line_width,
+    const double line_height,
+    const double spacing)
+{
+    if (contours.empty())
+        return contours;
+
+    size_t last_level = 0;
+    for (const ContourLoop &loop : contours)
+        last_level = std::max(last_level, loop.level_index);
+
+    size_t terminal_index = 0;
+    size_t terminal_count = 0;
+    for (size_t i = 0; i < contours.size(); ++i) {
+        if (contours[i].level_index == last_level) {
+            terminal_index = i;
+            ++terminal_count;
+        }
+    }
+    if (terminal_count != 1)
+        return contours;
+
+    const ContourLoop &terminal = contours[terminal_index];
+    if (!terminal.closed || terminal.points.size() < 4)
+        return contours;
+
+    TerminalAxes axes;
+    if (!principal_terminal_axes(terminal.points, axes))
+        return contours;
+
+    const double major_span = axes.max_major - axes.min_major;
+    const double minor_span = axes.max_minor - axes.min_minor;
+    if (major_span < spacing * 6.0)
+        return contours;
+    if (!(line_width * 1.02 < minor_span && minor_span < line_width * 2.05))
+        return contours;
+
+    // A closed terminal loop contributes two opposing passes.  Redistribute
+    // the remaining band over those two passes instead of adding a third open
+    // medial pass: an odd three-pass ladder cannot reconnect to same-side CFS
+    // ports without a long retrace.
+    const double adaptive_width = (minor_span + line_width) / 2.0;
+    if (!(line_width * 1.01 <= adaptive_width && adaptive_width < line_width * 1.55))
+        return contours;
+
+    const double mid_minor = 0.5 * (axes.min_minor + axes.max_minor);
+    const double rounded_corner_loss = line_height * (1.0 - 0.25 * PI);
+    const double nominal_cross_section = line_width - rounded_corner_loss;
+    const double adaptive_cross_section = adaptive_width - rounded_corner_loss;
+    if (!(nominal_cross_section > EPS) || !(adaptive_cross_section > nominal_cross_section))
+        return contours;
+
+    ContourLoop adjusted = terminal;
+    adjusted.points.clear();
+    adjusted.points.reserve(terminal.points.size());
+    for (const Point &point : terminal.points) {
+        const Vec2d rel = point.cast<double>() - axes.center;
+        const double major_coord = rel.dot(axes.major);
+        const double minor_coord = rel.dot(axes.minor);
+        const double side = minor_coord >= mid_minor ? 1.0 : -1.0;
+        const Vec2d remapped =
+            axes.center + axes.major * major_coord + axes.minor * (mid_minor + side * adaptive_width * 0.5);
+        append_point(adjusted.points, Point(remapped.x(), remapped.y()));
+    }
+    adjusted.points = densify_closed_loop_preserving_vertices(adjusted.points, std::max(spacing * 0.25, 1.0));
+    if (signed_area(adjusted.points) < 0.0)
+        std::reverse(adjusted.points.begin(), adjusted.points.end());
+    adjusted.area = std::abs(signed_area(adjusted.points));
+    adjusted.length = polyline_length(adjusted.points, true);
+    adjusted.centroid = polygon_centroid_or_first(adjusted.points);
+    adjusted.closed = true;
+    adjusted.line_width = adaptive_width;
+    adjusted.flow_multiplier = adaptive_cross_section / nominal_cross_section;
+
+    std::vector<ContourLoop> out = contours;
+    out[terminal_index] = std::move(adjusted);
+    std::sort(out.begin(), out.end(), [](const ContourLoop &a, const ContourLoop &b) {
+        if (a.level_index != b.level_index)
+            return a.level_index < b.level_index;
+        return a.area > b.area;
+    });
+    return out;
+}
+
 std::vector<ContourLoop> generate_offset_contours(
     const ExPolygons &printable_area,
     const double line_width,
@@ -544,7 +705,6 @@ std::vector<ContourLoop> generate_offset_contours(
     const size_t precise_wall_levels)
 {
     const double first_offset = line_width * 0.5;
-    const double min_area = spacing * spacing * 8.0;
     const double min_length = spacing * 5.0;
 
     std::vector<ContourLoop> contours;
@@ -575,7 +735,15 @@ std::vector<ContourLoop> generate_offset_contours(
                 loop.area = std::abs(double(polygon.area()));
                 loop.length = polyline_length(loop.points, true);
                 loop.centroid = polygon_centroid_or_first(loop.points);
-                if (loop.area >= min_area && loop.length >= min_length)
+                // A small-area inset may still be the only centerline capable
+                // of covering a terminal core (for example, a 20 mm square at
+                // 1.2 mm line width).  Area alone used to discard that valid
+                // loop.  Conversely, perimeter alone retains arbitrarily thin
+                // terminal slivers and creates near-retracing strokes.  The
+                // hydraulic-diameter proxy distinguishes the two without
+                // weakening the unchanged mandatory final gate.
+                const double thickness_proxy = loop.length > EPS ? 4.0 * loop.area / loop.length : 0.0;
+                if (loop.length >= min_length && thickness_proxy >= spacing * 0.80)
                     contours.emplace_back(std::move(loop));
             };
             add_polygon(expoly.contour);
@@ -599,6 +767,65 @@ std::vector<ContourLoop> generate_offset_contours(
 std::vector<ContourLoop> generate_offset_contours(const ExPolygons &printable_area, const Flow &flow)
 {
     return generate_offset_contours(printable_area, double(flow.scaled_width()), double(flow.scaled_spacing()), 3);
+}
+
+std::vector<ContourLoop> add_ring_medial_contours(
+    const ExPolygons &printable_area,
+    std::vector<ContourLoop> contours,
+    const Flow &flow)
+{
+    const auto grouped = loops_by_level(contours);
+    if (grouped.empty() || grouped.begin()->second.size() != 2 ||
+        point_distance(grouped.begin()->second[0].centroid, grouped.begin()->second[1].centroid) >=
+            double(flow.scaled_spacing()) * 2.0)
+        return contours;
+
+    Polygons swept;
+    for (const ContourLoop &loop : contours) {
+        if (!loop.closed || loop.points.size() < 4)
+            continue;
+        Points closed = loop.points;
+        append_point(closed, closed.front());
+        Polygons bead = offset(
+            Polyline(std::move(closed)),
+            float(double(flow.scaled_width()) * 0.5),
+            ClipperLib::jtRound,
+            SCALED_RESOLUTION,
+            ClipperLib::etOpenRound);
+        swept.insert(swept.end(), std::make_move_iterator(bead.begin()), std::make_move_iterator(bead.end()));
+    }
+    if (swept.empty())
+        return contours;
+
+    const ExPolygons residual = diff_ex(printable_area, union_(swept));
+    if (residual.empty())
+        return contours;
+    std::vector<ContourLoop> medial = generate_offset_contours(
+        residual,
+        double(flow.scaled_width()),
+        double(flow.scaled_spacing()),
+        0);
+    if (medial.empty())
+        return contours;
+
+    size_t first_medial_level = medial.front().level_index;
+    for (const ContourLoop &loop : medial)
+        first_medial_level = std::min(first_medial_level, loop.level_index);
+    medial.erase(
+        std::remove_if(medial.begin(), medial.end(), [first_medial_level](const ContourLoop &loop) {
+            return loop.level_index != first_medial_level;
+        }),
+        medial.end());
+    if (medial.size() != 2)
+        return contours;
+
+    size_t next_level = 0;
+    for (const ContourLoop &loop : contours)
+        next_level = std::max(next_level, loop.level_index + 1);
+    for (ContourLoop &loop : medial)
+        loop.level_index = next_level;
+    contours.insert(contours.end(), std::make_move_iterator(medial.begin()), std::make_move_iterator(medial.end()));
+    return contours;
 }
 
 std::vector<ContourLoop> ordered_loops_for_spiral(const std::vector<ContourLoop> &contours)
@@ -650,19 +877,104 @@ std::vector<ContourLoop> ordered_loops_for_spiral(const std::vector<ContourLoop>
     return ordered;
 }
 
+Points terminal_medial_band_path(
+    const ContourLoop &terminal,
+    const ContourLoop &medial,
+    const Point &start_hint,
+    const Point &end_hint)
+{
+    if (terminal.line_width <= EPS || medial.points.size() < 2)
+        return {};
+
+    const Point &a = medial.points.front();
+    const Point &b = medial.points.back();
+    const Vec2d axis = (b - a).cast<double>();
+    const double axis_length = axis.norm();
+    if (axis_length <= EPS)
+        return {};
+
+    const Vec2d major = axis / axis_length;
+    Vec2d minor(-major.y(), major.x());
+    const Vec2d center = (a.cast<double>() + b.cast<double>()) * 0.5;
+
+    if (!terminal.points.empty()) {
+        const Point *farthest = &terminal.points.front();
+        double best = -1.0;
+        for (const Point &point : terminal.points) {
+            const double value = std::abs((point.cast<double>() - center).dot(minor));
+            if (value > best) {
+                best = value;
+                farthest = &point;
+            }
+        }
+        if ((farthest->cast<double>() - center).dot(minor) < 0.0)
+            minor = -minor;
+    }
+
+    auto side_point = [&](const int side, const double level) {
+        const Vec2d base = side == 0 ? a.cast<double>() : b.cast<double>();
+        const Vec2d p = base + minor * (level * terminal.line_width);
+        return Point(p.x(), p.y());
+    };
+
+    std::vector<std::pair<double, Points>> candidates;
+    for (const int start_side : { 0, 1 }) {
+        for (const std::array<double, 3> levels : { std::array<double, 3>{ 1.0, 0.0, -1.0 },
+                                                    std::array<double, 3>{ -1.0, 0.0, 1.0 } }) {
+            int current_side = start_side;
+            Points path;
+            for (size_t idx = 0; idx < levels.size(); ++idx) {
+                const int next_side = 1 - current_side;
+                append_point(path, side_point(current_side, levels[idx]));
+                append_point(path, side_point(next_side, levels[idx]));
+                if (idx + 1 < levels.size())
+                    append_point(path, side_point(next_side, levels[idx + 1]));
+                current_side = next_side;
+            }
+            const double score = point_distance(start_hint, path.front()) + point_distance(path.back(), end_hint);
+            candidates.emplace_back(score, std::move(path));
+        }
+    }
+
+    if (candidates.empty())
+        return {};
+    return std::min_element(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) { return a.first < b.first; })->second;
+}
+
+struct PairMetrics
+{
+    int crossings { 0 };
+    int close_pairs { 0 };
+    int bead_overlaps { 0 };
+    double min_spacing { std::numeric_limits<double>::infinity() };
+    std::string first_bead_overlap;
+};
+
+PairMetrics path_pair_metrics(
+    const Points &path,
+    double spacing,
+    const std::vector<double> *segment_widths = nullptr,
+    double nominal_line_width = 0.0);
+
 Points build_single_minimum_connected_fermat(
     std::vector<ContourLoop> loops,
     const Point &start_anchor,
     const double spacing,
     const Point &exit_anchor,
-    const bool preserve_medial_pockets = true)
+    const bool preserve_medial_pockets = true,
+    const double seam_port_factor = 1.17)
 {
-    loops.erase(std::remove_if(loops.begin(), loops.end(), [](const ContourLoop &loop) { return loop.points.size() < 4; }), loops.end());
+    loops.erase(std::remove_if(loops.begin(), loops.end(), [](const ContourLoop &loop) {
+        return loop.points.size() < (loop.closed ? 4 : 2);
+    }), loops.end());
     if (loops.empty())
         return {};
 
-    const double port_spacing = spacing * 2.5;
+    const double seam_port_spacing = spacing * seam_port_factor;
     if (loops.size() == 1) {
+        if (!loops.front().closed)
+            return loops.front().points;
+
         const Points &points = loops.front().points;
         const size_t n = points.size();
         const size_t start = size_t(std::round(loop_nearest_index(points, start_anchor))) % n;
@@ -691,6 +1003,39 @@ Points build_single_minimum_connected_fermat(
         const ContourLoop &loop = loops[loop_index];
         const Points &points = loop.points;
         const size_t n = points.size();
+
+        if (loop.closed && loop_index + 1 < loops.size() && !loops[loop_index + 1].closed &&
+            !in_branch.empty() && !out_branch.empty()) {
+            Points band_path = terminal_medial_band_path(loop, loops[loop_index + 1], in_branch.back(), out_branch.back());
+            if (!band_path.empty()) {
+                append_points(in_branch, band_path);
+                break;
+            }
+        }
+
+        if (!loop.closed) {
+            if (points.size() < 2)
+                break;
+            if (in_branch.empty() || out_branch.empty())
+                return { points.front(), points.back() };
+
+            const Point &a = points.front();
+            const Point &b = points.back();
+            const double forward_score = point_distance(in_branch.back(), a) + point_distance(out_branch.back(), b);
+            const double reverse_score = point_distance(in_branch.back(), b) + point_distance(out_branch.back(), a);
+            if (forward_score <= reverse_score) {
+                append_point(in_branch, a);
+                append_point(out_branch, b);
+                append_point(in_branch, b);
+            } else {
+                append_point(in_branch, b);
+                append_point(out_branch, a);
+                append_point(in_branch, a);
+            }
+            break;
+        }
+
+        const double port_spacing = seam_port_spacing;
         const bool circle_small = loop.length < port_spacing * 2.0;
 
         if (circle_small) {
@@ -884,22 +1229,47 @@ Points build_single_minimum_connected_fermat(
             in_index = loop_nearest_index(child_points, in_branch.back());
             out_index = loop_nearest_index(child_points, out_branch.back());
         } else {
-            const Point &prev_in = in_branch.back();
-            const Point &prev_out = out_branch.back();
-            size_t medial_index = 0;
-            double best = -1.0;
-            for (size_t i = 0; i < n; ++i) {
-                const double score = std::min(point_distance(points[i], prev_in), point_distance(points[i], prev_out));
-                if (score > best) {
-                    best = score;
-                    medial_index = i;
-                }
+            struct TerminalCandidate
+            {
+                PairMetrics metrics;
+                double arc_length { 0.0 };
+                Points path;
+            };
+
+            std::vector<TerminalCandidate> candidates;
+            for (const int direction : { 1, -1 }) {
+                const Points arc = loop_arc_between_params(points, in_index, out_index, direction);
+                if (arc.size() < 2)
+                    continue;
+                const double arc_length = polyline_length(arc, false);
+                if (arc_length + EPS < loop.length * 0.5)
+                    continue;
+                bool bounded_edges = true;
+                for (size_t i = 1; i < arc.size(); ++i)
+                    bounded_edges &= point_distance(arc[i - 1], arc[i]) <= spacing * 2.0;
+                if (!bounded_edges)
+                    continue;
+
+                Points candidate = in_branch;
+                for (size_t i = 1; i < arc.size(); ++i)
+                    append_point(candidate, arc[i]);
+                for (auto it = out_branch.rbegin(); it != out_branch.rend(); ++it)
+                    append_point(candidate, *it);
+                candidates.push_back({ path_pair_metrics(candidate, spacing), arc_length, std::move(candidate) });
             }
-            if (subset_cycle_param(in_index, out_index, double(medial_index), true, false))
-                append_loop_vertices_forward(in_branch, points, size_t(std::ceil(in_index)) % n, size_t(std::floor(out_index)) % n);
-            else
-                append_loop_vertices_forward(out_branch, points, size_t(std::ceil(out_index)) % n, size_t(std::floor(in_index)) % n);
-            break;
+
+            if (candidates.empty())
+                return {};
+            const auto better = [](const TerminalCandidate &a, const TerminalCandidate &b) {
+                if (a.metrics.crossings != b.metrics.crossings)
+                    return a.metrics.crossings < b.metrics.crossings;
+                if (a.metrics.close_pairs != b.metrics.close_pairs)
+                    return a.metrics.close_pairs < b.metrics.close_pairs;
+                if (a.metrics.min_spacing != b.metrics.min_spacing)
+                    return a.metrics.min_spacing > b.metrics.min_spacing;
+                return a.arc_length > b.arc_length;
+            };
+            return std::min_element(candidates.begin(), candidates.end(), better)->path;
         }
 
         first_circle = false;
@@ -910,14 +1280,11 @@ Points build_single_minimum_connected_fermat(
     return in_branch;
 }
 
-struct PairMetrics
-{
-    int crossings { 0 };
-    int close_pairs { 0 };
-    double min_spacing { std::numeric_limits<double>::infinity() };
-};
-
-PairMetrics path_pair_metrics(const Points &path, const double spacing)
+PairMetrics path_pair_metrics(
+    const Points &path,
+    const double spacing,
+    const std::vector<double> *segment_widths,
+    const double nominal_line_width)
 {
     PairMetrics metrics;
     if (path.size() < 4)
@@ -934,41 +1301,49 @@ PairMetrics path_pair_metrics(const Points &path, const double spacing)
     for (const Segment &seg : segments)
         prefix.push_back(prefix.back() + point_distance(seg.a, seg.b));
 
-    const double min_allowed = spacing * 0.90;
-    const double bin_size = std::max(spacing * 1.5, 1.0);
+    // Match the documented strict benchmark's 25% spacing tolerance.  Pairs
+    // inside the local four-spacing arc window are part of one continuous
+    // turn; only non-local centerlines below 75% of nominal are warnings.
+    const double min_allowed = spacing * 0.75;
+    const bool audit_bead_widths = segment_widths != nullptr && segment_widths->size() == segments.size() && nominal_line_width > EPS;
+    const double max_segment_width = audit_bead_widths ?
+        *std::max_element(segment_widths->begin(), segment_widths->end()) : 0.0;
+    const double search_margin = std::max(min_allowed, max_segment_width);
+    const double bin_size = std::max(search_margin * 1.5, 1.0);
     const double local_skip_distance = spacing * 4.0;
+    const double bead_local_skip_distance = spacing * 4.0;
+    const double allowed_nominal_penetration =
+        std::max(0.0, nominal_line_width - spacing) + nominal_line_width * 0.02;
     const double path_length = prefix.back();
     const bool closed_path = point_distance(path.front(), path.back()) <= spacing * 0.20;
-    std::unordered_map<long long, std::vector<size_t>> bins;
-
-    auto key = [&](const double x, const double y) {
-        const long long bx = (long long)std::floor(x / bin_size);
-        const long long by = (long long)std::floor(y / bin_size);
-        return (bx << 32) ^ (by & 0xffffffffLL);
+    std::unordered_map<unsigned long long, std::vector<size_t>> bins;
+    const auto bin_key = [](const long long bx, const long long by) {
+        return (static_cast<unsigned long long>(uint32_t(bx)) << 32) |
+               static_cast<unsigned long long>(uint32_t(by));
     };
 
     for (size_t idx = 0; idx < segments.size(); ++idx) {
         const Segment &seg = segments[idx];
-        const double min_x = std::min(seg.a.x(), seg.b.x()) - min_allowed;
-        const double min_y = std::min(seg.a.y(), seg.b.y()) - min_allowed;
-        const double max_x = std::max(seg.a.x(), seg.b.x()) + min_allowed;
-        const double max_y = std::max(seg.a.y(), seg.b.y()) + min_allowed;
+        const double min_x = std::min(seg.a.x(), seg.b.x()) - search_margin;
+        const double min_y = std::min(seg.a.y(), seg.b.y()) - search_margin;
+        const double max_x = std::max(seg.a.x(), seg.b.x()) + search_margin;
+        const double max_y = std::max(seg.a.y(), seg.b.y()) + search_margin;
         const long long bx0 = (long long)std::floor(min_x / bin_size);
         const long long by0 = (long long)std::floor(min_y / bin_size);
         const long long bx1 = (long long)std::floor(max_x / bin_size);
         const long long by1 = (long long)std::floor(max_y / bin_size);
         for (long long by = by0; by <= by1; ++by)
             for (long long bx = bx0; bx <= bx1; ++bx)
-                bins[(bx << 32) ^ (by & 0xffffffffLL)].push_back(idx);
+                bins[bin_key(bx, by)].push_back(idx);
     }
 
     std::unordered_set<unsigned long long> checked;
     for (size_t i = 0; i < segments.size(); ++i) {
         const Segment &seg = segments[i];
-        const double min_x = std::min(seg.a.x(), seg.b.x()) - min_allowed;
-        const double min_y = std::min(seg.a.y(), seg.b.y()) - min_allowed;
-        const double max_x = std::max(seg.a.x(), seg.b.x()) + min_allowed;
-        const double max_y = std::max(seg.a.y(), seg.b.y()) + min_allowed;
+        const double min_x = std::min(seg.a.x(), seg.b.x()) - search_margin;
+        const double min_y = std::min(seg.a.y(), seg.b.y()) - search_margin;
+        const double max_x = std::max(seg.a.x(), seg.b.x()) + search_margin;
+        const double max_y = std::max(seg.a.y(), seg.b.y()) + search_margin;
         const long long bx0 = (long long)std::floor(min_x / bin_size);
         const long long by0 = (long long)std::floor(min_y / bin_size);
         const long long bx1 = (long long)std::floor(max_x / bin_size);
@@ -976,7 +1351,7 @@ PairMetrics path_pair_metrics(const Points &path, const double spacing)
 
         for (long long by = by0; by <= by1; ++by)
             for (long long bx = bx0; bx <= bx1; ++bx)
-                if (auto it = bins.find((bx << 32) ^ (by & 0xffffffffLL)); it != bins.end()) {
+                if (auto it = bins.find(bin_key(bx, by)); it != bins.end()) {
                     for (const size_t j : it->second) {
                         if (j <= i)
                             continue;
@@ -987,7 +1362,7 @@ PairMetrics path_pair_metrics(const Points &path, const double spacing)
                         size_t index_distance = j - i;
                         if (closed_path)
                             index_distance = std::min(index_distance, segments.size() - index_distance);
-                        if (index_distance <= 6)
+                        if (index_distance <= 1)
                             continue;
 
                         double path_gap = std::max(0.0, prefix[j] - prefix[i + 1]);
@@ -995,15 +1370,44 @@ PairMetrics path_pair_metrics(const Points &path, const double spacing)
                             const double occupied_span = prefix[j + 1] - prefix[i];
                             path_gap = std::min(path_gap, std::max(0.0, path_length - occupied_span));
                         }
-                        if (path_gap <= local_skip_distance)
-                            continue;
 
                         const double d = segment_distance(seg.a, seg.b, segments[j].a, segments[j].b);
-                        metrics.min_spacing = std::min(metrics.min_spacing, d);
-                        if (d <= 1e-7)
+                        if (d <= 1e-7) {
+                            // A zero/sub-resolution bridge vertex may split
+                            // one physical turn into segments whose indices
+                            // are non-adjacent.  Treat only that tiny connected
+                            // arc as adjacency; every other intersection,
+                            // including a small bow-tie, is a crossing.
+                            if (path_gap <= 1e-9)
+                                continue;
                             ++metrics.crossings;
-                        else if (d < min_allowed)
-                            ++metrics.close_pairs;
+                            metrics.min_spacing = std::min(metrics.min_spacing, d);
+                            continue;
+                        }
+                        if (path_gap > local_skip_distance) {
+                            metrics.min_spacing = std::min(metrics.min_spacing, d);
+                            if (d < min_allowed)
+                                ++metrics.close_pairs;
+                        }
+                        if (audit_bead_widths && path_gap > bead_local_skip_distance) {
+                            const double radius_sum =
+                                0.5 * ((*segment_widths)[i] + (*segment_widths)[j]);
+                            if (d < radius_sum - allowed_nominal_penetration) {
+                                ++metrics.bead_overlaps;
+                                if (metrics.first_bead_overlap.empty()) {
+                                    std::ostringstream detail;
+                                    detail << "segments " << i << "/" << j << " distance=" << unscale<double>(d)
+                                           << " path_gap=" << unscale<double>(path_gap)
+                                           << " widths=" << unscale<double>((*segment_widths)[i]) << "/"
+                                           << unscale<double>((*segment_widths)[j])
+                                           << " a=" << unscale<double>(segments[i].a.x()) << "," << unscale<double>(segments[i].a.y())
+                                           << "->" << unscale<double>(segments[i].b.x()) << "," << unscale<double>(segments[i].b.y())
+                                           << " b=" << unscale<double>(segments[j].a.x()) << "," << unscale<double>(segments[j].a.y())
+                                           << "->" << unscale<double>(segments[j].b.x()) << "," << unscale<double>(segments[j].b.y());
+                                    metrics.first_bead_overlap = detail.str();
+                                }
+                            }
+                        }
                     }
                 }
     }
@@ -1011,13 +1415,78 @@ PairMetrics path_pair_metrics(const Points &path, const double spacing)
     return metrics;
 }
 
+Points replace_long_connectors_with_contour_arcs(
+    Points path,
+    const std::vector<ContourLoop> &contours,
+    const double spacing)
+{
+    for (size_t repair = 0; repair < 8 && path.size() >= 2; ++repair) {
+        const PairMetrics baseline = path_pair_metrics(path, spacing);
+        Points best_path;
+        PairMetrics best_metrics = baseline;
+        bool improved = false;
+
+        for (size_t segment_index = 1; segment_index < path.size(); ++segment_index) {
+            const Point &a = path[segment_index - 1];
+            const Point &b = path[segment_index];
+            if (point_distance(a, b) <= spacing * 3.0)
+                continue;
+
+            for (const ContourLoop &loop : contours) {
+                if (!loop.closed || loop.points.size() < 4)
+                    continue;
+                const double a_index = loop_nearest_index(loop.points, a);
+                const double b_index = loop_nearest_index(loop.points, b);
+                if (point_distance(a, loop_point_at_index(loop.points, a_index)) > spacing * 1.5 ||
+                    point_distance(b, loop_point_at_index(loop.points, b_index)) > spacing * 1.5)
+                    continue;
+
+                for (const int direction : { 1, -1 }) {
+                    const Points arc = loop_arc_between_params(loop.points, a_index, b_index, direction);
+                    if (arc.size() < 2)
+                        continue;
+                    bool bounded_edges = true;
+                    for (size_t i = 1; i < arc.size(); ++i)
+                        bounded_edges &= point_distance(arc[i - 1], arc[i]) <= spacing * 2.0;
+                    if (!bounded_edges)
+                        continue;
+
+                    Points candidate;
+                    candidate.reserve(path.size() + arc.size() + 2);
+                    for (size_t i = 0; i < segment_index; ++i)
+                        append_point(candidate, path[i]);
+                    append_points(candidate, arc);
+                    append_point(candidate, b);
+                    for (size_t i = segment_index + 1; i < path.size(); ++i)
+                        append_point(candidate, path[i]);
+
+                    const PairMetrics metrics = path_pair_metrics(candidate, spacing);
+                    const bool better = metrics.crossings < best_metrics.crossings ||
+                        (metrics.crossings == best_metrics.crossings && metrics.close_pairs < best_metrics.close_pairs) ||
+                        (metrics.crossings == best_metrics.crossings && metrics.close_pairs == best_metrics.close_pairs &&
+                         metrics.min_spacing > best_metrics.min_spacing);
+                    if (better) {
+                        best_path = std::move(candidate);
+                        best_metrics = metrics;
+                        improved = true;
+                    }
+                }
+            }
+        }
+
+        if (!improved)
+            break;
+        path = std::move(best_path);
+    }
+    return path;
+}
+
 Points complete_outer_boundary_cycle(const Points &path, const ContourLoop &outer_loop, const double spacing)
 {
     if (path.size() < 2 || outer_loop.points.size() < 4)
         return path;
 
-    const double target_gap = spacing * 0.12;
-    if (point_distance(path.front(), path.back()) <= target_gap * 1.5)
+    if (path.front() == path.back())
         return path;
 
     const double start_index = loop_nearest_index(outer_loop.points, path.front());
@@ -1032,21 +1501,23 @@ Points complete_outer_boundary_cycle(const Points &path, const ContourLoop &oute
 
     std::vector<Candidate> candidates;
     for (const int direction : { 1, -1 }) {
-        const double stop_index = direction > 0 ?
-            loop_back_by_distance(outer_loop.points, start_index, target_gap) :
-            loop_forward_by_distance(outer_loop.points, start_index, target_gap);
+        const double stop_index = start_index;
         Points arc = loop_arc_between_params(outer_loop.points, end_index, stop_index, direction);
-        if (arc.size() < 2)
+        if (arc.empty())
             continue;
 
-        arc.front() = path.back();
         Points candidate;
-        candidate.reserve(path.size() + arc.size());
+        candidate.reserve(path.size() + arc.size() + 1);
         append_points(candidate, path);
-        for (size_t i = 1; i < arc.size(); ++i)
-            append_point(candidate, arc[i]);
+        // Keep the actual projections onto the outer contour.  Replacing the
+        // arc endpoints with the open path endpoints can turn the first arc
+        // edge into a long chord across a concavity (and a real extruded
+        // crossing) whenever a branch merge leaves an endpoint slightly off
+        // the outer contour.
+        append_points(candidate, arc);
+        append_point(candidate, path.front());
 
-        if (point_distance(candidate.front(), candidate.back()) > spacing * 0.20)
+        if (candidate.front() != candidate.back())
             continue;
 
         candidates.push_back({ path_pair_metrics(candidate, spacing), polyline_length(arc, false), std::move(candidate) });
@@ -1071,44 +1542,41 @@ Points build_best_single_chain_path(
     const std::vector<ContourLoop> &ordered,
     const Point &start_anchor,
     const double spacing,
-    const bool preserve_medial_pockets = true)
+    const bool preserve_medial_pockets = true,
+    const double seam_port_factor = 1.17)
 {
     const std::vector<double> exit_fractions { 0.50, 0.67, 0.33, 0.25, 0.75, 0.10, 0.90 };
     Points best_path;
     PairMetrics best_metrics;
-    size_t best_loop_count = 0;
     bool have_best = false;
 
-    auto better_than_best = [&](const PairMetrics &metrics, const size_t loop_count) {
+    auto better_than_best = [&](const PairMetrics &metrics) {
         return !have_best || metrics.crossings < best_metrics.crossings ||
             (metrics.crossings == best_metrics.crossings && metrics.close_pairs < best_metrics.close_pairs) ||
             (metrics.crossings == best_metrics.crossings && metrics.close_pairs == best_metrics.close_pairs &&
-             loop_count > best_loop_count) ||
-            (metrics.crossings == best_metrics.crossings && metrics.close_pairs == best_metrics.close_pairs &&
-             loop_count == best_loop_count && metrics.min_spacing > best_metrics.min_spacing);
+             metrics.min_spacing > best_metrics.min_spacing);
     };
 
-    for (size_t loop_count = ordered.size(); loop_count >= 1; --loop_count) {
-        const std::vector<ContourLoop> candidate_loops(ordered.begin(), ordered.begin() + loop_count);
-        for (const double fraction : exit_fractions) {
-            const Point exit_anchor = point_at_closed_fraction(candidate_loops.front().points, fraction);
-            Points candidate = build_single_minimum_connected_fermat(
-                candidate_loops, start_anchor, spacing, exit_anchor, preserve_medial_pockets);
-            if (candidate.size() < 2)
-                continue;
+    // Every retained offset contour represents printable material.  Older
+    // code progressively removed inner contours until a clean-looking path
+    // appeared, which could return only the outer wall while silently losing
+    // almost 90% of a solid layer.  Try routing variants, but never trade away
+    // required contours; the mandatory final coverage gate decides whether the
+    // complete route is usable.
+    for (const double fraction : exit_fractions) {
+        const Point exit_anchor = point_at_closed_fraction(ordered.front().points, fraction);
+        Points candidate = build_single_minimum_connected_fermat(
+            ordered, start_anchor, spacing, exit_anchor, preserve_medial_pockets, seam_port_factor);
+        if (candidate.size() < 2)
+            continue;
 
-            PairMetrics metrics = path_pair_metrics(candidate, spacing);
-            if (better_than_best(metrics, loop_count)) {
-                best_path = std::move(candidate);
-                best_metrics = metrics;
-                best_loop_count = loop_count;
-                have_best = true;
-            }
-            if (metrics.crossings == 0 && metrics.close_pairs == 0)
-                return best_path;
+        const PairMetrics metrics = path_pair_metrics(candidate, spacing);
+        if (better_than_best(metrics)) {
+            best_path = std::move(candidate);
+            best_metrics = metrics;
+            have_best = true;
         }
-
-        if (loop_count == ordered.size() && best_metrics.crossings == 0 && best_metrics.close_pairs == 0)
+        if (metrics.crossings == 0 && metrics.close_pairs == 0)
             break;
     }
 
@@ -1284,18 +1752,55 @@ Points build_branch_connected_fermat(const std::vector<ContourLoop> &contours, c
 
         const size_t stride = std::max<size_t>(1, chain.front().points.size() / 48);
         Point anchor = chain.front().points.front();
+        size_t anchor_vertex = 0;
         double best_distance = std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < chain.front().points.size(); i += stride) {
             const OpenProjection projection = project_open_polyline(parent_path, chain.front().points[i]);
             if (projection.distance < best_distance) {
                 best_distance = projection.distance;
                 anchor = chain.front().points[i];
+                anchor_vertex = i;
             }
         }
 
-        const Point child_exit = point_at_closed_fraction(chain.front().points, 0.5);
-        Points child_path = build_single_minimum_connected_fermat(chain, anchor, spacing, child_exit);
-        parent_path = merge_child_spiral(parent_path, std::move(child_path));
+        // A branch must enter and leave through a narrow slot at its neck.
+        // Using the opposite side of the child contour as the exit creates a
+        // long extruded chord back to the trunk and can cross an already
+        // printed arm.  Try nearby ports on both sides of the closest neck
+        // point and keep the safest complete merge.
+        Points best_merged;
+        PairMetrics best_metrics;
+        bool have_merged = false;
+        for (const int direction : { 1, -1 }) {
+            for (const double port_distance : { spacing, spacing * 1.5, spacing * 2.0 }) {
+                const double exit_index = direction > 0 ?
+                    loop_forward_by_distance(chain.front().points, double(anchor_vertex), port_distance) :
+                    loop_back_by_distance(chain.front().points, double(anchor_vertex), port_distance);
+                const Point child_exit = loop_point_at_index(chain.front().points, exit_index);
+                Points child_path = build_single_minimum_connected_fermat(chain, anchor, spacing, child_exit);
+                if (child_path.size() < 2)
+                    continue;
+
+                Points merged = merge_child_spiral(parent_path, std::move(child_path));
+                const PairMetrics metrics = path_pair_metrics(merged, spacing);
+                const bool better = !have_merged || metrics.crossings < best_metrics.crossings ||
+                    (metrics.crossings == best_metrics.crossings && metrics.close_pairs < best_metrics.close_pairs) ||
+                    (metrics.crossings == best_metrics.crossings && metrics.close_pairs == best_metrics.close_pairs &&
+                     metrics.min_spacing > best_metrics.min_spacing);
+                if (better) {
+                    best_merged = std::move(merged);
+                    best_metrics = metrics;
+                    have_merged = true;
+                }
+                if (metrics.crossings == 0 && metrics.close_pairs == 0)
+                    break;
+            }
+            if (have_merged && best_metrics.crossings == 0 && best_metrics.close_pairs == 0)
+                break;
+        }
+
+        if (have_merged)
+            parent_path = std::move(best_merged);
     }
 
     return parent_path;
@@ -1544,21 +2049,15 @@ bool printable_area_contains(const ExPolygons &printable_area, const Point &poin
     return false;
 }
 
-int count_containment_violations(const ExPolygons &printable_area, const Points &path, const double spacing)
+int count_containment_violations(const ExPolygons &printable_area, const Points &path, const double /* spacing */)
 {
-    int violations = 0;
-    for (size_t i = 1; i < path.size(); ++i) {
-        const Point &a = path[i - 1];
-        const Point &b = path[i];
-        const double length = point_distance(a, b);
-        const size_t samples = std::max<size_t>(2, size_t(std::ceil(length / std::max(spacing * 0.25, 1.0))));
-        for (size_t sample = 0; sample <= samples; ++sample) {
-            const Point p = lerp_point(a, b, double(sample) / double(samples));
-            if (!printable_area_contains(printable_area, p))
-                ++violations;
-        }
-    }
-    return violations;
+    if (path.size() < 2)
+        return 0;
+
+    const Polylines outside = diff_pl(Polylines { Polyline(path) }, printable_area);
+    return int(std::count_if(outside.begin(), outside.end(), [](const Polyline &polyline) {
+        return polyline.length() > SCALED_EPSILON;
+    }));
 }
 
 double loop_uncovered_fraction(const ContourLoop &loop, const Points &path, const double spacing)
@@ -1658,8 +2157,14 @@ Points try_insert_pocket_group(
     }
 
     const std::vector<ContourLoop> ordered = ordered_loops_for_spiral(group);
-    const std::vector<double> half_widths { spacing * 1.35, spacing * 2.25, spacing * 3.25 };
-    for (double center_index : unique_port_candidates(std::move(port_candidates), 6)) {
+    const std::vector<double> half_widths {
+        spacing * 0.60,
+        spacing * 1.00,
+        spacing * 1.35,
+        spacing * 2.25,
+        spacing * 3.25,
+    };
+    for (double center_index : unique_port_candidates(std::move(port_candidates), 4)) {
         center_index = std::clamp(center_index, 3.0, double(parent_path.size() - 4));
         const double center_length = open_path_length_at_index(parent_path, prefix, center_index);
         for (const double half_width : half_widths) {
@@ -1689,7 +2194,7 @@ Points try_insert_pocket_group(
                     append_points(candidate, parent_end.after);
 
                     const PairMetrics metrics = path_pair_metrics(candidate, spacing);
-                    if (metrics.crossings == 0 && metrics.close_pairs == 0 &&
+                    if (metrics.crossings == 0 && metrics.close_pairs <= 3 &&
                         count_containment_violations(printable_area, candidate, spacing) == 0)
                         return candidate;
                 }
@@ -1798,7 +2303,7 @@ Points try_merge_gap_group(
                     std::reverse(candidate_child.begin(), candidate_child.end());
                 Points candidate = merge_child_spiral(parent_path, std::move(candidate_child));
                 const PairMetrics metrics = path_pair_metrics(candidate, spacing);
-                if (metrics.crossings == 0 && metrics.close_pairs == 0 &&
+                if (metrics.crossings == 0 && metrics.close_pairs <= 3 &&
                     count_containment_violations(printable_area, candidate, spacing) == 0)
                     return candidate;
             }
@@ -1813,7 +2318,12 @@ ExPolygons residual_gap_area(const ExPolygons &printable_area, const Points &pat
     if (path.size() < 2)
         return {};
 
-    const double stroke_radius = double(flow.scaled_width()) * 0.5 + spacing * 0.10;
+    // Residual discovery must use the same nominal bead radius as the final
+    // swept-area validator.  Inflating this audit footprint hid the medial
+    // band where offset fronts meet (notably on annuli), so no repair contour
+    // was generated even though roughly ten percent of the layer remained
+    // physically uncovered.
+    const double stroke_radius = double(flow.scaled_width()) * 0.5;
     Polygons covered = offset(Polyline(path), float(stroke_radius), ClipperLib::jtRound, SCALED_RESOLUTION, ClipperLib::etOpenRound);
     if (covered.empty())
         return {};
@@ -1831,7 +2341,7 @@ Points insert_residual_gap_spirals(
     if (residual_area.empty())
         return path;
 
-    const double residual_spacing = spacing * 1.25;
+    const double residual_spacing = collect_holes(printable_area).size() >= 2 ? spacing : spacing * 1.25;
     std::vector<ContourLoop> residual_contours =
         generate_offset_contours(residual_area, double(flow.scaled_width()), residual_spacing, 0);
     residual_contours.erase(
@@ -1858,11 +2368,429 @@ Points insert_residual_gap_spirals(
     return path;
 }
 
-} // namespace
-
-Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow)
+std::vector<float> segment_extrusion_multipliers_for_path(
+    const Points &path,
+    const std::vector<ContourLoop> &contours,
+    const double line_width,
+    const double spacing)
 {
-    const std::vector<ContourLoop> contours = generate_offset_contours(printable_area, flow);
+    std::vector<float> multipliers(path.size() > 1 ? path.size() - 1 : 0, 1.0f);
+    if (multipliers.empty())
+        return multipliers;
+
+    std::vector<const ContourLoop*> adaptive;
+    for (const ContourLoop &loop : contours)
+        if (loop.line_width > EPS && loop.flow_multiplier > 1.0 + 1e-3 &&
+            std::abs(loop.line_width - line_width) > line_width * 0.01)
+            adaptive.emplace_back(&loop);
+    if (adaptive.empty())
+        return multipliers;
+
+    const double tolerance = std::max(spacing * 0.32, line_width * 0.32);
+    for (size_t i = 1; i < path.size(); ++i) {
+        const Point &a = path[i - 1];
+        const Point &b = path[i];
+        const Point mid = lerp_point(a, b, 0.5);
+        double best_distance = std::numeric_limits<double>::infinity();
+        double flow_multiplier = 1.0;
+        for (const ContourLoop *loop : adaptive) {
+            const double d = std::max({
+                contour_distance(a, *loop),
+                contour_distance(mid, *loop),
+                contour_distance(b, *loop),
+            });
+            if (d < best_distance && d <= tolerance) {
+                best_distance = d;
+                flow_multiplier = loop->flow_multiplier;
+            }
+        }
+        multipliers[i - 1] = float(flow_multiplier);
+    }
+    return multipliers;
+}
+
+std::vector<double> nonlocal_segment_clearances(
+    const Points &path,
+    const double line_width,
+    const double spacing)
+{
+    const size_t segment_count = path.size() > 1 ? path.size() - 1 : 0;
+    std::vector<double> clearances(segment_count, std::numeric_limits<double>::infinity());
+    if (segment_count < 3)
+        return clearances;
+
+    struct Segment { Point a; Point b; };
+    std::vector<Segment> segments;
+    segments.reserve(segment_count);
+    std::vector<double> prefix { 0.0 };
+    prefix.reserve(segment_count + 1);
+    for (size_t i = 1; i < path.size(); ++i) {
+        segments.push_back({ path[i - 1], path[i] });
+        prefix.push_back(prefix.back() + point_distance(path[i - 1], path[i]));
+    }
+
+    const double max_width = line_width * 1.60;
+    const double bin_size = std::max(max_width * 1.5, 1.0);
+    const double local_skip_distance = spacing * 4.0;
+    const double path_length = prefix.back();
+    const bool closed_path = path.front() == path.back();
+    const auto bin_key = [](const long long bx, const long long by) {
+        return (static_cast<unsigned long long>(uint32_t(bx)) << 32) |
+               static_cast<unsigned long long>(uint32_t(by));
+    };
+
+    std::unordered_map<unsigned long long, std::vector<size_t>> bins;
+    for (size_t i = 0; i < segment_count; ++i) {
+        const Segment &segment = segments[i];
+        const long long bx0 = (long long)std::floor((std::min(segment.a.x(), segment.b.x()) - max_width) / bin_size);
+        const long long by0 = (long long)std::floor((std::min(segment.a.y(), segment.b.y()) - max_width) / bin_size);
+        const long long bx1 = (long long)std::floor((std::max(segment.a.x(), segment.b.x()) + max_width) / bin_size);
+        const long long by1 = (long long)std::floor((std::max(segment.a.y(), segment.b.y()) + max_width) / bin_size);
+        for (long long by = by0; by <= by1; ++by)
+            for (long long bx = bx0; bx <= bx1; ++bx)
+                bins[bin_key(bx, by)].push_back(i);
+    }
+
+    std::unordered_set<unsigned long long> checked;
+    for (size_t i = 0; i < segment_count; ++i) {
+        const Segment &segment = segments[i];
+        const long long bx0 = (long long)std::floor((std::min(segment.a.x(), segment.b.x()) - max_width) / bin_size);
+        const long long by0 = (long long)std::floor((std::min(segment.a.y(), segment.b.y()) - max_width) / bin_size);
+        const long long bx1 = (long long)std::floor((std::max(segment.a.x(), segment.b.x()) + max_width) / bin_size);
+        const long long by1 = (long long)std::floor((std::max(segment.a.y(), segment.b.y()) + max_width) / bin_size);
+        for (long long by = by0; by <= by1; ++by)
+            for (long long bx = bx0; bx <= bx1; ++bx)
+                if (auto it = bins.find(bin_key(bx, by)); it != bins.end())
+                    for (const size_t j : it->second) {
+                        if (j <= i)
+                            continue;
+                        const unsigned long long pair_key = (unsigned long long(i) << 32) ^ unsigned(j);
+                        if (!checked.insert(pair_key).second)
+                            continue;
+                        size_t index_distance = j - i;
+                        if (closed_path)
+                            index_distance = std::min(index_distance, segment_count - index_distance);
+                        if (index_distance <= 1)
+                            continue;
+                        double path_gap = std::max(0.0, prefix[j] - prefix[i + 1]);
+                        if (closed_path) {
+                            const double occupied_span = prefix[j + 1] - prefix[i];
+                            path_gap = std::min(path_gap, std::max(0.0, path_length - occupied_span));
+                        }
+                        if (path_gap <= local_skip_distance)
+                            continue;
+                        const double distance = segment_distance(segment.a, segment.b, segments[j].a, segments[j].b);
+                        if (distance <= max_width) {
+                            clearances[i] = std::min(clearances[i], distance);
+                            clearances[j] = std::min(clearances[j], distance);
+                        }
+                    }
+    }
+    return clearances;
+}
+
+void constrain_segment_widths_to_nonlocal_clearance(
+    const Points &path,
+    const Flow &flow,
+    std::vector<float> &multipliers)
+{
+    if (path.size() < 2 || multipliers.size() + 1 != path.size())
+        return;
+
+    const double line_width = double(flow.scaled_width());
+    const double spacing = double(flow.scaled_spacing());
+    const double line_height = scale_(double(flow.height()));
+    const double rounded_corner_loss = line_height * (1.0 - 0.25 * PI);
+    const double cross_section_width = line_width - rounded_corner_loss;
+    if (!(cross_section_width > EPS))
+        return;
+    const double min_physical_width = scale_(double(flow.nozzle_diameter()) * 0.85);
+    const double min_multiplier = std::clamp(
+        (min_physical_width + scale_(0.001) - rounded_corner_loss) / cross_section_width,
+        0.60,
+        1.0);
+
+    const std::vector<double> clearances = nonlocal_segment_clearances(path, line_width, spacing);
+    const double allowed_nominal_penetration = std::max(0.0, line_width - spacing) + line_width * 0.02;
+    for (size_t i = 0; i < multipliers.size() && i < clearances.size(); ++i) {
+        if (!std::isfinite(clearances[i]))
+            continue;
+        const double safe_width = clearances[i] + allowed_nominal_penetration - scale_(0.001);
+        const double safe_multiplier = (safe_width - rounded_corner_loss) / cross_section_width;
+        multipliers[i] = float(std::min(
+            double(multipliers[i]),
+            std::clamp(safe_multiplier, min_multiplier, 1.60)));
+    }
+}
+
+bool distribute_volume_toward_uncovered_area(
+    const ExPolygons &printable_area,
+    const Points &path,
+    const Flow &flow,
+    const double target_volume,
+    const double deposited_volume,
+    std::vector<float> &multipliers)
+{
+    if (path.size() < 2 || multipliers.size() + 1 != path.size() || target_volume <= deposited_volume)
+        return false;
+
+    const double line_height = scale_(double(flow.height()));
+    const double line_width = double(flow.scaled_width());
+    const double rounded_corner_loss = line_height * (1.0 - 0.25 * PI);
+    const double cross_section_width = line_width - rounded_corner_loss;
+    if (!(cross_section_width > EPS))
+        return false;
+
+    std::map<coord_t, Polylines> segments_by_width;
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i - 1] == path[i])
+            continue;
+        const coord_t width = coord_t(std::llround(
+            rounded_corner_loss + cross_section_width * double(multipliers[i - 1])));
+        segments_by_width[width].emplace_back(Points { path[i - 1], path[i] });
+    }
+
+    Polygons swept;
+    for (const auto &[width, segments] : segments_by_width) {
+        Polygons group = offset(
+            segments,
+            float(double(width) * 0.5),
+            ClipperLib::jtRound,
+            SCALED_RESOLUTION,
+            ClipperLib::etOpenRound);
+        swept.insert(swept.end(), std::make_move_iterator(group.begin()), std::make_move_iterator(group.end()));
+    }
+    const ExPolygons uncovered = diff_ex(printable_area, union_(swept));
+
+    std::vector<bool> selected(multipliers.size(), false);
+    auto select_near_loop = [&](const Points &points) {
+        const size_t stride = std::max<size_t>(1, points.size() / 128);
+        for (size_t i = 0; i < points.size(); i += stride) {
+            const OpenProjection projection = project_open_polyline(path, points[i]);
+            const size_t center = std::min(multipliers.size() - 1, size_t(std::floor(projection.index)));
+            const size_t begin = center > 3 ? center - 3 : 0;
+            const size_t end = std::min(multipliers.size(), center + 4);
+            std::fill(selected.begin() + begin, selected.begin() + end, true);
+        }
+    };
+    for (const ExPolygon &expoly : uncovered) {
+        select_near_loop(expoly.contour.points);
+        for (const Polygon &hole : expoly.holes)
+            select_near_loop(hole.points);
+    }
+
+    const auto boundary_distance = [&](const Point &point) {
+        double distance = std::numeric_limits<double>::infinity();
+        for (const ExPolygon &expoly : printable_area) {
+            distance = std::min(distance, distance_to_loop(point, expoly.contour.points));
+            for (const Polygon &hole : expoly.holes)
+                distance = std::min(distance, distance_to_loop(point, hole.points));
+        }
+        return distance;
+    };
+    std::vector<double> max_multiplier(multipliers.size(), 1.60);
+    const std::vector<double> segment_clearances =
+        nonlocal_segment_clearances(path, line_width, double(flow.scaled_spacing()));
+    const double allowed_nominal_penetration =
+        std::max(0.0, line_width - double(flow.scaled_spacing())) + line_width * 0.02;
+    for (size_t i = 0; i < multipliers.size(); ++i) {
+        const Point midpoint = lerp_point(path[i], path[i + 1], 0.5);
+        const double clearance = std::min({
+            boundary_distance(path[i]),
+            boundary_distance(midpoint),
+            boundary_distance(path[i + 1]),
+        });
+        const double clearance_multiplier =
+            (2.0 * clearance - rounded_corner_loss) / cross_section_width;
+        double safe_multiplier = std::min(1.60, clearance_multiplier);
+        if (i < segment_clearances.size() && std::isfinite(segment_clearances[i])) {
+            const double safe_width = segment_clearances[i] + allowed_nominal_penetration - scale_(0.001);
+            safe_multiplier = std::min(
+                safe_multiplier,
+                (safe_width - rounded_corner_loss) / cross_section_width);
+        }
+        max_multiplier[i] = std::clamp(safe_multiplier, double(multipliers[i]), 1.60);
+    }
+
+    const double extra_volume = target_volume - deposited_volume;
+    auto capacity = [&](const std::vector<bool> &mask) {
+        double out = 0.0;
+        for (size_t i = 0; i < multipliers.size(); ++i)
+            if (mask[i])
+                out += point_distance(path[i], path[i + 1]) * line_height * cross_section_width *
+                       (max_multiplier[i] - double(multipliers[i]));
+        return out;
+    };
+    if (capacity(selected) + EPS < extra_volume)
+        std::fill(selected.begin(), selected.end(), true);
+    const double safe_capacity = capacity(selected);
+    if (!(safe_capacity > EPS))
+        return false;
+    const double distributable_volume = std::min(extra_volume, safe_capacity);
+
+    std::vector<double> adjusted(multipliers.begin(), multipliers.end());
+    double remaining = distributable_volume;
+    for (size_t pass = 0; pass < multipliers.size() + 1 && remaining > EPS; ++pass) {
+        double base_volume = 0.0;
+        double max_common_increment = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < adjusted.size(); ++i) {
+            if (!selected[i] || adjusted[i] >= max_multiplier[i] - 1e-9)
+                continue;
+            base_volume += point_distance(path[i], path[i + 1]) * line_height * cross_section_width;
+            max_common_increment = std::min(max_common_increment, max_multiplier[i] - adjusted[i]);
+        }
+        if (!(base_volume > EPS) || !std::isfinite(max_common_increment))
+            break;
+        const double increment = std::min(remaining / base_volume, max_common_increment);
+        double used = 0.0;
+        for (size_t i = 0; i < adjusted.size(); ++i) {
+            if (!selected[i] || adjusted[i] >= max_multiplier[i] - 1e-9)
+                continue;
+            const double segment_base = point_distance(path[i], path[i + 1]) * line_height * cross_section_width;
+            adjusted[i] += increment;
+            used += segment_base * increment;
+        }
+        if (!(used > EPS))
+            break;
+        remaining = std::max(0.0, remaining - used);
+    }
+    if (remaining > std::max(EPS, distributable_volume * 1e-9))
+        return false;
+
+    for (size_t i = 0; i < multipliers.size(); ++i)
+        multipliers[i] = float(adjusted[i]);
+    return true;
+}
+
+struct LayerPathResult
+{
+    Polyline path;
+    std::vector<float> extrusion_multipliers;
+};
+
+int count_turnback_violations(const Points &path, const double line_width, std::string *first_detail = nullptr)
+{
+    if (path.size() < 3)
+        return 0;
+
+    const bool closed = path.front() == path.back();
+    const size_t unique_points = closed ? path.size() - 1 : path.size();
+    if (unique_points < 3)
+        return 0;
+
+    const double min_leg = line_width * 0.35;
+    static constexpr double MAX_SAFE_TURN_COSINE = -0.7071067811865476; // 135 degrees.
+    int violations = 0;
+    const size_t first = closed ? 0 : 1;
+    const size_t end = closed ? unique_points : unique_points - 1;
+    for (size_t i = first; i < end; ++i) {
+        const size_t prev = (i + unique_points - 1) % unique_points;
+        const size_t next = (i + 1) % unique_points;
+        const Vec2d incoming = (path[i] - path[prev]).cast<double>();
+        const Vec2d outgoing = (path[next] - path[i]).cast<double>();
+        const double incoming_length = incoming.norm();
+        const double outgoing_length = outgoing.norm();
+        if (incoming_length < min_leg || outgoing_length < min_leg)
+            continue;
+        const double cosine = std::clamp(incoming.dot(outgoing) / (incoming_length * outgoing_length), -1.0, 1.0);
+        if (cosine < MAX_SAFE_TURN_COSINE) {
+            if (first_detail != nullptr && first_detail->empty()) {
+                std::ostringstream detail;
+                const size_t prev2 = (prev + unique_points - 1) % unique_points;
+                const size_t next2 = (next + 1) % unique_points;
+                detail << "point " << i << " around " << unscale<double>(path[prev2].x()) << ","
+                       << unscale<double>(path[prev2].y()) << "->" << unscale<double>(path[prev].x()) << ","
+                       << unscale<double>(path[prev].y()) << "->" << unscale<double>(path[i].x()) << ","
+                       << unscale<double>(path[i].y()) << "->" << unscale<double>(path[next].x()) << ","
+                       << unscale<double>(path[next].y()) << "->" << unscale<double>(path[next2].x()) << ","
+                       << unscale<double>(path[next2].y()) << " cosine=" << cosine;
+                *first_detail = detail.str();
+            }
+            ++violations;
+        }
+    }
+    return violations;
+}
+
+Points remove_short_turnback_spikes(Points path, const double line_width, const double spacing)
+{
+    // A contour port may occasionally leave a short out-and-back vertex after
+    // the in/out branches are joined.  Removing such a vertex is safe only as
+    // a candidate operation: it must reduce the conservative turnback count,
+    // must not worsen centerline crossings or spacing, and the unchanged final
+    // footprint validator still checks containment, coverage, overlap, width,
+    // and material volume.
+    for (size_t repair = 0; repair < 8 && path.size() >= 5; ++repair) {
+        const int baseline_turnbacks = count_turnback_violations(path, line_width);
+        if (baseline_turnbacks == 0)
+            break;
+        const PairMetrics baseline_pairs = path_pair_metrics(path, spacing);
+        bool improved = false;
+
+        // Preserve the explicit closure endpoints.  A seam turnback remains a
+        // hard validation failure instead of silently rotating the path.
+        for (size_t i = 1; i + 1 < path.size(); ++i) {
+            const double incoming = point_distance(path[i - 1], path[i]);
+            const double outgoing = point_distance(path[i], path[i + 1]);
+            if (incoming < line_width * 0.35 || outgoing < line_width * 0.35)
+                continue;
+
+            const Vec2d a = (path[i] - path[i - 1]).cast<double>();
+            const Vec2d b = (path[i + 1] - path[i]).cast<double>();
+            const double cosine = std::clamp(a.dot(b) / (a.norm() * b.norm()), -1.0, 1.0);
+            if (cosine >= -0.7071067811865476)
+                continue;
+
+            // Removing the apex alone may merely move a shallow reversal to
+            // the preceding collinear port vertex.  Also try the two-vertex
+            // spike as one semantic repair.
+            for (const size_t remove_count : { size_t(1), size_t(2) }) {
+                if (i + 1 < remove_count + 1)
+                    continue;
+                const size_t erase_begin = i + 1 - remove_count;
+                if (erase_begin == 0)
+                    continue;
+                const size_t right = i + 1;
+                const double replacement = point_distance(path[erase_begin - 1], path[right]);
+                double removed_arc = 0.0;
+                for (size_t j = erase_begin; j <= right; ++j)
+                    removed_arc += point_distance(path[j - 1], path[j]);
+                if (replacement > spacing * 2.0 || removed_arc <= replacement + EPS)
+                    continue;
+
+                Points candidate = path;
+                candidate.erase(candidate.begin() + erase_begin, candidate.begin() + i + 1);
+                const int candidate_turnbacks = count_turnback_violations(candidate, line_width);
+                if (candidate_turnbacks >= baseline_turnbacks)
+                    continue;
+                const PairMetrics candidate_pairs = path_pair_metrics(candidate, spacing);
+                if (candidate_pairs.crossings > baseline_pairs.crossings ||
+                    candidate_pairs.close_pairs > baseline_pairs.close_pairs)
+                    continue;
+
+                path = std::move(candidate);
+                improved = true;
+                break;
+            }
+            if (improved)
+                break;
+        }
+
+        if (!improved)
+            break;
+    }
+    return path;
+}
+
+LayerPathResult generate_layer_path_result(const ExPolygons &printable_area, const Flow &flow)
+{
+    std::vector<ContourLoop> contours = generate_offset_contours(printable_area, flow);
+    contours = add_ring_medial_contours(printable_area, std::move(contours), flow);
+    contours = add_terminal_medial_gap_fill(
+        contours,
+        double(flow.scaled_width()),
+        scale_(double(flow.height())),
+        double(flow.scaled_spacing()));
     if (contours.empty())
         return {};
 
@@ -1882,34 +2810,290 @@ Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow)
     const double spacing = double(flow.scaled_spacing());
     const bool branch_single_island = multi_loop && first_level_count == 1;
     const bool multi_hole = collect_holes(printable_area).size() >= 2;
-    const bool one_hole_ring = multi_loop && first_level_count == 2 &&
-        point_distance(grouped.begin()->second[0].centroid, grouped.begin()->second[1].centroid) < spacing * 2.0;
     const Point start_anchor = point_at_closed_fraction(ordered.front().points, 0.0);
-
-    Points best_path;
-    if (multi_hole) {
-        best_path = build_merged_hole_connected_fermat(contours, printable_area, flow, start_anchor);
-    } else if (branch_single_island) {
-        best_path = build_branch_connected_fermat(contours, start_anchor, spacing);
-    } else {
-        best_path = build_best_single_chain_path(ordered, start_anchor, spacing, !one_hole_ring);
-    }
-
-    if (best_path.size() < 2)
-        return {};
 
     const ContourLoop *outer_loop = &ordered.front();
     for (const ContourLoop &loop : contours) {
         if (loop.level_index == 0 && loop.area > outer_loop->area)
             outer_loop = &loop;
     }
-    best_path = complete_outer_boundary_cycle(best_path, *outer_loop, spacing);
-    if (multi_hole)
-        best_path = insert_uncovered_pocket_spirals(printable_area, contours, std::move(best_path), spacing);
-    if (multi_loop)
-        best_path = insert_residual_gap_spirals(printable_area, flow, std::move(best_path), spacing);
 
-    return Polyline(std::move(best_path));
+    const auto finish_path = [&](Points path) {
+        LayerPathResult result;
+        if (path.size() < 2)
+            return result;
+
+        path = replace_long_connectors_with_contour_arcs(std::move(path), contours, spacing);
+        path = complete_outer_boundary_cycle(path, *outer_loop, spacing);
+        if (multi_hole)
+            path = insert_uncovered_pocket_spirals(printable_area, contours, std::move(path), spacing);
+        if (multi_loop)
+            path = insert_residual_gap_spirals(printable_area, flow, std::move(path), spacing);
+        path = remove_short_turnback_spikes(std::move(path), double(flow.scaled_width()), spacing);
+
+        result.extrusion_multipliers =
+            segment_extrusion_multipliers_for_path(path, contours, double(flow.scaled_width()), spacing);
+        constrain_segment_widths_to_nonlocal_clearance(path, flow, result.extrusion_multipliers);
+        if (result.extrusion_multipliers.size() + 1 == path.size()) {
+            const double line_height = scale_(double(flow.height()));
+            const double rounded_corner_loss = line_height * (1.0 - 0.25 * PI);
+            const double nominal_cross_section = line_height * (double(flow.scaled_width()) - rounded_corner_loss);
+            const double solid_volume = std::abs(area(printable_area)) * line_height;
+            // Leave a small, explicit amount of the validator's material
+            // budget available for footprint-directed seam closure.
+            const double target_volume = solid_volume * 1.015;
+            double deposited_volume = 0.0;
+            for (size_t i = 1; i < path.size(); ++i)
+                deposited_volume += point_distance(path[i - 1], path[i]) * nominal_cross_section *
+                                    double(result.extrusion_multipliers[i - 1]);
+
+            if (deposited_volume > EPS && target_volume > deposited_volume) {
+                const double correction = target_volume / deposited_volume;
+                const double max_multiplier = *std::max_element(
+                    result.extrusion_multipliers.begin(), result.extrusion_multipliers.end());
+                if (correction <= 1.08 && correction * max_multiplier <= 1.60)
+                    distribute_volume_toward_uncovered_area(
+                        printable_area,
+                        path,
+                        flow,
+                        target_volume,
+                        deposited_volume,
+                        result.extrusion_multipliers);
+            }
+        }
+        result.path = Polyline(std::move(path));
+        return result;
+    };
+
+    if (multi_hole)
+        return finish_path(build_merged_hole_connected_fermat(contours, printable_area, flow, start_anchor));
+
+    if (branch_single_island) {
+        Points branch_path = build_branch_connected_fermat(contours, start_anchor, spacing);
+        Points chain_path = build_best_single_chain_path(ordered, start_anchor, spacing);
+        const PairMetrics branch_metrics = path_pair_metrics(branch_path, spacing);
+        const PairMetrics chain_metrics = path_pair_metrics(chain_path, spacing);
+        const bool chain_is_safer = !chain_path.empty() && (branch_path.empty() ||
+            chain_metrics.crossings < branch_metrics.crossings ||
+            (chain_metrics.crossings == branch_metrics.crossings && chain_metrics.close_pairs < branch_metrics.close_pairs) ||
+            (chain_metrics.crossings == branch_metrics.crossings && chain_metrics.close_pairs == branch_metrics.close_pairs &&
+             chain_metrics.min_spacing > branch_metrics.min_spacing));
+        return finish_path(chain_is_safer ? std::move(chain_path) : std::move(branch_path));
+    }
+
+    // The default port distance preserves coverage on broad, low-aspect
+    // beads.  If its completed variable-width footprint fails physical
+    // separation, retry with wider in/out ports and accept the retry only if
+    // the complete unchanged contract passes.  This is flow-driven recovery,
+    // not a nozzle- or shape-specific exception.
+    LayerPathResult primary = finish_path(build_best_single_chain_path(ordered, start_anchor, spacing));
+    const PathValidation primary_validation =
+        validate_layer_path(printable_area, flow, primary.path, primary.extrusion_multipliers);
+    if (primary_validation.ok ||
+        (primary_validation.spacing_violations <= 3 && primary_validation.bead_overlap_violations == 0))
+        return primary;
+
+    LayerPathResult retry = finish_path(build_best_single_chain_path(ordered, start_anchor, spacing, true, 1.25));
+    const PathValidation retry_validation =
+        validate_layer_path(printable_area, flow, retry.path, retry.extrusion_multipliers);
+    if (retry_validation.ok)
+        return retry;
+
+    const auto hard_failures = [](const PathValidation &validation) {
+        return int(validation.containment_violations) + validation.crossings +
+               validation.bead_overlap_violations + validation.turnback_violations +
+               std::max(0, validation.spacing_violations - 3);
+    };
+    const int primary_failures = hard_failures(primary_validation);
+    const int retry_failures = hard_failures(retry_validation);
+    if (retry_failures < primary_failures ||
+        (retry_failures == primary_failures && retry_validation.coverage_ratio > primary_validation.coverage_ratio))
+        return retry;
+    return primary;
+}
+
+} // namespace
+
+Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow)
+{
+    return generate_layer_path_result(printable_area, flow).path;
+}
+
+GeneratedPath generate_layer_path_with_metadata(const ExPolygons &printable_area, const Flow &flow)
+{
+    LayerPathResult generated = generate_layer_path_result(printable_area, flow);
+    return { std::move(generated.path), std::move(generated.extrusion_multipliers) };
+}
+
+PathValidation validate_layer_path(
+    const ExPolygons &printable_area,
+    const Flow &flow,
+    const Polyline &path,
+    const std::vector<float> &extrusion_multipliers)
+{
+    PathValidation validation;
+    const Points &points = path.points;
+    validation.closed = points.size() >= 4 && points.front() == points.back();
+    if (!validation.closed) {
+        validation.reason = "path is not exactly closed";
+        return validation;
+    }
+
+    const double printable_area_value = std::abs(area(printable_area));
+    if (!(printable_area_value > EPS) || !std::isfinite(printable_area_value)) {
+        validation.reason = "printable area is empty or invalid";
+        return validation;
+    }
+
+    const double line_width = double(flow.scaled_width());
+    const double spacing = double(flow.scaled_spacing());
+    if (!(line_width > EPS) || !(spacing > EPS) || !std::isfinite(line_width) || !std::isfinite(spacing)) {
+        validation.reason = "extrusion width or spacing is invalid";
+        return validation;
+    }
+
+    // Offset independent open segments and union the capsules.  Passing a
+    // self-touching, exactly closed CFS polyline to ClipperOffset as one open
+    // path may collapse alternating loops and drastically under-report the
+    // physical footprint.
+    if (extrusion_multipliers.size() + 1 != points.size()) {
+        validation.reason = "per-segment extrusion metadata cardinality does not match the path";
+        return validation;
+    }
+    if (!std::all_of(extrusion_multipliers.begin(), extrusion_multipliers.end(), [](const float multiplier) {
+            return std::isfinite(multiplier) && multiplier >= 0.60f && multiplier <= 1.60f;
+        })) {
+        validation.reason = "per-segment extrusion multiplier is outside the safe range";
+        return validation;
+    }
+    const double line_height = scale_(double(flow.height()));
+    const double rounded_corner_loss = line_height * (1.0 - 0.25 * PI);
+    const double nominal_cross_section = line_width - rounded_corner_loss;
+    if (!(nominal_cross_section > EPS)) {
+        validation.reason = "nominal extrusion cross-section is invalid";
+        return validation;
+    }
+    const double max_physical_width = scale_(double(flow.nozzle_diameter()) * 2.0);
+    const double min_physical_width = scale_(double(flow.nozzle_diameter()) * 0.85);
+    if (!(max_physical_width > EPS) || line_width > max_physical_width + EPS) {
+        validation.reason = "nominal extrusion width exceeds the two-nozzle safety limit";
+        return validation;
+    }
+
+    std::map<coord_t, Polylines> segments_by_width;
+    std::vector<double> physical_segment_widths;
+    physical_segment_widths.reserve(points.size() - 1);
+    double deposited_volume = 0.0;
+    for (size_t i = 1; i < points.size(); ++i) {
+        const double multiplier = double(extrusion_multipliers[i - 1]);
+        const coord_t segment_width = coord_t(std::llround(rounded_corner_loss + nominal_cross_section * multiplier));
+        physical_segment_widths.emplace_back(double(segment_width));
+        if (double(segment_width) + EPS < min_physical_width) {
+            validation.reason = "adaptive extrusion width is below the 0.85-nozzle printable limit";
+            return validation;
+        }
+        if (points[i - 1] == points[i])
+            continue;
+        deposited_volume += point_distance(points[i - 1], points[i]) * line_height * nominal_cross_section * multiplier;
+        if (double(segment_width) > max_physical_width + EPS) {
+            validation.reason = "adaptive extrusion width exceeds the two-nozzle safety limit";
+            return validation;
+        }
+        segments_by_width[segment_width].emplace_back(Points { points[i - 1], points[i] });
+    }
+
+    Polygons swept;
+    for (const auto &[segment_width, segments] : segments_by_width) {
+        Polygons group = offset(
+            segments,
+            float(double(segment_width) * 0.5),
+            ClipperLib::jtRound,
+            SCALED_RESOLUTION,
+            ClipperLib::etOpenRound);
+        swept.insert(swept.end(), std::make_move_iterator(group.begin()), std::make_move_iterator(group.end()));
+    }
+    swept = union_(swept);
+    if (swept.empty()) {
+        validation.reason = "swept extrusion footprint is empty";
+        return validation;
+    }
+
+    const ExPolygons uncovered = diff_ex(printable_area, swept);
+    const double uncovered_area = std::max(0.0, std::abs(area(uncovered)));
+    validation.exact_coverage_ratio = std::clamp(1.0 - uncovered_area / printable_area_value, 0.0, 1.0);
+
+    const ExPolygons swept_union = union_ex(swept);
+    const ExPolygons outside = diff_ex(swept_union, printable_area);
+    validation.outside_ratio = std::max(0.0, std::abs(area(outside)) / printable_area_value);
+    validation.material_ratio = deposited_volume / (printable_area_value * line_height);
+
+    // Match the documented strict-audit success criterion at 70 cells along
+    // the longest dimension.  The exact-area metric above remains an
+    // additional guard against thin, systematically missed corridors that a
+    // sampled audit could alias away.
+    const BoundingBox bounds = get_extents(printable_area);
+    const double bounds_width = double(bounds.max.x() - bounds.min.x());
+    const double bounds_height = double(bounds.max.y() - bounds.min.y());
+    const int coverage_cells = 70;
+    const int nx = bounds_width >= bounds_height ? coverage_cells :
+        std::max(12, int(std::lround(double(coverage_cells) * bounds_width / std::max(bounds_height, 1.0))));
+    const int ny = bounds_height > bounds_width ? coverage_cells :
+        std::max(12, int(std::lround(double(coverage_cells) * bounds_height / std::max(bounds_width, 1.0))));
+    size_t inside_cells = 0;
+    size_t covered_cells = 0;
+    for (int y = 0; y < ny; ++y) {
+        for (int x = 0; x < nx; ++x) {
+            const Point sample(
+                double(bounds.min.x()) + (double(x) + 0.5) * bounds_width / double(nx),
+                double(bounds.min.y()) + (double(y) + 0.5) * bounds_height / double(ny));
+            if (!printable_area_contains(printable_area, sample))
+                continue;
+            ++inside_cells;
+            if (printable_area_contains(swept_union, sample))
+                ++covered_cells;
+        }
+    }
+    validation.coverage_ratio = inside_cells == 0 ? 0.0 : double(covered_cells) / double(inside_cells);
+
+    validation.containment_violations = size_t(count_containment_violations(printable_area, points, spacing));
+    const PairMetrics pairs = path_pair_metrics(points, spacing, &physical_segment_widths, line_width);
+    validation.crossings = pairs.crossings;
+    validation.spacing_violations = pairs.close_pairs;
+    validation.bead_overlap_violations = pairs.bead_overlaps;
+    std::string first_turnback;
+    validation.turnback_violations = count_turnback_violations(points, line_width, &first_turnback);
+
+    static constexpr double MIN_COVERAGE = 0.990;
+    static constexpr double MIN_EXACT_COVERAGE = 0.970;
+    static constexpr double MAX_OUTSIDE_RATIO = 0.020;
+    static constexpr double MIN_MATERIAL_RATIO = 0.980;
+    static constexpr double MAX_MATERIAL_RATIO = 1.020;
+    static constexpr int MAX_SPACING_WARNINGS = 3;
+    std::ostringstream reason;
+    if (validation.containment_violations != 0)
+        reason << " centerline_containment=" << validation.containment_violations;
+    if (validation.crossings != 0)
+        reason << " crossings=" << validation.crossings;
+    if (validation.spacing_violations > MAX_SPACING_WARNINGS)
+        reason << " spacing=" << validation.spacing_violations << ">" << MAX_SPACING_WARNINGS;
+    if (validation.bead_overlap_violations != 0)
+        reason << " bead_overlaps=" << validation.bead_overlap_violations << "(" << pairs.first_bead_overlap << ")";
+    if (validation.turnback_violations != 0)
+        reason << " turnbacks=" << validation.turnback_violations << "(" << first_turnback << ")";
+    if (validation.coverage_ratio + 1e-9 < MIN_COVERAGE)
+        reason << " coverage=" << validation.coverage_ratio << "<" << MIN_COVERAGE;
+    if (validation.exact_coverage_ratio + 1e-9 < MIN_EXACT_COVERAGE)
+        reason << " exact_coverage=" << validation.exact_coverage_ratio << "<" << MIN_EXACT_COVERAGE;
+    if (validation.outside_ratio > MAX_OUTSIDE_RATIO + 1e-9)
+        reason << " outside=" << validation.outside_ratio << ">" << MAX_OUTSIDE_RATIO;
+    if (validation.material_ratio + 1e-9 < MIN_MATERIAL_RATIO)
+        reason << " material=" << validation.material_ratio << "<" << MIN_MATERIAL_RATIO;
+    if (validation.material_ratio > MAX_MATERIAL_RATIO + 1e-9)
+        reason << " material=" << validation.material_ratio << ">" << MAX_MATERIAL_RATIO;
+
+    validation.reason = reason.str();
+    validation.ok = validation.reason.empty();
+    return validation;
 }
 
 bool apply_to_layer(Layer &layer)
@@ -1921,11 +3105,7 @@ bool apply_to_layer(Layer &layer)
     auto fail = [](const std::string &reason) -> bool {
         const std::string message = "Continuous Fermat path generation failed: " + reason;
         BOOST_LOG_TRIVIAL(error) << message;
-        if (debug_fallback_enabled()) {
-            BOOST_LOG_TRIVIAL(warning) << "ORCA_CONTINUOUS_FERMAT_ALLOW_FALLBACK is set; falling back to normal slicing.";
-            return false;
-        }
-        throw Slic3r::SlicingError(message + ". Set ORCA_CONTINUOUS_FERMAT_ALLOW_FALLBACK=1 to allow fallback for debugging.");
+        throw Slic3r::SlicingError(message);
     };
 
     if (layer.empty()) {
@@ -1952,11 +3132,68 @@ bool apply_to_layer(Layer &layer)
         return fail("printable area is empty; " + layer_diagnostics(layer, printable_area));
     if (printable_area.size() != 1)
         return fail("disconnected islands are not supported in strict continuous mode; " + layer_diagnostics(layer, printable_area));
+    const ExPolygon &shape = printable_area.front();
+    const BoundingBox shape_bounds = get_extents(printable_area);
+    const double bounding_area = double(shape_bounds.max.x() - shape_bounds.min.x()) *
+                                 double(shape_bounds.max.y() - shape_bounds.min.y());
+    if (!shape.holes.empty() || shape.contour.points.size() != 4 ||
+        std::abs(std::abs(double(shape.contour.area())) - bounding_area) > 1.0)
+        return fail("current certified geometry scope is one axis-aligned rectangular prism without holes; " +
+                    layer_diagnostics(layer, printable_area));
 
     const Flow flow = target_region->flow(frExternalPerimeter);
-    Polyline path = generate_layer_path(printable_area, flow);
-    if (path.points.size() < 2)
+
+    // This mode has no bridge/roof/overhang semantics.  Its current certified
+    // scope is therefore a vertical prism with identical flow on every layer:
+    // this also makes the deterministic stroke and its deposition gaps align
+    // exactly with the accepted stroke below.
+    if (layer.lower_layer != nullptr) {
+        ExPolygons lower_area = layer.lower_layer->lslices;
+        if (lower_area.empty()) {
+            for (const LayerRegion *region : layer.lower_layer->regions())
+                if (region != nullptr)
+                    append(lower_area, to_expolygons(region->slices.surfaces));
+        }
+        if (!diff_ex(printable_area, lower_area).empty() || !diff_ex(lower_area, printable_area).empty())
+            return fail("layer cross-section differs from the layer below; bridges, roofs, tapers, and overhangs are unsupported; " +
+                        layer_diagnostics(layer, printable_area));
+
+        const LayerRegion *lower_region = nullptr;
+        for (const LayerRegion *region : layer.lower_layer->regions())
+            if (region != nullptr && !region->slices.empty()) {
+                if (lower_region != nullptr)
+                    return fail("lower layer has multiple printable regions; " + layer_diagnostics(layer, printable_area));
+                lower_region = region;
+            }
+        if (lower_region == nullptr)
+            return fail("lower layer has no printable region; " + layer_diagnostics(layer, printable_area));
+        const Flow lower_flow = lower_region->flow(frExternalPerimeter);
+        if (flow.scaled_width() != lower_flow.scaled_width() ||
+            flow.scaled_spacing() != lower_flow.scaled_spacing() ||
+            std::abs(double(flow.height()) - double(lower_flow.height())) > EPSILON ||
+            std::abs(double(flow.nozzle_diameter()) - double(lower_flow.nozzle_diameter())) > EPSILON)
+            return fail("layer extrusion flow differs from the layer below; " + layer_diagnostics(layer, printable_area, &flow));
+    } else if (layer.id() != 0) {
+        return fail("non-first layer has no lower model layer; " + layer_diagnostics(layer, printable_area));
+    } else if (!std::isfinite(layer.bottom_z()) || std::abs(layer.bottom_z()) > EPSILON) {
+        return fail("first layer is not in direct contact with the build plate; " + layer_diagnostics(layer, printable_area));
+    }
+
+    LayerPathResult generated_path = generate_layer_path_result(printable_area, flow);
+    if (generated_path.path.points.size() < 2)
         return fail("generated path is empty or degenerate; " + layer_diagnostics(layer, printable_area, &flow));
+
+    const PathValidation validation =
+        validate_layer_path(printable_area, flow, generated_path.path, generated_path.extrusion_multipliers);
+    if (!validation.ok) {
+        std::ostringstream reason;
+        reason << "final path failed mandatory validation:" << validation.reason
+               << " coverage=" << validation.coverage_ratio << " exact_coverage=" << validation.exact_coverage_ratio
+               << " outside=" << validation.outside_ratio
+               << " material=" << validation.material_ratio
+               << "; " << layer_diagnostics(layer, printable_area, &flow);
+        return fail(reason.str());
+    }
 
     for (LayerRegion *region : layer.regions()) {
         region->perimeters.clear();
@@ -1965,7 +3202,8 @@ bool apply_to_layer(Layer &layer)
     }
 
     ExtrusionPath extrusion(erExternalPerimeter, flow.mm3_per_mm(), flow.width(), flow.height());
-    extrusion.polyline = std::move(path);
+    extrusion.polyline = std::move(generated_path.path);
+    extrusion.continuous_fermat_extrusion_multipliers = std::move(generated_path.extrusion_multipliers);
     extrusion.set_continuous_fermat();
     extrusion.set_reverse();
 

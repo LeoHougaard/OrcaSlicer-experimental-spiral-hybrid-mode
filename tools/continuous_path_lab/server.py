@@ -123,6 +123,20 @@ class LabHandler(BaseHTTPRequestHandler):
                 self.send_payload(*json_bytes(result))
                 return
 
+            if self.path == "/api/preview":
+                payload = self.read_json()
+                model, input_diagnostics, meta = geometry_io.load_model_from_request(payload)
+                self.send_payload(
+                    *json_bytes(
+                        {
+                            "model": planner.model_payload(model),
+                            "input": meta,
+                            "diagnostics": input_diagnostics,
+                        }
+                    )
+                )
+                return
+
             self.send_error(HTTPStatus.NOT_FOUND)
         except geometry_io.InputError as exc:
             self.send_payload(*json_bytes({"error": str(exc)}, status=400))

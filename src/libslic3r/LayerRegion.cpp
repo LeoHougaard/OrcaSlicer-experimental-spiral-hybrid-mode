@@ -1023,6 +1023,13 @@ void LayerRegion::simplify_entity_collection(ExtrusionEntityCollection* entity_c
 
 void LayerRegion::simplify_path(ExtrusionPath* path)
 {
+    // Continuous Fermat geometry and per-segment extrusion metadata were
+    // validated together after generation.  Any point simplification here
+    // would invalidate that proof or shift width multipliers onto different
+    // physical segments.
+    if (path->is_continuous_fermat())
+        return;
+
     const auto print_config = this->layer()->object()->print()->config();
     const bool spiral_mode = print_config.spiral_mode && !print_config.spiral_hybrid_non_crossing;
     const bool enable_arc_fitting = print_config.enable_arc_fitting;

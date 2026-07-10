@@ -24,15 +24,13 @@ import math
 import sys
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
 
 Point = tuple[float, float]
 EPS = 1e-9
-DEFAULT_WALL_CONTOURS = 3
-
 
 def add(a: Point, b: Point) -> Point:
     return (a[0] + b[0], a[1] + b[1])
@@ -220,6 +218,15 @@ def star_polygon(outer_radius: float, inner_radius: float, points: int) -> list[
         a = -math.pi / 2.0 + math.pi * i / points
         out.append((math.cos(a) * r, math.sin(a) * r))
     return out
+
+
+def loop_bounds(points: Sequence[Point], margin: float = 0.0) -> tuple[float, float, float, float]:
+    return (
+        min(p[0] for p in points) - margin,
+        min(p[1] for p in points) - margin,
+        max(p[0] for p in points) + margin,
+        max(p[1] for p in points) + margin,
+    )
 
 
 @dataclass(frozen=True)
@@ -432,6 +439,37 @@ class ContourLoop:
     area: float
     length: float
     centroid: Point
+    closed: bool = True
+    line_width: float = 0.0
+    speed_multiplier: float = 1.0
+
+
+@dataclass(frozen=True)
+class ScanlineSpan:
+    fixed_index: int
+    fixed: float
+    low: float
+    high: float
+    vertical: bool
+    cell_id: int = -1
+
+    @property
+    def length(self) -> float:
+        return self.high - self.low
+
+    @property
+    def center(self) -> Point:
+        if self.vertical:
+            return (self.fixed, 0.5 * (self.low + self.high))
+        return (0.5 * (self.low + self.high), self.fixed)
+
+    def with_cell(self, cell_id: int) -> "ScanlineSpan":
+        return ScanlineSpan(self.fixed_index, self.fixed, self.low, self.high, self.vertical, cell_id)
+
+    def segment(self, reverse: bool) -> list[Point]:
+        a = (self.fixed, self.low) if self.vertical else (self.low, self.fixed)
+        b = (self.fixed, self.high) if self.vertical else (self.high, self.fixed)
+        return [b, a] if reverse else [a, b]
 
 
 def interpolate_edge(corners: Sequence[Point], values: Sequence[float], level: float, edge: int) -> Point:
@@ -804,6 +842,135 @@ def filter_ring_medial_overlap(contours: Sequence[ContourLoop], spacing: float) 
     return stable if stable else list(contours)
 
 
+def open_polyline_distance(p: Point, points: Sequence[Point]) -> float:
+    if not points:
+        return float("inf")
+    if len(points) == 1:
+        return dist(p, points[0])
+    return min(point_segment_distance(p, a, b) for a, b in zip(points, points[1:]))
+
+
+def contour_distance(p: Point, contour: ContourLoop) -> float:
+    return distance_to_loop(p, contour.points) if contour.closed else open_polyline_distance(p, contour.points)
+
+
+def principal_terminal_axes(points: Sequence[Point]) -> tuple[Point, Point, Point, float, float, float, float] | None:
+    if len(points) < 4:
+        return None
+
+    center = (
+        sum(p[0] for p in points) / len(points),
+        sum(p[1] for p in points) / len(points),
+    )
+    xx = 0.0
+    xy = 0.0
+    yy = 0.0
+    for p in points:
+        dx = p[0] - center[0]
+        dy = p[1] - center[1]
+        xx += dx * dx
+        xy += dx * dy
+        yy += dy * dy
+
+    if xx + yy <= EPS:
+        return None
+
+    angle = 0.5 * math.atan2(2.0 * xy, xx - yy)
+    major = (math.cos(angle), math.sin(angle))
+    minor = (-major[1], major[0])
+
+    major_values = [dot(sub(p, center), major) for p in points]
+    minor_values = [dot(sub(p, center), minor) for p in points]
+    major_span = max(major_values) - min(major_values)
+    minor_span = max(minor_values) - min(minor_values)
+    if minor_span > major_span:
+        major, minor = minor, major
+        major_values, minor_values = minor_values, major_values
+        major_span, minor_span = minor_span, major_span
+
+    return center, major, minor, min(major_values), max(major_values), min(minor_values), max(minor_values)
+
+
+def add_terminal_medial_gap_fill(
+    contours: Sequence[ContourLoop],
+    line_width: float,
+    spacing: float,
+) -> tuple[list[ContourLoop], list[str]]:
+    """Redistribute a terminal band over two safely connected wider passes.
+
+    A final elongated loop already contributes two opposing passes.  An earlier
+    iteration inserted a third medial pass, but odd-pass parity forced a long
+    retrace when both CFS ports were on the same end of the band.  Widen and
+    move the existing two passes instead; this preserves a simple open loop and
+    fills the same total band width without another branch.
+    """
+
+    grouped = loops_by_level(contours)
+    if not grouped:
+        return list(contours), []
+
+    last_level = max(grouped)
+    terminal_level = grouped[last_level]
+    if len(terminal_level) != 1:
+        return list(contours), []
+
+    terminal = terminal_level[0]
+    if not terminal.closed or len(terminal.points) < 4:
+        return list(contours), []
+
+    axes = principal_terminal_axes(terminal.points)
+    if axes is None:
+        return list(contours), []
+
+    center, major, minor, min_major, max_major, min_minor, max_minor = axes
+    major_span = max_major - min_major
+    minor_span = max_minor - min_minor
+    if major_span < spacing * 6.0:
+        return list(contours), []
+    if not (line_width * 1.02 < minor_span < line_width * 2.05):
+        return list(contours), []
+
+    adaptive_width = (minor_span + line_width) / 2.0
+    if not (line_width * 1.01 <= adaptive_width < line_width * 1.55):
+        return list(contours), []
+
+    mid_minor = 0.5 * (min_minor + max_minor)
+
+    def remap_terminal_point(p: Point) -> Point:
+        rel = sub(p, center)
+        major_coord = dot(rel, major)
+        minor_coord = dot(rel, minor)
+        side = 1.0 if minor_coord >= mid_minor else -1.0
+        return add(center, add(mul(major, major_coord), mul(minor, mid_minor + side * adaptive_width * 0.5)))
+
+    adjusted_points = [remap_terminal_point(p) for p in terminal.points]
+    adjusted_area = abs(signed_area(adjusted_points))
+    adjusted = ContourLoop(
+        level_index=terminal.level_index,
+        offset=terminal.offset,
+        points=adjusted_points if signed_area(adjusted_points) >= 0.0 else list(reversed(adjusted_points)),
+        area=adjusted_area,
+        length=polyline_length(adjusted_points, closed=True),
+        centroid=polygon_centroid(adjusted_points),
+        closed=True,
+        line_width=adaptive_width,
+        speed_multiplier=adaptive_width / line_width,
+    )
+
+    out: list[ContourLoop] = []
+    for loop in contours:
+        if loop is terminal:
+            out.append(adjusted)
+        else:
+            out.append(loop)
+    out.sort(key=lambda loop: (loop.level_index, -loop.area))
+
+    return out, [
+        f"Terminal band {minor_span:.3f} mm was redistributed into two {adaptive_width:.3f} mm beads "
+        f"(cross-section factor approximately {adaptive_width / line_width:.3f})."
+    ]
+
+
 def build_even_odd_fermat_chain(level_loops: Sequence[ContourLoop], anchor: Point, spacing: float) -> list[Point]:
     """Build a boundary-to-boundary Fermat-like contour spiral for one-loop levels.
 
@@ -836,6 +1003,53 @@ def build_even_odd_fermat_chain(level_loops: Sequence[ContourLoop], anchor: Poin
             direction *= -1
 
     return path
+
+
+def terminal_medial_band_path(
+    terminal: ContourLoop,
+    medial: ContourLoop,
+    start_hint: Point,
+    end_hint: Point,
+) -> list[Point]:
+    if terminal.line_width <= EPS or len(medial.points) < 2:
+        return []
+
+    a = medial.points[0]
+    b = medial.points[-1]
+    axis_length = dist(a, b)
+    if axis_length <= EPS:
+        return []
+
+    major = ((b[0] - a[0]) / axis_length, (b[1] - a[1]) / axis_length)
+    minor = (-major[1], major[0])
+    center = lerp(a, b, 0.5)
+    if terminal.points:
+        farthest = max(terminal.points, key=lambda p: abs(dot(sub(p, center), minor)))
+        if dot(sub(farthest, center), minor) < 0.0:
+            minor = (-minor[0], -minor[1])
+
+    sides = [a, b]
+
+    def side_point(side: int, level: float) -> Point:
+        return add(sides[side], mul(minor, level * terminal.line_width))
+
+    candidates: list[tuple[float, list[Point]]] = []
+    for start_side in (0, 1):
+        for levels in ((1.0, 0.0, -1.0), (-1.0, 0.0, 1.0)):
+            current_side = start_side
+            path: list[Point] = []
+            for idx, level in enumerate(levels):
+                next_side = 1 - current_side
+                append_point(path, side_point(current_side, level))
+                append_point(path, side_point(next_side, level))
+                if idx + 1 < len(levels):
+                    append_point(path, side_point(next_side, levels[idx + 1]))
+                current_side = next_side
+            score = dist(start_hint, path[0]) + dist(path[-1], end_hint)
+            candidates.append((score, path))
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1] if candidates else []
 
 
 def seam_gap_points(loop: ContourLoop, spacing: float) -> int:
@@ -1211,7 +1425,7 @@ def build_single_minimum_connected_fermat(
     the slot self-touches produced by the earlier two-slot weave.
     """
 
-    loops = [loop for loop in ordered_loops if len(loop.points) >= 4]
+    loops = [loop for loop in ordered_loops if len(loop.points) >= (4 if loop.closed else 2)]
     if not loops:
         return [], 0
     port_spacing = spacing if port_spacing is None else port_spacing
@@ -1239,7 +1453,39 @@ def build_single_minimum_connected_fermat(
         loop = loops[loop_index]
         points = loop.points
         n = len(points)
-        active_port_spacing = port_spacing if first_circle else max(port_spacing, spacing * 2.5)
+        if (
+            loop.closed
+            and loop_index + 1 < len(loops)
+            and not loops[loop_index + 1].closed
+            and in_branch
+            and out_branch
+        ):
+            band_path = terminal_medial_band_path(loop, loops[loop_index + 1], in_branch[-1], out_branch[-1])
+            if band_path:
+                append_points(in_branch, band_path)
+                break
+
+        if not loop.closed:
+            if len(points) < 2:
+                break
+            if not in_branch or not out_branch:
+                return [points[0], points[-1]], 0
+
+            a = points[0]
+            b = points[-1]
+            forward_score = dist(in_branch[-1], a) + dist(out_branch[-1], b)
+            reverse_score = dist(in_branch[-1], b) + dist(out_branch[-1], a)
+            if forward_score <= reverse_score:
+                start_point, end_point = a, b
+            else:
+                start_point, end_point = b, a
+
+            append_point(in_branch, start_point)
+            append_point(out_branch, end_point)
+            append_point(in_branch, end_point)
+            break
+
+        active_port_spacing = port_spacing
         circle_small = loop.length < active_port_spacing * 2.0
 
         if circle_small:
@@ -1630,6 +1876,7 @@ def merge_child_into_closed_parent(
     ]
     for first_port, second_port, first_index, second_index, child in variants:
         kept_arc = closed_path_arc_between_params(parent_path, second_index, first_index)
+
         candidate: list[Point] = []
         append_point(candidate, first_port)
         append_points(candidate, child)
@@ -1637,6 +1884,22 @@ def merge_child_into_closed_parent(
         append_points(candidate, kept_arc[1:])
         append_point(candidate, candidate[0])
         candidates.append(rotate_closed_path_to_anchor(candidate, anchor))
+
+        if grid is None or parent_min_sdf is None:
+            continue
+
+        connector_in = grid_astar_connector(grid, first_port, child[0], required_clearance=parent_min_sdf)
+        connector_out = grid_astar_connector(grid, child[-1], second_port, required_clearance=parent_min_sdf)
+        if connector_in is None or connector_out is None:
+            continue
+
+        routed: list[Point] = []
+        append_points(routed, connector_in)
+        append_points(routed, child[1:])
+        append_points(routed, connector_out)
+        append_points(routed, kept_arc[1:])
+        append_point(routed, routed[0])
+        candidates.append(rotate_closed_path_to_anchor(routed, anchor))
 
     return candidates
 
@@ -1825,11 +2088,11 @@ def try_insert_pocket_group(
 
     ordered = ordered_loops_for_spiral(group)
     best: tuple[tuple[int, int, int, float], list[Point]] | None = None
-    for center_index in unique_port_candidates(port_candidates, limit=6):
+    for center_index in unique_port_candidates(port_candidates, limit=4):
         center_index = max(3.0, min(center_index, len(parent_path) - 4.0))
         center_length = open_path_length_at_index(parent_path, prefix, center_index)
 
-        for half_width in (spacing * 1.35, spacing * 2.25, spacing * 3.25):
+        for half_width in (spacing * 0.60, spacing * 1.00, spacing * 1.35, spacing * 2.25, spacing * 3.25):
             left_index = open_path_index_at_length(parent_path, prefix, center_length - half_width)
             right_index = open_path_index_at_length(parent_path, prefix, center_length + half_width)
 
@@ -1946,9 +2209,15 @@ def build_residual_gap_grid(
     path: Sequence[Point],
     line_width: float,
     spacing: float,
+    exact_first_spacing: bool,
 ) -> SDFGrid:
     index = PathDistanceIndex(path, bin_size=max(spacing * 2.0, line_width))
-    extrusion_radius = line_width * 0.5 + spacing * 0.10
+    if exact_first_spacing:
+        # The residual boundary is offset so the first generated residual
+        # centerline lands exactly one nominal spacing from the existing path.
+        extrusion_radius = max(spacing - line_width * 0.5, EPS)
+    else:
+        extrusion_radius = line_width * 0.5 + spacing * 0.10
     max_search = max(spacing * 5.0, line_width * 4.0)
     values: list[float] = []
     for j in range(source_grid.ny + 1):
@@ -2002,8 +2271,9 @@ def insert_residual_gap_spirals(
 ) -> tuple[list[Point], int, int]:
     residual_cells = max(48, min(120, max(source_grid.nx, source_grid.ny)))
     residual_source_grid = build_sdf_grid(model, grid_cells=residual_cells, margin=line_width * 2.0)
-    residual_grid = build_residual_gap_grid(model, residual_source_grid, path, line_width, spacing)
-    residual_spacing = spacing * 1.25
+    exact_first_spacing = len(model.holes) >= 2
+    residual_grid = build_residual_gap_grid(model, residual_source_grid, path, line_width, spacing, exact_first_spacing)
+    residual_spacing = spacing if exact_first_spacing else spacing * 1.25
     residual_contours = filter_printable_contours(
         generate_offset_contours(
             residual_grid,
@@ -2637,27 +2907,57 @@ def grid_scanline_intervals(
     sample_step: float,
     vertical: bool,
     required_sdf: float | None = None,
+    min_interval_length: float | None = None,
 ) -> list[tuple[float, float]]:
     required = line_width * 0.5 if required_sdf is None else required_sdf
+    min_length = line_width if min_interval_length is None else min_interval_length
     samples = max(8, int(math.ceil((variable_max - variable_min) / max(sample_step, EPS))))
-    inside = []
+    values: list[tuple[float, float, bool]] = []
     for i in range(samples + 1):
         v = variable_min + (variable_max - variable_min) * i / samples
         p = (fixed, v) if vertical else (v, fixed)
-        inside.append(grid.sample(p) >= required)
+        sdf = grid.sample(p)
+        values.append((v, sdf, sdf >= required))
+
+    def refined_crossing(left: tuple[float, float, bool], right: tuple[float, float, bool]) -> float:
+        lo = left[0]
+        hi = right[0]
+        lo_inside = left[2]
+        for _ in range(10):
+            mid = 0.5 * (lo + hi)
+            p = (fixed, mid) if vertical else (mid, fixed)
+            mid_inside = grid.sample(p) >= required
+            if mid_inside == lo_inside:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
 
     intervals: list[tuple[float, float]] = []
     start: float | None = None
-    for i, is_inside in enumerate(inside):
-        v = variable_min + (variable_max - variable_min) * i / samples
+    prev: tuple[float, float, bool] | None = None
+    for current in values:
+        v, _, is_inside = current
+        if prev is not None and prev[2] != is_inside:
+            crossing = refined_crossing(prev, current)
+            if is_inside:
+                start = crossing
+            elif start is not None:
+                if crossing - start >= min_length:
+                    intervals.append((start, crossing))
+                start = None
+            prev = current
+            continue
+
         if is_inside and start is None:
             start = v
         elif not is_inside and start is not None:
-            prev = variable_min + (variable_max - variable_min) * (i - 1) / samples
-            if prev - start >= line_width:
-                intervals.append((start, prev))
+            if v - start >= min_length:
+                intervals.append((start, v))
             start = None
-    if start is not None and variable_max - start >= line_width:
+        prev = current
+
+    if start is not None and variable_max - start >= min_length:
         intervals.append((start, variable_max))
     return intervals
 
@@ -2713,6 +3013,865 @@ def build_monotone_scanline_path(
     return path, not unsupported_multi_interval
 
 
+def scanline_fixed_values(fixed_min: float, fixed_max: float, spacing: float, phase: float) -> list[float]:
+    if fixed_max < fixed_min:
+        return []
+
+    width = fixed_max - fixed_min
+    if width <= EPS:
+        return [0.5 * (fixed_min + fixed_max)]
+
+    count = max(1, int(math.floor(width / max(spacing, EPS))) + 1)
+    covered = spacing * (count - 1)
+    start = fixed_min + max(0.0, width - covered) * 0.5 + phase * spacing
+    while start - spacing >= fixed_min - EPS:
+        start -= spacing
+
+    values: list[float] = []
+    fixed = start
+    while fixed <= fixed_max + EPS:
+        if fixed >= fixed_min - EPS:
+            values.append(max(fixed_min, min(fixed_max, fixed)))
+        fixed += spacing
+    return values
+
+
+def collect_scanline_spans(
+    model: PolygonModel,
+    grid: SDFGrid,
+    line_width: float,
+    spacing: float,
+    vertical: bool,
+    phase: float,
+    required_sdf: float | None,
+) -> list[ScanlineSpan]:
+    min_x, min_y, max_x, max_y = model.bounds(margin=0.0)
+    if vertical:
+        fixed_min = min_x + line_width * 0.5
+        fixed_max = max_x - line_width * 0.5
+        variable_min = min_y + line_width * 0.5
+        variable_max = max_y - line_width * 0.5
+    else:
+        fixed_min = min_y + line_width * 0.5
+        fixed_max = max_y - line_width * 0.5
+        variable_min = min_x + line_width * 0.5
+        variable_max = max_x - line_width * 0.5
+
+    spans: list[ScanlineSpan] = []
+    min_interval_length = max(line_width * 0.35, spacing * 0.35)
+    for fixed_index, fixed in enumerate(scanline_fixed_values(fixed_min, fixed_max, spacing, phase)):
+        intervals = grid_scanline_intervals(
+            grid,
+            fixed,
+            variable_min,
+            variable_max,
+            line_width=line_width,
+            sample_step=spacing * 0.25,
+            vertical=vertical,
+            required_sdf=required_sdf,
+            min_interval_length=min_interval_length,
+        )
+        for a, b in intervals:
+            spans.append(ScanlineSpan(fixed_index, fixed, a, b, vertical))
+    return spans
+
+
+def scanline_span_overlap(a: ScanlineSpan, b: ScanlineSpan) -> float:
+    return max(0.0, min(a.high, b.high) - max(a.low, b.low))
+
+
+def assign_boustrophedon_cells(spans: Sequence[ScanlineSpan], spacing: float) -> list[ScanlineSpan]:
+    columns: dict[int, list[ScanlineSpan]] = {}
+    for span in spans:
+        columns.setdefault(span.fixed_index, []).append(span)
+    for column in columns.values():
+        column.sort(key=lambda span: (span.low, span.high))
+
+    next_cell_id = 0
+    previous_column: list[ScanlineSpan] = []
+    assigned: list[ScanlineSpan] = []
+    min_overlap = max(spacing * 0.10, EPS)
+
+    for fixed_index in sorted(columns):
+        column = columns[fixed_index]
+        current_to_previous: dict[int, list[int]] = {idx: [] for idx in range(len(column))}
+        previous_to_current: dict[int, list[int]] = {idx: [] for idx in range(len(previous_column))}
+
+        for current_idx, current in enumerate(column):
+            for previous_idx, previous in enumerate(previous_column):
+                if scanline_span_overlap(current, previous) >= min_overlap:
+                    current_to_previous[current_idx].append(previous_idx)
+                    previous_to_current[previous_idx].append(current_idx)
+
+        new_column: list[ScanlineSpan] = []
+        for current_idx, current in enumerate(column):
+            predecessors = current_to_previous[current_idx]
+            if len(predecessors) == 1 and len(previous_to_current[predecessors[0]]) == 1:
+                cell_id = previous_column[predecessors[0]].cell_id
+            else:
+                cell_id = next_cell_id
+                next_cell_id += 1
+            new_span = current.with_cell(cell_id)
+            new_column.append(new_span)
+            assigned.append(new_span)
+
+        previous_column = new_column
+
+    return assigned
+
+
+def route_middle_connector(
+    grid: SDFGrid,
+    existing_path: Sequence[Point],
+    start: Point,
+    goal: Point,
+    required_clearance: float,
+    spacing: float,
+    spacing_tolerance: float,
+    allow_astar: bool = True,
+    astar_cache: dict[tuple[int, int, int, int, int], list[Point] | None] | None = None,
+) -> list[Point] | None:
+    if dist(start, goal) <= EPS:
+        return [start, goal]
+
+    direct = [start, goal]
+    if segment_is_inside(grid.model, start, goal, required_clearance, spacing * 0.35) and connector_clear_of_path(
+        existing_path,
+        direct,
+        spacing,
+        spacing_tolerance,
+        skip_tail=6,
+    ):
+        return direct
+
+    if not allow_astar:
+        return None
+
+    cache_key = (
+        round(start[0] * 1000),
+        round(start[1] * 1000),
+        round(goal[0] * 1000),
+        round(goal[1] * 1000),
+        round(required_clearance * 1000),
+    )
+    if astar_cache is not None and cache_key in astar_cache:
+        connector = astar_cache[cache_key]
+    else:
+        connector = grid_astar_connector(grid, start, goal, required_clearance=required_clearance)
+        if astar_cache is not None:
+            astar_cache[cache_key] = connector
+    if connector is not None and connector_clear_of_path(
+        existing_path,
+        connector,
+        spacing,
+        spacing_tolerance,
+        skip_tail=6,
+    ):
+        return connector
+
+    return None
+
+
+def build_scanline_cell_path(
+    grid: SDFGrid,
+    spans: Sequence[ScanlineSpan],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+    start_high: bool,
+) -> list[Point] | None:
+    if not spans:
+        return None
+
+    path: list[Point] = []
+    reverse = start_high
+    connector_clearance = line_width * 0.5 - spacing * 0.15
+    ordered = sorted(spans, key=lambda span: (span.fixed_index, span.low, span.high))
+
+    for span in ordered:
+        segment = span.segment(reverse)
+        if path:
+            connector = route_middle_connector(
+                grid,
+                path,
+                path[-1],
+                segment[0],
+                required_clearance=connector_clearance,
+                spacing=spacing,
+                spacing_tolerance=spacing_tolerance,
+            )
+            if connector is None:
+                return None
+            append_points(path, connector)
+        append_points(path, segment)
+        reverse = not reverse
+
+    return path
+
+
+def cell_path_variants(
+    grid: SDFGrid,
+    spans: Sequence[ScanlineSpan],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+) -> list[list[Point]]:
+    variants: list[list[Point]] = []
+    seen: set[tuple[tuple[int, int], tuple[int, int], int]] = set()
+
+    for start_high in (False, True):
+        path = build_scanline_cell_path(
+            grid,
+            spans,
+            line_width=line_width,
+            spacing=spacing,
+            spacing_tolerance=spacing_tolerance,
+            start_high=start_high,
+        )
+        if path is None or len(path) < 2:
+            continue
+        for candidate in (path, list(reversed(path))):
+            key = (
+                (round(candidate[0][0] * 1000), round(candidate[0][1] * 1000)),
+                (round(candidate[-1][0] * 1000), round(candidate[-1][1] * 1000)),
+                len(candidate),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            variants.append(candidate)
+
+    return variants
+
+
+def chain_scanline_cells(
+    grid: SDFGrid,
+    cell_variants: dict[int, list[list[Point]]],
+    cell_centers: dict[int, Point],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+    start_cell: int,
+    astar_cache: dict[tuple[int, int, int, int, int], list[Point] | None] | None = None,
+) -> list[Point] | None:
+    if start_cell not in cell_variants:
+        return None
+
+    connector_clearance = line_width * 0.5 - spacing * 0.15
+    all_cells = set(cell_variants)
+    cell_count = len(cell_variants)
+    beam_width = 16 if cell_count <= 5 else 8
+    states: list[tuple[float, list[Point], frozenset[int]]] = []
+
+    for variant in cell_variants[start_cell]:
+        remaining = frozenset(all_cells - {start_cell})
+        states.append((polyline_length(variant, closed=False) * 0.001, list(variant), remaining))
+
+    while states:
+        complete = [(score, path) for score, path, remaining in states if not remaining]
+        if complete:
+            complete.sort(
+                key=lambda item: (
+                    path_pair_metrics(item[1], spacing=spacing, spacing_tolerance=spacing_tolerance)[0],
+                    count_containment_violations(grid.model, item[1], spacing),
+                    item[0],
+                )
+            )
+            return complete[0][1]
+
+        next_states: list[tuple[float, list[Point], frozenset[int]]] = []
+        for state_score, path, remaining in states:
+            ordered_cells = sorted(
+                remaining,
+                key=lambda cell_id: (
+                    dist2(path[-1], cell_centers[cell_id]),
+                    cell_centers[cell_id][0],
+                    cell_centers[cell_id][1],
+                ),
+            )
+            search_limit = 6 if cell_count <= 5 else 4
+            search_cells = ordered_cells if len(ordered_cells) <= search_limit else ordered_cells[:search_limit]
+            for cell_id in search_cells:
+                remaining_after = frozenset(cell for cell in remaining if cell != cell_id)
+                for variant in cell_variants[cell_id]:
+                    connector = route_middle_connector(
+                        grid,
+                        path,
+                        path[-1],
+                        variant[0],
+                        required_clearance=connector_clearance,
+                        spacing=spacing,
+                        spacing_tolerance=spacing_tolerance,
+                        astar_cache=astar_cache,
+                    )
+                    if connector is None:
+                        continue
+
+                    lookahead = 0.0
+                    if remaining_after:
+                        lookahead = min(dist(variant[-1], cell_centers[other]) for other in remaining_after)
+
+                    next_path = list(path)
+                    append_points(next_path, connector)
+                    append_points(next_path, variant)
+                    next_score = state_score + polyline_length(connector, closed=False) + lookahead * 0.35
+                    next_states.append((next_score, next_path, remaining_after))
+
+        if not next_states:
+            return None
+
+        next_states.sort(key=lambda item: item[0])
+        states = next_states[:beam_width]
+
+    return None
+
+
+def chain_scanline_cells_in_order(
+    grid: SDFGrid,
+    cell_variants: dict[int, list[list[Point]]],
+    cell_centers: dict[int, Point],
+    order: Sequence[int],
+    line_width: float,
+    spacing: float,
+    spacing_tolerance: float,
+    astar_cache: dict[tuple[int, int, int, int, int], list[Point] | None] | None = None,
+) -> list[Point] | None:
+    path: list[Point] = []
+    connector_clearance = line_width * 0.5 - spacing * 0.15
+
+    for order_index, cell_id in enumerate(order):
+        if cell_id not in cell_variants:
+            return None
+
+        next_center = cell_centers[order[order_index + 1]] if order_index + 1 < len(order) else None
+        best: tuple[float, list[Point], list[Point] | None] | None = None
+        for variant in cell_variants[cell_id]:
+            connector: list[Point] | None = None
+            connector_length = 0.0
+            if path:
+                connector = route_middle_connector(
+                    grid,
+                    path,
+                    path[-1],
+                    variant[0],
+                    required_clearance=connector_clearance,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                    astar_cache=astar_cache,
+                )
+                if connector is None:
+                    continue
+                connector_length = polyline_length(connector, closed=False)
+
+            lookahead = dist(variant[-1], next_center) if next_center is not None else 0.0
+            start_bias = (variant[0][0] + variant[0][1]) * 0.001 if not path else 0.0
+            score = connector_length + lookahead * 0.35 + start_bias
+            if best is None or score < best[0]:
+                best = (score, variant, connector)
+
+        if best is None:
+            return None
+
+        _, variant, connector = best
+        if connector is not None:
+            append_points(path, connector)
+        append_points(path, variant)
+
+    return path
+
+
+def scanline_cell_orders(cell_centers: dict[int, Point]) -> list[list[int]]:
+    if not cell_centers:
+        return []
+
+    cell_ids = list(cell_centers)
+    centroid = (
+        sum(cell_centers[cell_id][0] for cell_id in cell_ids) / len(cell_ids),
+        sum(cell_centers[cell_id][1] for cell_id in cell_ids) / len(cell_ids),
+    )
+    base_orders = [
+        sorted(cell_ids, key=lambda cell_id: (cell_centers[cell_id][0], cell_centers[cell_id][1])),
+        sorted(cell_ids, key=lambda cell_id: (cell_centers[cell_id][1], cell_centers[cell_id][0])),
+        sorted(
+            cell_ids,
+            key=lambda cell_id: math.atan2(cell_centers[cell_id][1] - centroid[1], cell_centers[cell_id][0] - centroid[0]),
+        ),
+    ]
+
+    orders: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def add_order(order: Sequence[int]) -> None:
+        if not order:
+            return
+        rotations = range(len(order)) if len(order) <= 7 else (0,)
+        for rotation in rotations:
+            rotated = list(order[rotation:]) + list(order[:rotation])
+            for candidate in (rotated, list(reversed(rotated))):
+                key = tuple(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                orders.append(candidate)
+
+    for order in base_orders:
+        add_order(order)
+
+    return orders
+
+
+def build_cellular_scanline_path_candidates(
+    model: PolygonModel,
+    grid: SDFGrid,
+    line_width: float,
+    spacing: float,
+    required_sdf: float | None = None,
+    spacing_tolerance: float = 0.25,
+    limit: int = 6,
+) -> list[list[Point]]:
+    candidates: list[tuple[tuple[int, int, float, float], list[Point]]] = []
+
+    def unique_candidates() -> list[list[Point]]:
+        candidates.sort(key=lambda item: item[0])
+        unique: list[list[Point]] = []
+        seen_keys: set[tuple[tuple[int, int], tuple[int, int], int]] = set()
+        for _, path in candidates:
+            key = (
+                (round(path[0][0] * 1000), round(path[0][1] * 1000)),
+                (round(path[-1][0] * 1000), round(path[-1][1] * 1000)),
+                len(path),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique.append(path)
+            if len(unique) >= limit:
+                break
+        return unique
+
+    sweep_options: list[tuple[int, int, bool, float, list[ScanlineSpan]]] = []
+    for vertical, phase in ((True, 0.0), (False, 0.0), (True, 0.5), (False, 0.5)):
+        spans = assign_boustrophedon_cells(
+            collect_scanline_spans(
+                model,
+                grid,
+                line_width=line_width,
+                spacing=spacing,
+                vertical=vertical,
+                phase=phase,
+                required_sdf=required_sdf,
+            ),
+            spacing=spacing,
+        )
+        if not spans:
+            continue
+        cell_count = len({span.cell_id for span in spans})
+        sweep_options.append((cell_count, len(spans), vertical, phase, spans))
+
+    sweep_options.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+
+    for _, _, _vertical, _phase, spans in sweep_options:
+        cells: dict[int, list[ScanlineSpan]] = {}
+        for span in spans:
+            cells.setdefault(span.cell_id, []).append(span)
+
+        cell_variants: dict[int, list[list[Point]]] = {}
+        cell_centers: dict[int, Point] = {}
+        for cell_id, cell_spans in cells.items():
+            variants = cell_path_variants(
+                grid,
+                cell_spans,
+                line_width=line_width,
+                spacing=spacing,
+                spacing_tolerance=spacing_tolerance,
+            )
+            if not variants:
+                break
+            cell_variants[cell_id] = variants
+            cell_centers[cell_id] = (
+                sum(span.center[0] for span in cell_spans) / len(cell_spans),
+                sum(span.center[1] for span in cell_spans) / len(cell_spans),
+            )
+        else:
+            astar_cache: dict[tuple[int, int, int, int, int], list[Point] | None] = {}
+
+            for order in scanline_cell_orders(cell_centers):
+                path = chain_scanline_cells_in_order(
+                    grid,
+                    cell_variants,
+                    cell_centers,
+                    order,
+                    line_width=line_width,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                    astar_cache=astar_cache,
+                )
+                if path is None or len(path) < 2:
+                    continue
+
+                crossings, close_pairs, min_spacing = path_pair_metrics(
+                    path,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                )
+                containment = count_containment_violations(model, path, spacing) if crossings == 0 else 1
+                score = (crossings, containment, -min_spacing, polyline_length(path, closed=False))
+                candidates.append((score, path))
+                if crossings == 0 and containment == 0 and len(unique_candidates()) >= min(2, limit):
+                    return unique_candidates()
+
+            clean = [item for item in candidates if item[0][0] == 0 and item[0][1] == 0]
+            if clean:
+                return unique_candidates()
+
+            ring_path = build_hole_band_scanline_path(
+                model,
+                grid,
+                line_width=line_width,
+                spacing=spacing,
+                required_sdf=required_sdf,
+                spacing_tolerance=spacing_tolerance,
+            )
+            if ring_path:
+                crossings, close_pairs, min_spacing = path_pair_metrics(
+                    ring_path,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                )
+                containment = count_containment_violations(model, ring_path, spacing) if crossings == 0 else 1
+                score = (crossings, containment, -min_spacing, polyline_length(ring_path, closed=False))
+                candidates.append((score, ring_path))
+                if crossings == 0 and containment == 0:
+                    return unique_candidates()
+
+            start_cells = sorted(
+                cell_variants,
+                key=lambda cell_id: (cell_centers[cell_id][0], cell_centers[cell_id][1]),
+            )
+            if len(start_cells) > 1:
+                middle = start_cells[len(start_cells) // 2]
+                start_cells = [start_cells[0], start_cells[-1], middle]
+            tried_starts: set[int] = set()
+            for start_cell in start_cells:
+                if start_cell in tried_starts:
+                    continue
+                tried_starts.add(start_cell)
+                path = chain_scanline_cells(
+                    grid,
+                    cell_variants,
+                    cell_centers,
+                    line_width=line_width,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                    start_cell=start_cell,
+                    astar_cache=astar_cache,
+                )
+                if path is None or len(path) < 2:
+                    continue
+
+                crossings, close_pairs, min_spacing = path_pair_metrics(
+                    path,
+                    spacing=spacing,
+                    spacing_tolerance=spacing_tolerance,
+                )
+                containment = count_containment_violations(model, path, spacing) if crossings == 0 else 1
+                score = (crossings, containment, -min_spacing, polyline_length(path, closed=False))
+                candidates.append((score, path))
+                if crossings == 0 and containment == 0 and len(unique_candidates()) >= min(2, limit):
+                    return unique_candidates()
+
+    return unique_candidates()
+
+
+def build_hole_band_scanline_path(
+    model: PolygonModel,
+    grid: SDFGrid,
+    line_width: float,
+    spacing: float,
+    required_sdf: float | None,
+    spacing_tolerance: float,
+    phase: float = 0.0,
+) -> list[Point]:
+    if not model.holes:
+        return []
+
+    min_x, min_y, max_x, max_y = model.bounds(margin=0.0)
+    hole_points = [p for hole in model.holes for p in hole]
+    y_cut = sum(p[1] for p in hole_points) / max(1, len(hole_points))
+    fixed_min = min_x + line_width * 0.5
+    fixed_max = max_x - line_width * 0.5
+    variable_min = min_y + line_width * 0.5
+    variable_max = max_y - line_width * 0.5
+    fixed_values = scanline_fixed_values(fixed_min, fixed_max, spacing, phase=phase)
+
+    lower: list[tuple[float, float, float]] = []
+    upper: list[tuple[float, float, float]] = []
+    cut_gap = spacing * 0.50
+    for fixed in fixed_values:
+        intervals = grid_scanline_intervals(
+            grid,
+            fixed,
+            variable_min,
+            variable_max,
+            line_width=line_width,
+            sample_step=spacing * 0.25,
+            vertical=True,
+            required_sdf=required_sdf,
+            min_interval_length=max(line_width * 0.35, spacing * 0.35),
+        )
+        for a, b in intervals:
+            if a < y_cut - cut_gap:
+                lo = a
+                hi = min(b, y_cut - cut_gap)
+                if hi - lo >= spacing * 0.35:
+                    lower.append((fixed, lo, hi))
+            if b > y_cut + cut_gap:
+                lo = max(a, y_cut + cut_gap)
+                hi = b
+                if hi - lo >= spacing * 0.35:
+                    upper.append((fixed, lo, hi))
+
+    path: list[Point] = []
+    connector_clearance = line_width * 0.5 - spacing * 0.15
+
+    def append_segment(segment: list[Point]) -> bool:
+        if path:
+            connector = route_middle_connector(
+                grid,
+                path,
+                path[-1],
+                segment[0],
+                required_clearance=connector_clearance,
+                spacing=spacing,
+                spacing_tolerance=spacing_tolerance,
+                astar_cache={},
+            )
+            if connector is None:
+                return False
+            append_points(path, connector)
+        append_points(path, segment)
+        return True
+
+    reverse = False
+    for fixed, a, b in lower:
+        if not append_segment([(fixed, b), (fixed, a)] if reverse else [(fixed, a), (fixed, b)]):
+            return []
+        reverse = not reverse
+
+    upper_order = list(reversed(upper))
+    reverse = False
+    if path and upper_order:
+        fixed, a, b = upper_order[0]
+        if abs(path[-1][0] - fixed) <= EPS and abs(path[-1][1] - a) < abs(path[-1][1] - b):
+            reverse = True
+    for fixed, a, b in upper_order:
+        if not append_segment([(fixed, a), (fixed, b)] if reverse else [(fixed, b), (fixed, a)]):
+            return []
+        reverse = not reverse
+
+    if len(path) < 2:
+        return []
+    crossings, _, _ = path_pair_metrics(path, spacing=spacing, spacing_tolerance=spacing_tolerance)
+    if crossings != 0 or count_containment_violations(model, path, spacing) != 0:
+        return []
+    return path
+
+
+def outer_wall_preserving_scanline_intervals(
+    model: PolygonModel,
+    fixed: float,
+    variable_min: float,
+    variable_max: float,
+    line_width: float,
+    spacing: float,
+    wall_count: int,
+    vertical: bool,
+    hole_bounds: Sequence[tuple[Sequence[Point], tuple[float, float, float, float]]] | None = None,
+) -> list[tuple[float, float]]:
+    outer_required = line_width * 0.5 + spacing * wall_count
+    hole_required = line_width * 0.5
+    samples = max(8, int(math.ceil((variable_max - variable_min) / max(spacing * 0.25, EPS))))
+    hole_data = hole_bounds
+    if hole_data is None:
+        hole_data = [(hole, loop_bounds(hole, hole_required)) for hole in model.holes]
+
+    def clear_of_holes(p: Point) -> bool:
+        for hole, bounds in hole_data:
+            min_x, min_y, max_x, max_y = bounds
+            if p[0] < min_x or p[0] > max_x or p[1] < min_y or p[1] > max_y:
+                continue
+            if point_in_polygon(p, hole) or distance_to_loop(p, hole) < hole_required:
+                return False
+        return True
+
+    intervals: list[tuple[float, float]] = []
+    start: float | None = None
+    for i in range(samples + 1):
+        v = variable_min + (variable_max - variable_min) * i / samples
+        p = (fixed, v) if vertical else (v, fixed)
+        inside = (
+            point_in_polygon(p, model.outer)
+            and distance_to_loop(p, model.outer) >= outer_required
+            and clear_of_holes(p)
+        )
+        if inside and start is None:
+            start = v
+        elif not inside and start is not None:
+            if v - start >= spacing * 0.35:
+                intervals.append((start, v))
+            start = None
+
+    if start is not None and variable_max - start >= spacing * 0.35:
+        intervals.append((start, variable_max))
+    return intervals
+
+
+def build_outer_wall_preserving_hole_band_path(
+    model: PolygonModel,
+    grid: SDFGrid,
+    line_width: float,
+    spacing: float,
+    wall_count: int,
+    spacing_tolerance: float,
+    phase: float,
+) -> list[Point]:
+    if not model.holes:
+        return []
+
+    min_x, min_y, max_x, max_y = model.bounds(margin=0.0)
+    fixed_min = min_x + line_width * 0.5
+    fixed_max = max_x - line_width * 0.5
+    variable_min = min_y + line_width * 0.5
+    variable_max = max_y - line_width * 0.5
+    hole_points = [p for hole in model.holes for p in hole]
+    y_cut = sum(p[1] for p in hole_points) / max(1, len(hole_points))
+    hole_bounds = [(hole, loop_bounds(hole, line_width * 0.5)) for hole in model.holes]
+
+    lower: list[tuple[float, float, float]] = []
+    upper: list[tuple[float, float, float]] = []
+    cut_gap = spacing * 0.5
+    for fixed in scanline_fixed_values(fixed_min, fixed_max, spacing, phase):
+        intervals = outer_wall_preserving_scanline_intervals(
+            model,
+            fixed,
+            variable_min,
+            variable_max,
+            line_width=line_width,
+            spacing=spacing,
+            wall_count=wall_count,
+            vertical=True,
+            hole_bounds=hole_bounds,
+        )
+        for a, b in intervals:
+            if a < y_cut - cut_gap:
+                lo = a
+                hi = min(b, y_cut - cut_gap)
+                if hi - lo >= spacing * 0.35:
+                    lower.append((fixed, lo, hi))
+            if b > y_cut + cut_gap:
+                lo = max(a, y_cut + cut_gap)
+                hi = b
+                if hi - lo >= spacing * 0.35:
+                    upper.append((fixed, lo, hi))
+
+    path: list[Point] = []
+    connector_clearance = line_width * 0.5 - spacing * 0.15
+    astar_cache: dict[tuple[int, int, int, int, int], list[Point] | None] = {}
+
+    def append_segment(segment: list[Point]) -> bool:
+        if path:
+            connector = route_middle_connector(
+                grid,
+                path,
+                path[-1],
+                segment[0],
+                required_clearance=connector_clearance,
+                spacing=spacing,
+                spacing_tolerance=spacing_tolerance,
+                astar_cache=astar_cache,
+            )
+            if connector is None:
+                return False
+            append_points(path, connector)
+        append_points(path, segment)
+        return True
+
+    reverse = False
+    for fixed, a, b in lower:
+        if not append_segment([(fixed, b), (fixed, a)] if reverse else [(fixed, a), (fixed, b)]):
+            return []
+        reverse = not reverse
+
+    upper_order = list(reversed(upper))
+    reverse = False
+    if path and upper_order:
+        fixed, a, b = upper_order[0]
+        if abs(path[-1][0] - fixed) <= EPS and abs(path[-1][1] - a) < abs(path[-1][1] - b):
+            reverse = True
+    for fixed, a, b in upper_order:
+        if not append_segment([(fixed, a), (fixed, b)] if reverse else [(fixed, b), (fixed, a)]):
+            return []
+        reverse = not reverse
+
+    return path
+
+
+def build_outer_wall_preserving_hole_band_candidates(
+    model: PolygonModel,
+    grid: SDFGrid,
+    line_width: float,
+    spacing: float,
+    wall_count: int,
+    spacing_tolerance: float,
+) -> list[list[Point]]:
+    candidates: list[tuple[tuple[int, int, int, float, float], list[Point]]] = []
+    for phase in (0.0, 0.25, 0.5, 0.75):
+        path = build_outer_wall_preserving_hole_band_path(
+            model,
+            grid,
+            line_width=line_width,
+            spacing=spacing,
+            wall_count=wall_count,
+            spacing_tolerance=spacing_tolerance,
+            phase=phase,
+        )
+        if len(path) < 2:
+            continue
+        for candidate in (path, list(reversed(path))):
+            crossings, close_pairs, min_spacing = path_pair_metrics(
+                candidate,
+                spacing=spacing,
+                spacing_tolerance=spacing_tolerance,
+            )
+            retraces = count_immediate_retraces(candidate, spacing)
+            containment = 0 if crossings == 0 and retraces == 0 else 1
+            score = (
+                crossings + retraces,
+                containment,
+                close_pairs,
+                -min_spacing,
+                polyline_length(candidate, closed=False),
+            )
+            candidates.append((score, candidate))
+
+    candidates.sort(key=lambda item: item[0])
+    unique: list[list[Point]] = []
+    seen: set[tuple[tuple[int, int], tuple[int, int], int]] = set()
+    for _, path in candidates:
+        key = (
+            (round(path[0][0] * 1000), round(path[0][1] * 1000)),
+            (round(path[-1][0] * 1000), round(path[-1][1] * 1000)),
+            len(path),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+        if len(unique) >= 8:
+            break
+    return unique
+
+
 def build_two_band_scanline_path(
     model: PolygonModel,
     grid: SDFGrid,
@@ -2720,71 +3879,16 @@ def build_two_band_scanline_path(
     spacing: float,
     required_sdf: float | None = None,
 ) -> list[Point]:
-    min_x, min_y, max_x, max_y = model.bounds(margin=0.0)
-    if model.holes:
-        total_points = sum(len(hole) for hole in model.holes)
-        y_cut = sum(p[1] for hole in model.holes for p in hole) / max(1, total_points)
-    else:
-        y_cut = (min_y + max_y) * 0.5
-
-    fixed_values: list[float] = []
-    x = min_x + line_width * 0.5
-    while x <= max_x - line_width * 0.5 + EPS:
-        fixed_values.append(x)
-        x += spacing
-
-    lower: list[tuple[float, float, float]] = []
-    upper: list[tuple[float, float, float]] = []
-    for fixed in fixed_values:
-        intervals = grid_scanline_intervals(
-            grid,
-            fixed,
-            min_y + line_width * 0.5,
-            max_y - line_width * 0.5,
-            line_width=line_width,
-            sample_step=spacing * 0.25,
-            vertical=True,
-            required_sdf=required_sdf,
-        )
-        low_parts: list[tuple[float, float]] = []
-        high_parts: list[tuple[float, float]] = []
-        for a, b in intervals:
-            if a < y_cut - spacing * 0.5:
-                low_parts.append((a, min(b, y_cut - spacing * 0.5)))
-            if b > y_cut + spacing * 0.5:
-                high_parts.append((max(a, y_cut + spacing * 0.5), b))
-        if low_parts:
-            a = min(part[0] for part in low_parts)
-            b = max(part[1] for part in low_parts)
-            if b - a >= line_width:
-                lower.append((fixed, a, b))
-        if high_parts:
-            a = min(part[0] for part in high_parts)
-            b = max(part[1] for part in high_parts)
-            if b - a >= line_width:
-                upper.append((fixed, a, b))
-
-    path: list[Point] = []
-    reverse = False
-    required_clearance = line_width * 0.5 - spacing * 0.15
-
-    def append_segment_with_routed_connector(segment: list[Point]) -> None:
-        if path and not segment_is_inside(model, path[-1], segment[0], required_clearance, spacing * 0.5):
-            connector = grid_astar_connector(grid, path[-1], segment[0], required_clearance=required_clearance)
-            if connector is not None:
-                append_points(path, connector)
-        append_points(path, segment)
-
-    for fixed, a, b in lower:
-        append_segment_with_routed_connector([(fixed, b), (fixed, a)] if reverse else [(fixed, a), (fixed, b)])
-        reverse = not reverse
-
-    reverse = False
-    for fixed, a, b in reversed(upper):
-        append_segment_with_routed_connector([(fixed, a), (fixed, b)] if reverse else [(fixed, b), (fixed, a)])
-        reverse = not reverse
-
-    return path
+    candidates = build_cellular_scanline_path_candidates(
+        model,
+        grid,
+        line_width=line_width,
+        spacing=spacing,
+        required_sdf=required_sdf,
+        spacing_tolerance=0.25,
+        limit=1,
+    )
+    return candidates[0] if candidates else []
 
 
 def point_line_distance(p: Point, a: Point, b: Point) -> float:
@@ -2916,7 +4020,13 @@ def seam_to_adjacent_spacing(path: Sequence[Point], spacing: float) -> float:
     return best if best < float("inf") else spacing
 
 
-def local_uncovered_area_ratio(model: PolygonModel, path: Sequence[Point], line_width: float, spacing: float) -> float:
+def local_uncovered_area_ratio(
+    model: PolygonModel,
+    path: Sequence[Point],
+    line_width: float,
+    spacing: float,
+    segment_widths: Sequence[float] | None = None,
+) -> float:
     if not path:
         return 1.0
     center = path[0]
@@ -2927,6 +4037,11 @@ def local_uncovered_area_ratio(model: PolygonModel, path: Sequence[Point], line_
     min_x = center[0] - radius
     min_y = center[1] - radius
     step = (radius * 2.0) / cells
+    widths = (
+        segment_widths
+        if segment_widths is not None and len(segment_widths) == max(0, len(path) - 1)
+        else [line_width] * max(0, len(path) - 1)
+    )
     for y in range(cells):
         py = min_y + (y + 0.5) * step
         for x in range(cells):
@@ -2934,9 +4049,32 @@ def local_uncovered_area_ratio(model: PolygonModel, path: Sequence[Point], line_
             if dist(p, center) > radius or not model.contains(p):
                 continue
             inside += 1
-            if any(point_segment_distance(p, a, b) <= line_width * 0.5 for a, b in zip(path, path[1:])):
+            if any(point_segment_distance(p, a, b) <= width * 0.5 for width, (a, b) in zip(widths, zip(path, path[1:]))):
                 covered += 1
     return 0.0 if inside == 0 else 1.0 - covered / inside
+
+
+def segment_widths_for_path(path: Sequence[Point], contours: Sequence[ContourLoop], line_width: float, spacing: float) -> list[float]:
+    if len(path) < 2:
+        return []
+
+    adaptive = [loop for loop in contours if loop.line_width > EPS and abs(loop.line_width - line_width) > line_width * 0.01]
+    if not adaptive:
+        return [line_width] * (len(path) - 1)
+
+    tolerance = max(spacing * 0.32, line_width * 0.32)
+    widths: list[float] = []
+    for a, b in zip(path, path[1:]):
+        mid = lerp(a, b, 0.5)
+        width = line_width
+        best_distance = float("inf")
+        for loop in adaptive:
+            d = max(contour_distance(a, loop), contour_distance(mid, loop), contour_distance(b, loop))
+            if d < best_distance and d <= tolerance:
+                best_distance = d
+                width = loop.line_width
+        widths.append(width)
+    return widths
 
 
 def raster_coverage(
@@ -2945,6 +4083,7 @@ def raster_coverage(
     bounds: tuple[float, float, float, float],
     line_width: float,
     cells: int,
+    segment_widths: Sequence[float] | None = None,
 ) -> tuple[float, float, float]:
     min_x, min_y, max_x, max_y = bounds
     width = max_x - min_x
@@ -2958,27 +4097,30 @@ def raster_coverage(
         ny = cells
         nx = max(12, int(round(cells * width / height)))
     cell = max(width / nx, height / ny)
-    radius_cells = max(1, int(math.ceil((line_width * 0.5) / cell)) + 1)
+    max_line_width = max([line_width, *(segment_widths or [])])
+    radius_cells = max(1, int(math.ceil((max_line_width * 0.5) / cell)) + 1)
 
     covered = bytearray(nx * ny)
 
-    def mark(p: Point) -> None:
+    def mark(p: Point, bead_width: float) -> None:
         ix = int((p[0] - min_x) / width * nx)
         iy = int((p[1] - min_y) / height * ny)
         if ix < -radius_cells or ix >= nx + radius_cells or iy < -radius_cells or iy >= ny + radius_cells:
             return
+        radius = bead_width * 0.5
         for y in range(max(0, iy - radius_cells), min(ny, iy + radius_cells + 1)):
             cy = min_y + (y + 0.5) * height / ny
             for x in range(max(0, ix - radius_cells), min(nx, ix + radius_cells + 1)):
                 cx = min_x + (x + 0.5) * width / nx
-                if dist((cx, cy), p) <= line_width * 0.5 + cell * 0.75:
+                if dist((cx, cy), p) <= radius + cell * 0.75:
                     covered[y * nx + x] = 1
 
-    for a, b in zip(path, path[1:]):
+    widths = list(segment_widths) if segment_widths is not None and len(segment_widths) == len(path) - 1 else [line_width] * max(0, len(path) - 1)
+    for width_this_segment, (a, b) in zip(widths, zip(path, path[1:])):
         length = dist(a, b)
         steps = max(1, int(math.ceil(length / max(cell * 0.45, EPS))))
         for i in range(steps + 1):
-            mark(lerp(a, b, i / steps))
+            mark(lerp(a, b, i / steps), width_this_segment)
 
     inside_count = 0
     inside_covered = 0
@@ -3086,6 +4228,22 @@ def path_pair_metrics(
     return self_intersections, spacing_violations, min_nonlocal_spacing
 
 
+def count_immediate_retraces(path: Sequence[Point], spacing: float) -> int:
+    tolerance = max(spacing * 0.02, EPS)
+    min_retrace_length = max(spacing * 0.10, tolerance)
+    retraces = 0
+    for a, b, c in zip(path, path[1:], path[2:]):
+        ab = sub(b, a)
+        bc = sub(c, b)
+        if dot(ab, ab) <= EPS or dot(bc, bc) <= min_retrace_length * min_retrace_length:
+            continue
+        if dot(ab, bc) >= 0.0:
+            continue
+        if point_segment_distance(c, a, b) <= tolerance:
+            retraces += 1
+    return retraces
+
+
 def validate_path(
     model: PolygonModel,
     contours: Sequence[ContourLoop],
@@ -3098,6 +4256,7 @@ def validate_path(
     elapsed_seconds: float,
     strategy: str,
     unsafe_connectors: int,
+    segment_widths: Sequence[float] | None = None,
 ) -> ValidationMetrics:
     max_segment = 0.0
     containment_violations = 0
@@ -3125,15 +4284,17 @@ def validate_path(
         model.bounds(margin=line_width),
         line_width,
         coverage_cells,
+        segment_widths=segment_widths,
     )
     self_intersections, spacing_violations, min_nonlocal_spacing = path_pair_metrics(
         path,
         spacing=spacing,
         spacing_tolerance=spacing_tolerance,
     )
+    self_intersections += count_immediate_retraces(path, spacing)
     endpoint_gap = dist(path[0], path[-1]) if path else 0.0
     seam_spacing = seam_to_adjacent_spacing(path, spacing)
-    local_uncovered = local_uncovered_area_ratio(model, path, line_width, spacing)
+    local_uncovered = local_uncovered_area_ratio(model, path, line_width, spacing, segment_widths=segment_widths)
     disconnected_path_count = 1 if path else 0
 
     contour_levels = len({loop.level_index for loop in contours})
@@ -3153,6 +4314,7 @@ def validate_path(
         and len(path) >= 2
         and containment_violations == 0
         and self_intersections == 0
+        and spacing_violations <= 3
         and start_on_outer
         and end_on_outer
         and unsafe_connectors == 0
@@ -3201,8 +4363,11 @@ class LayerResult:
     path: list[Point]
     metrics: ValidationMetrics
     diagnostics: list[str]
+    segment_widths: list[float] = field(default_factory=list)
+    line_width: float = 0.0
 
     def to_json(self) -> dict[str, object]:
+        adaptive_widths = [width for width in self.segment_widths if self.line_width > EPS and width < self.line_width * 0.99]
         return {
             "shape": self.shape,
             "grid": {
@@ -3224,216 +4389,13 @@ class LayerResult:
                 "points": len(self.path),
                 "start": list(self.path[0]) if self.path else None,
                 "end": list(self.path[-1]) if self.path else None,
+                "adaptive_segments": len(adaptive_widths),
+                "min_width": min(self.segment_widths) if self.segment_widths else None,
+                "max_speed_multiplier": (self.line_width / min(adaptive_widths)) if adaptive_widths and self.line_width > EPS else 1.0,
             },
             "metrics": self.metrics.__dict__,
             "diagnostics": self.diagnostics,
         }
-
-
-def build_contour_walls_with_zigzag_middle(
-    model: PolygonModel,
-    grid: SDFGrid,
-    contours: Sequence[ContourLoop],
-    outer_loop: ContourLoop,
-    start_anchor: Point,
-    line_width: float,
-    spacing: float,
-    spacing_tolerance: float,
-    wall_contours: int,
-) -> tuple[list[Point], int] | None:
-    wall_count = max(1, wall_contours)
-    wall_loops = [loop for loop in contours if loop.level_index < wall_count]
-    ordered_walls = ordered_loops_for_spiral(wall_loops)
-    if not ordered_walls:
-        return None
-
-    candidate_exits: list[Point] = [
-        point_at_closed_fraction(outer_loop.points, fraction)
-        for fraction in (0.50, 0.67, 0.33, 0.25, 0.75, 0.10, 0.90)
-    ]
-    best_wall: tuple[tuple[int, int, float], list[Point]] | None = None
-    for exit_anchor in candidate_exits:
-        wall_path, _ = build_single_minimum_connected_fermat(
-            ordered_walls,
-            start_anchor=start_anchor,
-            spacing=spacing,
-            port_spacing=spacing,
-            exit_anchor=exit_anchor,
-            preserve_medial_pockets=True,
-        )
-        if len(wall_path) < 2:
-            continue
-        wall_path = complete_outer_boundary_cycle(wall_path, outer_loop, spacing, spacing_tolerance)
-        crossings, close_pairs, min_spacing = path_pair_metrics(
-            wall_path,
-            spacing=spacing,
-            spacing_tolerance=spacing_tolerance,
-        )
-        score = (crossings, close_pairs, -min_spacing)
-        if best_wall is None or score < best_wall[0]:
-            best_wall = (score, wall_path)
-        if crossings == 0 and close_pairs == 0:
-            break
-
-    if best_wall is None:
-        return None
-
-    middle_required_sdf = line_width * 0.5 + spacing * wall_count
-    middle_path = build_two_band_scanline_path(
-        model,
-        grid,
-        line_width=line_width,
-        spacing=spacing,
-        required_sdf=middle_required_sdf,
-    )
-    if len(middle_path) < 2:
-        return best_wall[1], 0
-
-    best: tuple[tuple[int, int, int, float], list[Point]] | None = None
-    innermost_wall_sdf = line_width * 0.5 + spacing * (wall_count - 1) - spacing * 0.35
-    for candidate in merge_child_into_closed_parent(
-        best_wall[1],
-        middle_path,
-        start_anchor,
-        grid=grid,
-        parent_min_sdf=innermost_wall_sdf,
-    ):
-        candidate = rotate_closed_path_to_loop(candidate, outer_loop.points)
-        outer_distance = distance_to_loop(candidate[0], outer_loop.points)
-        crossings, close_pairs, min_spacing = path_pair_metrics(
-            candidate,
-            spacing=spacing,
-            spacing_tolerance=spacing_tolerance,
-        )
-        containment = count_containment_violations(model, candidate, spacing) if crossings == 0 else 1
-        score = (outer_distance > spacing * 0.55, crossings, close_pairs, containment, -min_spacing)
-        if best is None or score < best[0]:
-            best = (score, candidate)
-        if outer_distance <= spacing * 0.55 and crossings == 0 and containment == 0:
-            return candidate, 0
-
-    if best is not None and best[0][0] == 0 and best[0][1] == 0 and best[0][3] == 0:
-        return best[1], 0
-    return None
-
-
-def build_outer_contour_walls_with_zigzag_middle(
-    model: PolygonModel,
-    grid: SDFGrid,
-    contours: Sequence[ContourLoop],
-    outer_loop: ContourLoop,
-    start_anchor: Point,
-    line_width: float,
-    spacing: float,
-    spacing_tolerance: float,
-    wall_contours: int,
-    coverage_cells: int,
-    coverage_threshold: float,
-) -> tuple[list[Point], int] | None:
-    """Keep external contour walls, then splice SDF-clipped looped zig-zag.
-
-    This is deliberately narrower than build_contour_walls_with_zigzag_middle:
-    it preserves the requested number of external perimeter contour levels and
-    lets the middle fill start only after the same SDF wall thickness from every
-    boundary. It is used as a conservative prototype fallback for hole
-    topologies where splicing hole-wall contour families into the same cycle is
-    not yet robust.
-    """
-
-    grouped = loops_by_level(contours)
-    wall_count = max(1, wall_contours)
-    outer_wall_loops: list[ContourLoop] = []
-    for level in range(wall_count):
-        loops = grouped.get(level)
-        if not loops:
-            break
-        outer_wall_loops.append(max(loops, key=lambda loop: loop.area))
-
-    if not outer_wall_loops:
-        return None
-
-    middle_required_sdf = line_width * 0.5 + spacing * wall_count
-    middle_path = build_two_band_scanline_path(
-        model,
-        grid,
-        line_width=line_width,
-        spacing=spacing,
-        required_sdf=middle_required_sdf,
-    )
-    if len(middle_path) < 2:
-        return None
-
-    parent_min_sdf = line_width * 0.5 + spacing * (len(outer_wall_loops) - 1) - spacing * 0.35
-    exit_fractions = (0.67, 0.50, 0.33, 0.25, 0.75, 0.10, 0.90)
-
-    for exit_fraction in exit_fractions:
-        exit_anchor = point_at_closed_fraction(outer_loop.points, exit_fraction)
-        wall_path, unsafe = build_single_minimum_connected_fermat(
-            outer_wall_loops,
-            start_anchor=start_anchor,
-            spacing=spacing,
-            port_spacing=spacing,
-            exit_anchor=exit_anchor,
-            preserve_medial_pockets=True,
-        )
-        if unsafe or len(wall_path) < 2:
-            continue
-        wall_path = complete_outer_boundary_cycle(wall_path, outer_loop, spacing, spacing_tolerance)
-
-        for child_path in (middle_path, list(reversed(middle_path))):
-            for parent_path in (wall_path, list(reversed(wall_path))):
-                for candidate in merge_child_into_closed_parent(
-                    parent_path,
-                    child_path,
-                    start_anchor,
-                    grid=grid,
-                    parent_min_sdf=parent_min_sdf,
-                ):
-                    candidate = rotate_closed_path_to_loop(candidate, outer_loop.points)
-                    if not candidate:
-                        continue
-
-                    outer_tolerance = max(spacing * 0.55, line_width * 0.55)
-                    start_outer_distance = distance_to_loop(candidate[0], outer_loop.points)
-                    end_outer_distance = distance_to_loop(candidate[-1], outer_loop.points)
-                    if start_outer_distance > outer_tolerance or end_outer_distance > outer_tolerance:
-                        continue
-
-                    crossings, _, _ = path_pair_metrics(
-                        candidate,
-                        spacing=spacing,
-                        spacing_tolerance=spacing_tolerance,
-                    )
-                    containment = count_containment_violations(model, candidate, spacing) if crossings == 0 else 1
-                    coverage = 0.0
-                    if crossings == 0 and containment == 0:
-                        coverage, _, _ = raster_coverage(
-                            model,
-                            candidate,
-                            model.bounds(margin=line_width),
-                            line_width,
-                            coverage_cells,
-                        )
-
-                    metrics = None
-                    if crossings == 0 and containment == 0 and coverage >= coverage_threshold:
-                        metrics = validate_path(
-                            model,
-                            contours,
-                            candidate,
-                            line_width,
-                            spacing,
-                            coverage_cells,
-                            coverage_threshold,
-                            spacing_tolerance,
-                            0.0,
-                            "outer_contour_walls_plus_looped_zigzag_middle",
-                            unsafe_connectors=0,
-                        )
-                        if metrics.ok:
-                            return candidate, 0
-
-    return None
 
 
 def plan_one_layer(
@@ -3447,7 +4409,6 @@ def plan_one_layer(
     spacing_tolerance: float,
     start_fraction: float,
     exit_fraction: float,
-    wall_contours: int,
 ) -> LayerResult:
     started = time.perf_counter()
     grid = build_sdf_grid(model, grid_cells=grid_cells, margin=line_width * 2.0)
@@ -3459,6 +4420,8 @@ def plan_one_layer(
         spacing=spacing,
     )
     diagnostics: list[str] = []
+    contours, adaptive_diagnostics = add_terminal_medial_gap_fill(contours, line_width=line_width, spacing=spacing)
+    diagnostics.extend(adaptive_diagnostics)
 
     if not contours:
         elapsed = time.perf_counter() - started
@@ -3501,103 +4464,6 @@ def plan_one_layer(
             )
             branch_single_island = multi_loop and len(grouped.get(first_level, [])) == 1
 
-    if model.holes:
-        hybrid = build_contour_walls_with_zigzag_middle(
-            model,
-            grid,
-            contours,
-            outer_loop,
-            start_anchor,
-            line_width=line_width,
-            spacing=spacing,
-            spacing_tolerance=spacing_tolerance,
-            wall_contours=wall_contours,
-        )
-        if hybrid is not None:
-            hybrid_path, hybrid_unsafe = hybrid
-            if hybrid_path:
-                hybrid_crossings, _, _ = path_pair_metrics(
-                    hybrid_path,
-                    spacing=spacing,
-                    spacing_tolerance=spacing_tolerance,
-                )
-                hybrid_coverage, _, _ = raster_coverage(
-                    model,
-                    hybrid_path,
-                    model.bounds(margin=line_width),
-                    line_width,
-                    coverage_cells,
-                )
-                hybrid_containment = count_containment_violations(model, hybrid_path, spacing)
-                if hybrid_unsafe == 0 and hybrid_crossings == 0 and hybrid_containment == 0 and hybrid_coverage >= coverage_threshold:
-                    elapsed = time.perf_counter() - started
-                    metrics = validate_path(
-                        model,
-                        contours,
-                        hybrid_path,
-                        line_width,
-                        spacing,
-                        coverage_cells,
-                        coverage_threshold,
-                        spacing_tolerance,
-                        elapsed,
-                        "contour_walls_plus_looped_zigzag_middle",
-                        unsafe_connectors=0,
-                    )
-                    diagnostics.append(
-                        f"Hole topology kept {max(1, wall_contours)} contour wall level(s), then used looped zig-zag only in the remaining middle."
-                    )
-                    if metrics.spacing_violations:
-                        diagnostics.append(
-                            f"{metrics.spacing_violations} non-adjacent red path segment pair(s) are closer than "
-                            f"{spacing * (1.0 - spacing_tolerance):.3f}, but they do not cross."
-                        )
-                    if metrics.clearance_warnings:
-                        diagnostics.append(
-                            f"{metrics.clearance_warnings} sampled path points are inside the polygon but below nominal half-width clearance."
-                        )
-                    return LayerResult(model.name, grid, contours, hybrid_path, metrics, diagnostics)
-
-        outer_hybrid = build_outer_contour_walls_with_zigzag_middle(
-            model,
-            grid,
-            contours,
-            outer_loop,
-            start_anchor,
-            line_width=line_width,
-            spacing=spacing,
-            spacing_tolerance=spacing_tolerance,
-            wall_contours=wall_contours,
-            coverage_cells=coverage_cells,
-            coverage_threshold=coverage_threshold,
-        )
-        if outer_hybrid is not None:
-            outer_hybrid_path, outer_hybrid_unsafe = outer_hybrid
-            elapsed = time.perf_counter() - started
-            metrics = validate_path(
-                model,
-                contours,
-                outer_hybrid_path,
-                line_width,
-                spacing,
-                coverage_cells,
-                coverage_threshold,
-                spacing_tolerance,
-                elapsed,
-                "outer_contour_walls_plus_looped_zigzag_middle",
-                unsafe_connectors=outer_hybrid_unsafe,
-            )
-            if metrics.ok:
-                diagnostics.append(
-                    f"Hole topology kept {max(1, wall_contours)} external contour wall level(s), then used looped zig-zag only where SDF clearance remains."
-                )
-                if metrics.spacing_violations:
-                    diagnostics.append(
-                        f"{metrics.spacing_violations} non-adjacent red path segment pair(s) are closer than "
-                        f"{spacing * (1.0 - spacing_tolerance):.3f}, but they do not cross."
-                    )
-                return LayerResult(model.name, grid, contours, outer_hybrid_path, metrics, diagnostics)
-
     ordered_contours = ordered_loops_for_spiral(contours)
     if branch_single_island:
         path, unsafe_connectors = build_branch_connected_fermat(
@@ -3621,7 +4487,7 @@ def plan_one_layer(
             if all(abs(((fraction - existing + 0.5) % 1.0) - 0.5) > 1e-3 for existing, _ in candidate_exits):
                 candidate_exits.append((fraction, point_at_closed_fraction(outer_loop.points, fraction)))
 
-        best_candidate: tuple[tuple[int, int, int, float], list[Point], int, float] | None = None
+        best_candidate: tuple[tuple[int, int, float, int, float], list[Point], int, float] | None = None
         for fraction, candidate_exit in candidate_exits:
             candidate_path, candidate_unsafe = build_single_minimum_connected_fermat(
                 ordered_contours,
@@ -3631,16 +4497,21 @@ def plan_one_layer(
                 exit_anchor=candidate_exit,
                 preserve_medial_pockets=not one_hole_ring,
             )
+            completed_candidate = complete_outer_boundary_cycle(candidate_path, outer_loop, spacing, spacing_tolerance)
             crossings, close_pairs, min_spacing = path_pair_metrics(
-                candidate_path,
+                completed_candidate,
                 spacing=spacing,
                 spacing_tolerance=spacing_tolerance,
             )
-            score = (candidate_unsafe, crossings, close_pairs, -min_spacing)
+            seam_spacing = seam_to_adjacent_spacing(completed_candidate, spacing)
+            seam_penalty = abs(seam_spacing - spacing)
+            if seam_spacing < spacing * 0.98:
+                seam_penalty += spacing
+            score = (candidate_unsafe, crossings, seam_penalty, close_pairs, -min_spacing)
             if best_candidate is None or score < best_candidate[0]:
-                best_candidate = (score, candidate_path, candidate_unsafe, fraction)
-            if candidate_unsafe == 0 and crossings == 0 and close_pairs == 0:
-                best_candidate = (score, candidate_path, candidate_unsafe, fraction)
+                best_candidate = (score, completed_candidate, candidate_unsafe, fraction)
+            if candidate_unsafe == 0 and crossings == 0 and close_pairs == 0 and seam_penalty <= spacing * 0.05:
+                best_candidate = (score, completed_candidate, candidate_unsafe, fraction)
                 break
 
         assert best_candidate is not None
@@ -3693,6 +4564,7 @@ def plan_one_layer(
         elif gap_contours:
             diagnostics.append(f"Detected {gap_contours} residual gap contour(s), but no non-crossing splice was found.")
 
+    segment_widths = segment_widths_for_path(path, contours, line_width=line_width, spacing=spacing)
     elapsed = time.perf_counter() - started
     metrics = validate_path(
         model,
@@ -3706,6 +4578,7 @@ def plan_one_layer(
         elapsed,
         strategy,
         unsafe_connectors,
+        segment_widths=segment_widths,
     )
 
     if metrics.containment_violations:
@@ -3742,7 +4615,7 @@ def plan_one_layer(
             f"Coverage {metrics.coverage_ratio:.3f} is below threshold {coverage_threshold:.3f}; inspect SVG."
         )
 
-    return LayerResult(model.name, grid, contours, path, metrics, diagnostics)
+    return LayerResult(model.name, grid, contours, path, metrics, diagnostics, segment_widths=segment_widths, line_width=line_width)
 
 
 def svg_points(points: Sequence[Point], bounds: tuple[float, float, float, float], width: int, height: int, pad: int) -> str:
@@ -3777,13 +4650,39 @@ def write_svg(result: LayerResult, path: Path, draw_contours: bool) -> None:
 
     if draw_contours:
         for loop in result.contours:
-            color = "#9ab7d8" if loop.level_index % 2 == 0 else "#b7cda3"
-            pts = svg_points(loop.points + [loop.points[0]], bounds, width, height, pad)
-            lines.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="0.8" opacity="0.45"/>')
+            adaptive = result.line_width > EPS and loop.line_width > EPS and loop.line_width < result.line_width * 0.99
+            color = "#7a4cc2" if not loop.closed else ("#c65454" if adaptive else ("#9ab7d8" if loop.level_index % 2 == 0 else "#b7cda3"))
+            contour_points = loop.points + ([loop.points[0]] if loop.closed and loop.points else [])
+            pts = svg_points(contour_points, bounds, width, height, pad)
+            title = ""
+            if adaptive:
+                title = f"<title>adaptive contour width {loop.line_width:.3f} mm, speed x{loop.speed_multiplier:.3f}</title>"
+            elif not loop.closed:
+                title = "<title>open medial gap-fill contour</title>"
+            lines.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="0.9" opacity="0.60">{title}</polyline>')
 
     if result.path:
         pts = svg_points(result.path, bounds, width, height, pad)
         lines.append(f'<polyline points="{pts}" fill="none" stroke="#d12f1f" stroke-width="2.0" stroke-linejoin="round" stroke-linecap="round"/>')
+
+        if result.segment_widths and result.line_width > EPS and len(result.segment_widths) == len(result.path) - 1:
+            run_start: int | None = None
+            for idx, segment_width in enumerate(result.segment_widths + [result.line_width]):
+                adaptive = idx < len(result.segment_widths) and segment_width < result.line_width * 0.99
+                if adaptive and run_start is None:
+                    run_start = idx
+                elif not adaptive and run_start is not None:
+                    run_points = result.path[run_start : idx + 1]
+                    run_width = min(result.segment_widths[run_start:idx])
+                    run_pts = svg_points(run_points, bounds, width, height, pad)
+                    stroke_width = max(1.1, 2.0 * run_width / result.line_width)
+                    speed_multiplier = result.line_width / run_width
+                    lines.append(
+                        f'<polyline points="{run_pts}" fill="none" stroke="#7f1d1d" stroke-width="{stroke_width:.2f}" '
+                        f'stroke-linejoin="round" stroke-linecap="round" opacity="0.95">'
+                        f'<title>adaptive extrusion width {run_width:.3f} mm; speed x{speed_multiplier:.3f}</title></polyline>'
+                    )
+                    run_start = None
 
         def svg_point(p: Point) -> tuple[float, float]:
             min_x, min_y, max_x, max_y = bounds
@@ -3806,6 +4705,14 @@ def write_svg(result: LayerResult, path: Path, draw_contours: bool) -> None:
             f'endpoint_gap {result.metrics.endpoint_gap:.4f} mm; seam_spacing {result.metrics.seam_to_adjacent_spacing:.3f} mm; '
             f'local_uncovered {result.metrics.local_uncovered_area_ratio:.3f}</text>'
         )
+        adaptive_widths = [w for w in result.segment_widths if result.line_width > EPS and w < result.line_width * 0.99]
+        if adaptive_widths:
+            min_width = min(adaptive_widths)
+            lines.append(
+                f'<text x="{sx + 10:.2f}" y="{sy + 6:.2f}" font-family="monospace" font-size="13" fill="#222">'
+                f'adaptive_width {min_width:.3f} mm; speed x{result.line_width / min_width:.3f}; '
+                f'segments {len(adaptive_widths)}</text>'
+            )
 
     status = "PASS" if result.metrics.ok else "FAIL"
     subtitle = (
@@ -3936,12 +4843,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--spacing", type=float, default=1.2, help="spacing between contour centerlines")
     parser.add_argument("--max-levels", type=int, default=256, help="maximum offset contour levels")
     parser.add_argument("--coverage-threshold", type=float, default=0.82, help="minimum filled-area estimate")
-    parser.add_argument(
-        "--wall-contours",
-        type=int,
-        default=DEFAULT_WALL_CONTOURS,
-        help="number of iso-contour wall levels to keep before switching the remaining middle to looped zig-zag",
-    )
     parser.add_argument("--start-fraction", type=float, default=0.0, help="outer contour fraction for the layer cycle cut/start")
     parser.add_argument("--exit-fraction", type=float, default=0.5, help="outer contour fraction for the second boundary slot")
     parser.add_argument(
@@ -3985,7 +4886,6 @@ def main(argv: Sequence[str]) -> int:
             spacing_tolerance=args.spacing_tolerance,
             start_fraction=args.start_fraction,
             exit_fraction=args.exit_fraction,
-            wall_contours=args.wall_contours,
         )
         print_summary(result)
         write_json(result, args.out / f"{name}.json")

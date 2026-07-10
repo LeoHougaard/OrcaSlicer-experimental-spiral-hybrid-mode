@@ -286,8 +286,9 @@ std::string gcode(Print & print)
     print.set_status_silent();
     print.process();
     print.export_gcode(temp.string(), nullptr, nullptr);
-    std::ifstream t(temp.string());
+	std::ifstream t(temp.string());
 	std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
+	t.close();
 	boost::nowide::remove(temp.string().c_str());
 	return str;
 }

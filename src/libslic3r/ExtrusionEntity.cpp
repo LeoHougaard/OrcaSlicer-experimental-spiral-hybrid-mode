@@ -27,16 +27,22 @@ void ExtrusionPath::subtract_expolygons(const ExPolygons &collection, ExtrusionE
 
 void ExtrusionPath::clip_end(double distance)
 {
+    if (this->is_continuous_fermat())
+        return;
     this->polyline.clip_end(distance);
 }
 
 void ExtrusionPath::simplify(double tolerance)
 {
+    if (this->is_continuous_fermat())
+        return;
     this->polyline.simplify(tolerance);
 }
 
 void ExtrusionPath::simplify_by_fitting_arc(double tolerance)
 {
+    if (this->is_continuous_fermat())
+        return;
     this->polyline.simplify_by_fitting_arc(tolerance);
 }
 
@@ -47,8 +53,12 @@ double ExtrusionPath::length() const
 
 void ExtrusionPath::_inflate_collection(const Polylines &polylines, ExtrusionEntityCollection* collection) const
 {
-    for (const Polyline &polyline : polylines)
-        collection->entities.emplace_back(new ExtrusionPath(polyline, *this));
+    for (const Polyline &polyline : polylines) {
+        auto *path = new ExtrusionPath(polyline, *this);
+        if (path->is_continuous_fermat())
+            path->continuous_fermat_extrusion_multipliers.clear();
+        collection->entities.emplace_back(path);
+    }
 }
 
 void ExtrusionPath::polygons_covered_by_width(Polygons &out, const float scaled_epsilon) const

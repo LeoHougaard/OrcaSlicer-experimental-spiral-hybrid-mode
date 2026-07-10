@@ -5382,9 +5382,9 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloatOrPercent(200, true));
 
     def = this->add("spiral_hybrid_non_crossing", coBool);
-    def->label = L("Continuous slicing");
-    def->tooltip = L("Experimental: Enables the spiral hybrid non-crossing path, allowing walls and infill while avoiding wall crossings more aggressively.");
-    def->mode = comSimple;
+    def->label = L("Continuous slicing (pre-alpha; do not print)");
+    def->tooltip = L("Pre-alpha source-level research only: replaces each printable layer with one strictly validated Continuous Fermat extrusion stroke. Printer-ready G-code export and upload are intentionally blocked because no machine startup and approach contract is certified.");
+    def->mode = comDevelop;
     def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("spiral_hybrid_interior_clearance", coFloat);
@@ -8013,15 +8013,6 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
             this->opt<ConfigOptionBool>("alternate_extra_wall", true)->value = false;
             this->opt<ConfigOptionInt>("top_shell_layers", true)->value = 0;
             this->opt<ConfigOptionPercent>("sparse_infill_density", true)->value = 0;
-        } else {
-            this->opt<ConfigOptionBool>("reduce_crossing_wall", true)->value = true;
-            const double interior_clearance = this->opt<ConfigOptionFloat>("spiral_hybrid_interior_clearance", true)->value;
-            if (interior_clearance > 0.0) {
-                this->opt<ConfigOptionPercent>("infill_wall_overlap", true)->value = 0;
-                this->opt<ConfigOptionPercent>("top_bottom_infill_wall_overlap", true)->value = 0;
-                auto *gap_filter = this->opt<ConfigOptionFloat>("filter_out_gap_fill", true);
-                gap_filter->value = std::max(gap_filter->value, interior_clearance);
-            }
         }
     }
 
@@ -8096,15 +8087,6 @@ void DynamicPrintConfig::normalize_fdm_1()
             this->opt<ConfigOptionBool>("alternate_extra_wall", true)->value = false;
             this->opt<ConfigOptionInt>("top_shell_layers", true)->value = 0;
             this->opt<ConfigOptionPercent>("sparse_infill_density", true)->value = 0;
-        } else {
-            this->opt<ConfigOptionBool>("reduce_crossing_wall", true)->value = true;
-            const double interior_clearance = this->opt<ConfigOptionFloat>("spiral_hybrid_interior_clearance", true)->value;
-            if (interior_clearance > 0.0) {
-                this->opt<ConfigOptionPercent>("infill_wall_overlap", true)->value = 0;
-                this->opt<ConfigOptionPercent>("top_bottom_infill_wall_overlap", true)->value = 0;
-                auto *gap_filter = this->opt<ConfigOptionFloat>("filter_out_gap_fill", true);
-                gap_filter->value = std::max(gap_filter->value, interior_clearance);
-            }
         }
     }
 

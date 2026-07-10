@@ -5,11 +5,41 @@
 #include "Flow.hpp"
 #include "Polyline.hpp"
 
+#include <string>
+#include <vector>
+
 namespace Slic3r {
 
 class Layer;
 
 namespace ContinuousFermat {
+
+// Mandatory postconditions for a generated per-layer path.  These metrics are
+// evaluated against the physical extrusion footprint before normal Orca layer
+// entities are removed.  A path is usable only when `ok` is true.
+struct PathValidation
+{
+    bool ok { false };
+    bool closed { false };
+    double exact_coverage_ratio { 0.0 };
+    double coverage_ratio { 0.0 };
+    double outside_ratio { 0.0 };
+    double material_ratio { 0.0 };
+    size_t containment_violations { 0 };
+    int crossings { 0 };
+    int spacing_violations { 0 };
+    int bead_overlap_violations { 0 };
+    int turnback_violations { 0 };
+    std::string reason;
+};
+
+struct GeneratedPath
+{
+    Polyline path;
+    // Per-segment cross-section multiplier.  Wider terminal beads slow down by
+    // the inverse factor in G-code so volumetric flow stays bounded.
+    std::vector<float> extrusion_multipliers;
+};
 
 // Replace a layer's normal region extrusion entities with a single continuous
 // Fermat-style extrusion path when continuous slicing mode is active.
@@ -17,6 +47,15 @@ bool apply_to_layer(Layer &layer);
 
 // Exposed for focused geometry tests and debug tooling.
 Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow);
+GeneratedPath generate_layer_path_with_metadata(const ExPolygons &printable_area, const Flow &flow);
+
+// Validate a completed path using the same fail-closed contract applied by the
+// production layer integration.  Exposed for focused safety regression tests.
+PathValidation validate_layer_path(
+    const ExPolygons &printable_area,
+    const Flow &flow,
+    const Polyline &path,
+    const std::vector<float> &extrusion_multipliers);
 
 } // namespace ContinuousFermat
 } // namespace Slic3r

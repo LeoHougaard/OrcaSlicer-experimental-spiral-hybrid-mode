@@ -2,8 +2,14 @@ const state = {
   shapes: [],
   file: null,
   fileInfo: null,
+  previewModel: null,
   result: null,
   backendOnline: false,
+  startPoint: null,
+  endPoint: null,
+  endpointTouched: false,
+  endpointDrag: null,
+  previewTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -64,6 +70,16 @@ function sourceChanged() {
   show($("fileRow"), source === "file");
   show($("polygonRow"), source === "polygon");
   show($("stlRows"), source === "file" && state.fileInfo && state.fileInfo.type === "stl");
+  queuePreviewRefresh(true);
+}
+
+function algorithmChanged() {
+  const isV7 = $("algorithm").value === "contour_tree_v7";
+  show($("directionRow"), !isV7);
+  show($("startFractionRow"), !isV7);
+  show($("exitFractionRow"), !isV7);
+  show($("attemptsRow"), !isV7);
+  render();
 }
 
 async function loadShapes() {
@@ -83,6 +99,7 @@ async function loadShapes() {
     option.textContent = `${shape.name}${shape.holes ? ` (${shape.holes} hole)` : ""}`;
     select.appendChild(option);
   }
+  queuePreviewRefresh(true);
 }
 
 function arrayBufferToBase64(buffer) {
@@ -117,32 +134,17 @@ async function inspectSelectedFile(file) {
     setStatus("DXF ready", `${data.outerPoints} outer points, ${data.holes} hole(s)`);
   }
   sourceChanged();
+  queuePreviewRefresh(true);
 }
 
 function numeric(id) {
   return Number($(id).value);
 }
 
-function buildGeneratePayload() {
+function buildInputPayload() {
   const source = $("sourceType").value;
   const payload = {
     source,
-    options: {
-      algorithm: $("algorithm").value,
-      direction: $("direction").value,
-      lineWidth: numeric("lineWidth"),
-      spacing: numeric("spacing"),
-      grid: numeric("grid"),
-      coverageGrid: 150,
-      coverageThreshold: numeric("coverageThreshold"),
-      overlapThreshold: numeric("overlapThreshold"),
-      spacingWarningThreshold: Math.max(0, Math.floor(numeric("spacingWarningThreshold"))),
-      maxLevels: 256,
-      spacingTolerance: 0.25,
-      startFraction: numeric("startFraction"),
-      exitFraction: numeric("exitFraction"),
-      retryAttempts: Math.max(1, Math.floor(numeric("retryAttempts"))),
-    },
   };
 
   if (source === "builtin") {
@@ -160,6 +162,113 @@ function buildGeneratePayload() {
     }
   }
   return payload;
+}
+
+function buildGeneratePayload() {
+  const payload = buildInputPayload();
+  const algorithm = $("algorithm").value;
+  payload.options = {
+    algorithm,
+    lineWidth: numeric("lineWidth"),
+    spacing: numeric("spacing"),
+    grid: numeric("grid"),
+    coverageGrid: 150,
+    coverageThreshold: numeric("coverageThreshold"),
+    overlapThreshold: numeric("overlapThreshold"),
+    spacingWarningThreshold: Math.max(0, Math.floor(numeric("spacingWarningThreshold"))),
+    maxLevels: 256,
+    spacingTolerance: 0.25,
+    startFraction: numeric("startFraction"),
+    exitFraction: numeric("exitFraction"),
+  };
+  if (algorithm === "contour_tree_v7") {
+    if (state.endpointTouched && state.startPoint && state.endPoint) {
+      payload.options.startPoint = state.startPoint;
+      payload.options.endPoint = state.endPoint;
+    }
+  } else {
+    payload.options.direction = $("direction").value;
+    payload.options.retryAttempts = Math.max(1, Math.floor(numeric("retryAttempts")));
+  }
+  return payload;
+}
+
+function pointInPolygon(point, polygon) {
+  if (!polygon || polygon.length < 3) return false;
+  const [x, y] = point;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    if ((yi > y) !== (yj > y)) {
+      const xAtY = ((xj - xi) * (y - yi)) / (yj - yi || 1e-12) + xi;
+      if (x < xAtY) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function modelContains(model, point) {
+  return pointInPolygon(point, model.outer) && !(model.holes || []).some((hole) => pointInPolygon(point, hole));
+}
+
+function interiorPointNear(model, tx, ty) {
+  const [minX, minY, maxX, maxY] = model.bounds;
+  const preferred = [minX + (maxX - minX) * tx, minY + (maxY - minY) * ty];
+  if (modelContains(model, preferred)) return preferred;
+  let best = null;
+  for (let y = 0; y <= 28; y += 1) {
+    for (let x = 0; x <= 28; x += 1) {
+      const p = [minX + (maxX - minX) * (x / 28), minY + (maxY - minY) * (y / 28)];
+      if (!modelContains(model, p)) continue;
+      const score = dist(p, preferred);
+      if (!best || score < best.score) best = { score, point: p };
+    }
+  }
+  return best ? best.point : [(minX + maxX) * 0.5, (minY + maxY) * 0.5];
+}
+
+function setDefaultEndpoints(model) {
+  state.startPoint = interiorPointNear(model, 0.32, 0.48);
+  state.endPoint = interiorPointNear(model, 0.72, 0.52);
+  state.endpointTouched = false;
+}
+
+function queuePreviewRefresh(resetEndpoints = false) {
+  window.clearTimeout(state.previewTimer);
+  state.previewTimer = window.setTimeout(() => {
+    refreshPreviewModel(resetEndpoints).catch((err) => {
+      state.previewModel = null;
+      state.result = null;
+      render();
+      if (state.backendOnline) setStatus("Preview error", err.message || String(err), false);
+    });
+  }, 120);
+}
+
+async function refreshPreviewModel(resetEndpoints = false) {
+  if ($("sourceType").value === "file" && !state.file) {
+    state.previewModel = null;
+    state.result = null;
+    render();
+    return;
+  }
+  const payload = buildInputPayload();
+  if (payload.source === "builtin" && !payload.shape) return;
+  const data = await fetchJson("/api/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  setBackendStatus(true);
+  state.previewModel = data.model;
+  state.result = null;
+  if (state.previewModel && (resetEndpoints || !state.startPoint || !state.endPoint || !modelContains(state.previewModel, state.startPoint) || !modelContains(state.previewModel, state.endPoint))) {
+    setDefaultEndpoints(state.previewModel);
+  }
+  const name = state.previewModel ? state.previewModel.name : "shape";
+  setStatus("Shape ready", name);
+  render();
 }
 
 async function generate() {
@@ -276,31 +385,41 @@ function pathAtProgress(path, fraction) {
 function render() {
   updateProgressText();
   const result = state.result;
+  const model = result && result.model ? result.model : state.previewModel;
   const svg = $("preview");
   svg.innerHTML = "";
-  if (!result || !result.model) {
+  if (!model) {
     renderEmptyPreview(svg);
     renderMetrics();
     renderDiagnostics();
     return;
   }
 
-  const [minX, minY, maxX, maxY] = boundsWithMargin(result.model.bounds);
+  const [minX, minY, maxX, maxY] = boundsWithMargin(model.bounds);
   svg.setAttribute("viewBox", `${minX} ${-maxY} ${maxX - minX} ${maxY - minY}`);
 
-  addPolyline(svg, result.model.outer, { stroke: "#202320", "stroke-width": 2.2 }, true);
-  for (const hole of result.model.holes || []) {
+  addPolyline(svg, model.outer, { stroke: "#202320", "stroke-width": 2.2 }, true);
+  for (const hole of model.holes || []) {
     addPolyline(svg, hole, { stroke: "#59605a", "stroke-width": 1.8, "stroke-dasharray": "4 3" }, true);
   }
 
-  if ($("showContours").checked) {
+  for (const cut of (result && result.cutPaths) || []) {
+    addPolyline(svg, cut.points, {
+      stroke: cut.kind === "start" ? "#16803c" : "#7b4db8",
+      "stroke-width": 1.2,
+      "stroke-dasharray": "2 2",
+      opacity: 0.75,
+    });
+  }
+
+  if (result && $("showContours").checked) {
     for (const contour of result.contours || []) {
       const color = contour.level % 2 === 0 ? "#7da1c4" : "#91ad74";
       addPolyline(svg, contour.points, { stroke: color, "stroke-width": 0.85, opacity: 0.58 }, true);
     }
   }
 
-  if ($("showTree").checked) {
+  if (result && $("showTree").checked) {
     for (const edge of result.routeEdges || []) {
       svg.appendChild(el("line", {
         x1: edge.a[0],
@@ -316,9 +435,9 @@ function render() {
     }
   }
 
-  renderCoverageAudit(svg, result.coverageAudit);
+  if (result) renderCoverageAudit(svg, result.coverageAudit);
 
-  const path = result.path || [];
+  const path = (result && result.path) || [];
   const visiblePath = pathAtProgress(path, progressFraction());
   addPolyline(svg, visiblePath, { stroke: "#cf2e1f", "stroke-width": 2.1, "stroke-linecap": "round", "stroke-linejoin": "round" });
 
@@ -329,9 +448,34 @@ function render() {
     svg.appendChild(el("circle", { cx: end[0], cy: -end[1], r: 0.9, fill: "#7b4db8", stroke: "#ffffff", "stroke-width": 0.35 }));
   }
 
+  renderEndpointHandles(svg, model);
   renderMetrics();
   renderDiagnostics();
   renderQuickStats();
+}
+
+function renderEndpointHandles(svg, model) {
+  if (!state.startPoint || !state.endPoint) setDefaultEndpoints(model);
+  const [minX, minY, maxX, maxY] = model.bounds;
+  const r = Math.max(Math.max(maxX - minX, maxY - minY) * 0.012, 1.0);
+  const handles = [
+    ["start", state.startPoint, "#16803c"],
+    ["end", state.endPoint, "#7b4db8"],
+  ];
+  for (const [kind, point, fill] of handles) {
+    const handle = el("circle", {
+      cx: point[0],
+      cy: -point[1],
+      r,
+      fill,
+      stroke: "#ffffff",
+      "stroke-width": r * 0.22,
+      "vector-effect": "non-scaling-stroke",
+      cursor: "move",
+      "data-endpoint": kind,
+    });
+    svg.appendChild(handle);
+  }
 }
 
 function renderCoverageAudit(svg, audit) {
@@ -390,6 +534,12 @@ function renderMetrics() {
     ["legacy raster", fmt(m.legacyCoverageRatio)],
     ["intersections", m.selfIntersections],
     ["spacing warnings", m.spacingViolations],
+    ["bead overlaps", m.beadOverlapViolations],
+    ["bead crossings", m.extrusionCrossings],
+    ["turnbacks", m.turnbackViolations],
+    ["bead clearance", fmt(m.minBeadClearance)],
+    ["max turn deg", fmt(m.maxTurnAngleDegrees)],
+    ["guard rejects", m.physicalGuardRejected],
     ["semantic ignored", m.semanticIgnoredSpacingPairs],
     ["missed contours", m.missedContourCount],
     ["containment", m.containmentViolations],
@@ -398,6 +548,11 @@ function renderMetrics() {
     ["width-fair segments", m.widthFairingSegments],
     ["max segment width", fmt(m.maxSegmentWidth)],
     ["underfill detours", m.underfillDetours],
+    ["safe detours", m.safeUnderfillDetours],
+    ["safe rejects", m.safeUnderfillDetourRejected],
+    ["component stitches", m.componentStitches],
+    ["stitch rejects", m.componentStitchRejected],
+    ["endpoint cuts", m.endpointCutSegments],
     ["attempts", m.attemptCount],
     ["selected attempt", m.selectedAttempt],
     ["tree roots", m.treeRoots],
@@ -425,6 +580,7 @@ function renderQuickStats() {
     <span>${fmt(m.coverageRatio)} coverage</span>
     <span>${fmt(m.internalOverlapRatio)} overlap</span>
     <span>${escapeHtml(String(m.selfIntersections || 0))} crosses</span>
+    <span>${escapeHtml(String(m.extrusionViolationCount || 0))} bead</span>
   `;
 }
 
@@ -475,8 +631,63 @@ function downloadSvg() {
   download("continuous-path-preview.svg", `<?xml version="1.0" encoding="UTF-8"?>\n${svg.outerHTML}\n`, "image/svg+xml");
 }
 
+function svgPointFromEvent(event) {
+  const svg = $("preview");
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return null;
+  const point = svg.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  const mapped = point.matrixTransform(matrix.inverse());
+  return [mapped.x, -mapped.y];
+}
+
+function updateDraggedEndpoint(event) {
+  if (!state.endpointDrag) return;
+  const point = svgPointFromEvent(event);
+  const model = state.previewModel || (state.result && state.result.model);
+  if (!point || !model) return;
+  if (state.endpointDrag === "start") {
+    state.startPoint = point;
+  } else {
+    state.endPoint = point;
+  }
+  state.endpointTouched = true;
+  state.result = null;
+  render();
+}
+
+function previewPointerDown(event) {
+  const endpoint = event.target && event.target.getAttribute("data-endpoint");
+  if (!endpoint) return;
+  state.endpointDrag = endpoint;
+  $("preview").setPointerCapture(event.pointerId);
+  updateDraggedEndpoint(event);
+  event.preventDefault();
+}
+
+function previewPointerMove(event) {
+  if (!state.endpointDrag) return;
+  updateDraggedEndpoint(event);
+  event.preventDefault();
+}
+
+function previewPointerUp(event) {
+  if (!state.endpointDrag) return;
+  state.endpointDrag = null;
+  try {
+    $("preview").releasePointerCapture(event.pointerId);
+  } catch (_err) {
+    // Pointer capture may already be released by the browser.
+  }
+  event.preventDefault();
+}
+
 function bindEvents() {
   $("sourceType").addEventListener("change", sourceChanged);
+  $("algorithm").addEventListener("change", algorithmChanged);
+  $("shapeSelect").addEventListener("change", () => queuePreviewRefresh(true));
+  $("polygonJson").addEventListener("input", () => queuePreviewRefresh(true));
   $("fileInput").addEventListener("change", async (event) => {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
@@ -490,8 +701,10 @@ function bindEvents() {
     if (state.fileInfo && state.fileInfo.type === "stl") {
       const h = Math.max(0.01, numeric("layerHeight"));
       $("layerIndex").max = String(Math.max(0, Math.floor((state.fileInfo.zMax - state.fileInfo.zMin) / h)));
+      queuePreviewRefresh(true);
     }
   });
+  $("layerIndex").addEventListener("change", () => queuePreviewRefresh(true));
   $("generateBtn").addEventListener("click", () => {
     generate().catch((err) => setStatus("Generation error", err.message || String(err), false));
   });
@@ -502,10 +715,15 @@ function bindEvents() {
   $("progress").addEventListener("input", render);
   $("downloadJson").addEventListener("click", downloadJson);
   $("downloadSvg").addEventListener("click", downloadSvg);
+  $("preview").addEventListener("pointerdown", previewPointerDown);
+  $("preview").addEventListener("pointermove", previewPointerMove);
+  $("preview").addEventListener("pointerup", previewPointerUp);
+  $("preview").addEventListener("pointercancel", previewPointerUp);
 }
 
 async function boot() {
   bindEvents();
+  algorithmChanged();
   sourceChanged();
   await loadShapes();
   renderMetrics();

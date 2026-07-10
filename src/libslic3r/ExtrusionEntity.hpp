@@ -5,9 +5,11 @@
 #include "Polygon.hpp"
 #include "Polyline.hpp"
 
+#include <algorithm>
 #include <assert.h>
 #include <string_view>
 #include <numeric>
+#include <vector>
 
 namespace Slic3r {
 
@@ -157,6 +159,10 @@ public:
     float width;
     // Height of the extrusion, used for visualization purposes.
     float height;
+    // Per-polyline-segment extrusion cross-section multipliers for strict
+    // continuous Fermat paths. The G-code writer reduces feedrate by the same
+    // factor, keeping volumetric flow at or below the nominal limit.
+    std::vector<float> continuous_fermat_extrusion_multipliers;
 
     ExtrusionPath() : mm3_per_mm(-1), width(-1), height(-1), m_role(erNone), m_no_extrusion(false) {}
     ExtrusionPath(ExtrusionRole role) : mm3_per_mm(-1), width(-1), height(-1), m_role(role), m_no_extrusion(false) {}
@@ -167,6 +173,7 @@ public:
         , mm3_per_mm(rhs.mm3_per_mm)
         , width(rhs.width)
         , height(rhs.height)
+        , continuous_fermat_extrusion_multipliers(rhs.continuous_fermat_extrusion_multipliers)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -177,6 +184,7 @@ public:
         , mm3_per_mm(rhs.mm3_per_mm)
         , width(rhs.width)
         , height(rhs.height)
+        , continuous_fermat_extrusion_multipliers(std::move(rhs.continuous_fermat_extrusion_multipliers))
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -187,6 +195,7 @@ public:
         , mm3_per_mm(rhs.mm3_per_mm)
         , width(rhs.width)
         , height(rhs.height)
+        , continuous_fermat_extrusion_multipliers(rhs.continuous_fermat_extrusion_multipliers)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -197,6 +206,7 @@ public:
         , mm3_per_mm(rhs.mm3_per_mm)
         , width(rhs.width)
         , height(rhs.height)
+        , continuous_fermat_extrusion_multipliers(rhs.continuous_fermat_extrusion_multipliers)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -211,6 +221,7 @@ public:
         this->mm3_per_mm = rhs.mm3_per_mm;
         this->width = rhs.width;
         this->height = rhs.height;
+        this->continuous_fermat_extrusion_multipliers = rhs.continuous_fermat_extrusion_multipliers;
         this->polyline = rhs.polyline;
         return *this;
     }
@@ -222,14 +233,19 @@ public:
         this->mm3_per_mm = rhs.mm3_per_mm;
         this->width = rhs.width;
         this->height = rhs.height;
+        this->continuous_fermat_extrusion_multipliers = std::move(rhs.continuous_fermat_extrusion_multipliers);
         this->polyline = std::move(rhs.polyline);
         return *this;
     }
 
-	ExtrusionEntity* clone() const override { return new ExtrusionPath(*this); }
+    ExtrusionEntity* clone() const override { return new ExtrusionPath(*this); }
     // Create a new object, initialize it with this object using the move semantics.
-	ExtrusionEntity* clone_move() override { return new ExtrusionPath(std::move(*this)); }
-    void reverse() override { this->polyline.reverse(); }
+    ExtrusionEntity* clone_move() override { return new ExtrusionPath(std::move(*this)); }
+    void reverse() override {
+        this->polyline.reverse();
+        if (m_continuous_fermat)
+            std::reverse(continuous_fermat_extrusion_multipliers.begin(), continuous_fermat_extrusion_multipliers.end());
+    }
     const Point& first_point() const override { return this->polyline.points.front(); }
     const Point& last_point() const override { return this->polyline.points.back(); }
     size_t size() const { return this->polyline.size(); }
@@ -261,7 +277,16 @@ public:
     Polyline as_polyline() const override { return this->polyline; }
     void   collect_polylines(Polylines &dst) const override { if (! this->polyline.empty()) dst.emplace_back(this->polyline); }
     void   collect_points(Points &dst) const override { append(dst, this->polyline.points); }
-    double total_volume() const override { return mm3_per_mm * unscale<double>(length()); }
+    double total_volume() const override {
+        if (m_continuous_fermat && continuous_fermat_extrusion_multipliers.size() + 1 == polyline.points.size()) {
+            double volume = 0.0;
+            for (size_t i = 1; i < polyline.points.size(); ++i)
+                volume += (polyline.points[i] - polyline.points[i - 1]).cast<double>().norm() * SCALING_FACTOR *
+                          mm3_per_mm * double(continuous_fermat_extrusion_multipliers[i - 1]);
+            return volume;
+        }
+        return mm3_per_mm * unscale<double>(length());
+    }
 
     //BBS: add new simplifing method by fitting arc
     void simplify_by_fitting_arc(double tolerance);

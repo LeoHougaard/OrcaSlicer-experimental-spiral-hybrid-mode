@@ -195,6 +195,9 @@ public:
         m_object_layer_over_raft(false),
         //m_volumetric_speed(0),
         m_last_pos_defined(false),
+        m_continuous_fermat_started(false),
+        m_continuous_fermat_last_layer_index(-1),
+        m_continuous_fermat_section_count(0),
         m_last_extrusion_role(erNone),
         m_last_width(0.0f),
 #if ENABLE_GCODE_VIEWER_DATA_CHECKING
@@ -224,7 +227,8 @@ public:
     const Point&    last_pos() const { return m_last_pos; }
     Vec2d           point_to_gcode(const Point &point) const;
     Point           gcode_to_point(const Vec2d &point) const;
-    Vec2d point_to_gcode_quantized(const Point& point) const;
+    Vec2d           point_to_gcode_quantized(const Point &point) const;
+    Vec2d           point_to_serialized_gcode_quantized(const Point &point) const;
     const FullPrintConfig &config() const { return m_config; }
     const Layer*    layer() const { return m_layer; }
     GCodeWriter&    writer() { return m_writer; }
@@ -584,6 +588,10 @@ private:
 
     Point                               m_last_pos;
     bool                                m_last_pos_defined;
+    bool                                m_continuous_fermat_started;
+    Point                               m_continuous_fermat_endpoint;
+    int                                 m_continuous_fermat_last_layer_index;
+    unsigned int                        m_continuous_fermat_section_count;
 
     std::unique_ptr<CoolingBuffer>      m_cooling_buffer;
     std::unique_ptr<SpiralVase>         m_spiral_vase;
