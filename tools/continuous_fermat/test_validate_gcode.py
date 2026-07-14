@@ -19,17 +19,25 @@ END = ";_CONTINUOUS_FERMAT_END"
 
 def audit(gcode: str, **kwargs):
     normalize_firmware_state = kwargs.pop("normalize_firmware_state", True)
+    firmware = kwargs.pop("firmware", "marlin2")
     normalized = textwrap.dedent(gcode).strip()
     if normalize_firmware_state:
-        normalized = (
-            "G21\nG90\nM83\nT0\nM200 D0\nM220 S100\nM221 S100\n"
-            "M900 K0\nM413 S0\nG28\nM109 R200\n" + normalized
-        )
+        if firmware == "klipper":
+            normalized = (
+                "G90\nM83\nM220 S100\nM221 S100\n"
+                "SET_PRESSURE_ADVANCE ADVANCE=0\nG28\nM190 S60\nM109 S200\n" + normalized
+            )
+        else:
+            normalized = (
+                "G21\nG90\nM83\nT0\nM200 D0\nM220 S100\nM221 S100\n"
+                "M900 K0\nM413 S0\nG28\nM109 R200\n" + normalized
+            )
     return validate_lines(
         normalized.splitlines(),
         Path("fixture.gcode"),
         0.001,
         1e-7,
+        firmware=firmware,
         **kwargs,
     )
 
@@ -53,6 +61,26 @@ def one_layer(body: str, *, preamble: str = "", postamble: str = "") -> str:
 
 
 class ContinuousFermatGCodeValidationTests(unittest.TestCase):
+    def test_accepts_klipper_native_state_and_rejects_missing_guards(self):
+        fixture = one_layer("G1 X1 Y0 E0.2\nG1 X0 Y0 E0.2")
+        accepted = audit(fixture, firmware="klipper")
+        missing = audit(
+            "G90\nM83\nM220 S100\nM221 S100\nG28\nM109 S200\n" + fixture,
+            firmware="klipper",
+            normalize_firmware_state=False,
+        )
+        active_pa = audit(
+            "G90\nM83\nM220 S100\nM221 S100\n"
+            "SET_PRESSURE_ADVANCE ADVANCE=0.05\nG28\nM190 S60\nM109 S200\n" + fixture,
+            firmware="klipper",
+            normalize_firmware_state=False,
+        )
+
+        self.assertEqual([], accepted.violations)
+        self.assertIn("SET_PRESSURE_ADVANCE ADVANCE=0 was not explicitly established", messages(missing))
+        self.assertIn("Klipper bed state was not established", messages(missing))
+        self.assertIn("SET_PRESSURE_ADVANCE ADVANCE=0 was not explicitly established", messages(active_pa))
+
     def test_requires_explicit_firmware_extrusion_state_normalization(self):
         fixture = one_layer("G1 X1 Y0 E0.2\nG1 X0 Y0 E0.2")
         missing = audit(fixture, normalize_firmware_state=False)
@@ -128,6 +156,37 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         self.assertAlmostEqual(0.2, result.transitions[0].z_delta)
         self.assertAlmostEqual(0.0, result.transitions[0].endpoint_gap)
 
+    def test_accepts_one_non_extruding_xy_approach_after_positive_z(self):
+        result = audit(
+            f"""
+            G90
+            M83
+            G1 X0 Y0 Z0.2 F1200
+            ;LAYER_CHANGE
+            {BEGIN}
+            G1 X10 Y0 E1
+            G1 X10 Y10 E1
+            G1 X0 Y10 E1
+            G1 X0 Y0 E1
+            {END}
+            G1 Z0.4
+            G1 X2 Y2 F1200
+            ;LAYER_CHANGE
+            {BEGIN}
+            G1 X8 Y2 E1
+            G1 X8 Y8 E1
+            G1 X2 Y8 E1
+            G1 X2 Y2 E1
+            {END}
+            """,
+            expected_sections=2,
+            expected_layers=2,
+        )
+
+        self.assertEqual([], result.violations)
+        self.assertEqual(1, result.transitions[0].xy_moves)
+        self.assertAlmostEqual(2.0 * 2.0**0.5, result.transitions[0].endpoint_gap)
+
     def test_g90_clears_m83_and_restores_absolute_e(self):
         result = audit(
             one_layer(
@@ -198,7 +257,7 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         self.assertIn("purge starts from unknown XY", messages(unknown_start))
         self.assertIn("purge has no known positive feed rate", messages(unknown_start))
 
-    def test_transition_rejects_xy_retraction_and_non_positive_z(self):
+    def test_transition_rejects_retraction_non_positive_z_and_xy_before_z(self):
         result = audit(
             f"""
             G90
@@ -221,10 +280,9 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         )
         output = messages(result)
 
-        self.assertIn("unmarked XY move between", output)
+        self.assertIn("XY approach must occur after", output)
         self.assertIn("unmarked retraction between", output)
         self.assertIn("non-positive Z transition", output)
-        self.assertIn("section transition endpoint gap", output)
 
     def test_transition_requires_a_known_positive_z_increase(self):
         result = audit(

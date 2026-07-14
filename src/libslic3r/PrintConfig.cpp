@@ -5382,10 +5382,21 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloatOrPercent(200, true));
 
     def = this->add("spiral_hybrid_non_crossing", coBool);
-    def->label = L("Continuous slicing (pre-alpha; do not print)");
-    def->tooltip = L("Pre-alpha source-level research only: replaces each printable layer with one strictly validated Continuous Fermat extrusion stroke. Printer-ready G-code export and upload are intentionally blocked because no machine startup and approach contract is certified.");
-    def->mode = comDevelop;
+    def->label = L("Continuous slicing");
+    def->tooltip = L("Replaces each eligible printable layer with one Continuous Fermat extrusion stroke. Each layer must contain one island and overlap the layer below. Structurally valid Marlin 2 and Klipper output remains previewable and exportable when geometric quality warnings are present.");
+    def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("continuous_max_line_width", coFloatOrPercent);
+    def->label = L("Maximum continuous line width");
+    def->tooltip = L("Maximum physical bead width used to close residual gaps in Continuous slicing. Wider segments extrude proportionally more material and slow down by the inverse ratio. Values above 125% of nozzle diameter require careful machine and material qualification; an absolute two-nozzle safety limit always applies.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0.01;
+    def->max = 200;
+    def->max_literal = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(150, true));
 
     def = this->add("spiral_hybrid_interior_clearance", coFloat);
     def->label = L("Spiral hybrid interior clearance");

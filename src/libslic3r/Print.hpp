@@ -316,6 +316,14 @@ private: // Prevents erroneous use by other classes.
     typedef PrintObjectBaseWithState<Print, PrintObjectStep, posCount> Inherited;
 
 public:
+    void add_continuous_slicing_validation_warning(const std::string &message)
+    {
+        Inherited::active_step_add_warning(
+            PrintStateBase::WarningLevel::CRITICAL,
+            message,
+            PrintStateBase::SlicingContinuousFermatValidation);
+    }
+
     // Size of an object: XYZ in scaled coordinates. The size might not be quite snug in XY plane.
     const Vec3crd&               size() const			{ return m_size; }
     const PrintObjectConfig&     config() const         { return m_config; }
@@ -879,6 +887,11 @@ enum FilamentCompatibilityType {
     LowMidMixed
 };
 
+enum class GCodeExportPurpose {
+    PrinterReady,
+    ContinuousResearchPreview,
+};
+
 // The complete print tray with possibly multiple objects.
 class Print : public PrintBaseWithState<PrintStep, psCount>
 {
@@ -908,14 +921,12 @@ public:
     void                process(long long *time_cost_with_cache = nullptr, bool use_cache = false) override;
     // Exports G-code into a file name based on the path_template, returns the file path of the generated G-code file.
     // If preview_data is not null, the preview_data is filled in for the G-code visualization (not used by the command line Slic3r).
-    std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
-    // Continuous slicing is a pre-alpha geometry experiment without a certified
-    // machine homing, leveling, heating-pose, or first-approach contract.  All
-    // application export/upload paths must call this before exposing executable
-    // G-code.  The test-only escape hatch exists solely for serialized contract
-    // regression tests and must never be called by application code.
-    void                throw_if_continuous_slicing_export_blocked() const;
-    void                throw_if_continuous_slicing_artifact_blocked(const std::string &path) const;
+    std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result,
+                                     ThumbnailsGeneratorCallback thumbnail_cb = nullptr,
+                                     GCodeExportPurpose purpose = GCodeExportPurpose::PrinterReady);
+    // Cached/imported artifacts cannot be recertified against current slices.
+    // Fresh printer-ready output is governed by the normal print and G-code validators.
+    void                throw_if_continuous_slicing_artifact_blocked(const std::string &path, bool allow_research_preview = false) const;
     void                enable_continuous_slicing_development_export_for_tests() { m_continuous_slicing_development_export_for_tests = true; }
     //return 0 means successful
     int                 export_cached_data(const std::string& dir_path, bool with_space=false);
@@ -1049,7 +1060,9 @@ public:
     //BBS: export gcode from previous gcode file from 3mf
     void set_gcode_file_ready();
     void set_gcode_file_invalidated();
-    void export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    void export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result,
+                                         ThumbnailsGeneratorCallback thumbnail_cb = nullptr,
+                                         GCodeExportPurpose purpose = GCodeExportPurpose::PrinterReady);
     //BBS: add modify_count logic
     int get_modified_count() const {return m_modified_count;}
     //BBS: add status for whether support used

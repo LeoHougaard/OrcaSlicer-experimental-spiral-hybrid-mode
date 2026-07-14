@@ -992,6 +992,16 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
 
 	switch (opt->type) {
 	case coFloatOrPercent:{
+		if (!config.has(opt_key)) {
+			const auto *default_value = dynamic_cast<const ConfigOptionFloatOrPercent *>(opt->default_value.get());
+			if (default_value == nullptr)
+				break;
+			text_value = double_to_string(default_value->value);
+			if (default_value->percent)
+				text_value += "%";
+			ret = text_value;
+			break;
+		}
 		const auto &value = *config.option<ConfigOptionFloatOrPercent>(opt_key);
 
         text_value = double_to_string(value.value);

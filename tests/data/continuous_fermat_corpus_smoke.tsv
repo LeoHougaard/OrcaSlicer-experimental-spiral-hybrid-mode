@@ -1,0 +1,4 @@
+# id	path	source URL	scale
+local-cube	20mm_cube.obj	repository:test-data/20mm_cube.obj	0.2
+local-pyramid	pyramid.obj	repository:test-data/pyramid.obj	0.2
+local-cube-with-hole	cube_with_hole.obj	repository:test-data/cube_with_hole.obj	0.2

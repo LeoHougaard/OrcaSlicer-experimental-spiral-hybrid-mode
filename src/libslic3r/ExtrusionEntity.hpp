@@ -163,6 +163,9 @@ public:
     // continuous Fermat paths. The G-code writer reduces feedrate by the same
     // factor, keeping volumetric flow at or below the nominal limit.
     std::vector<float> continuous_fermat_extrusion_multipliers;
+    // Non-empty when the path is structurally emittable but misses one or
+    // more geometric quality targets. Serialized into G-code as an advisory.
+    std::string continuous_fermat_validation_warning;
 
     ExtrusionPath() : mm3_per_mm(-1), width(-1), height(-1), m_role(erNone), m_no_extrusion(false) {}
     ExtrusionPath(ExtrusionRole role) : mm3_per_mm(-1), width(-1), height(-1), m_role(role), m_no_extrusion(false) {}
@@ -174,6 +177,7 @@ public:
         , width(rhs.width)
         , height(rhs.height)
         , continuous_fermat_extrusion_multipliers(rhs.continuous_fermat_extrusion_multipliers)
+        , continuous_fermat_validation_warning(rhs.continuous_fermat_validation_warning)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -185,6 +189,7 @@ public:
         , width(rhs.width)
         , height(rhs.height)
         , continuous_fermat_extrusion_multipliers(std::move(rhs.continuous_fermat_extrusion_multipliers))
+        , continuous_fermat_validation_warning(std::move(rhs.continuous_fermat_validation_warning))
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -196,6 +201,7 @@ public:
         , width(rhs.width)
         , height(rhs.height)
         , continuous_fermat_extrusion_multipliers(rhs.continuous_fermat_extrusion_multipliers)
+        , continuous_fermat_validation_warning(rhs.continuous_fermat_validation_warning)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -207,6 +213,7 @@ public:
         , width(rhs.width)
         , height(rhs.height)
         , continuous_fermat_extrusion_multipliers(rhs.continuous_fermat_extrusion_multipliers)
+        , continuous_fermat_validation_warning(rhs.continuous_fermat_validation_warning)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -222,6 +229,7 @@ public:
         this->width = rhs.width;
         this->height = rhs.height;
         this->continuous_fermat_extrusion_multipliers = rhs.continuous_fermat_extrusion_multipliers;
+        this->continuous_fermat_validation_warning = rhs.continuous_fermat_validation_warning;
         this->polyline = rhs.polyline;
         return *this;
     }
@@ -234,6 +242,7 @@ public:
         this->width = rhs.width;
         this->height = rhs.height;
         this->continuous_fermat_extrusion_multipliers = std::move(rhs.continuous_fermat_extrusion_multipliers);
+        this->continuous_fermat_validation_warning = std::move(rhs.continuous_fermat_validation_warning);
         this->polyline = std::move(rhs.polyline);
         return *this;
     }

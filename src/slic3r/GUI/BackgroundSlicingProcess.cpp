@@ -195,9 +195,11 @@ std::string BackgroundSlicingProcess::output_filepath_for_project(const boost::f
 void BackgroundSlicingProcess::process_fff()
 {
     assert(m_print == m_fff_print);
-    // This also covers direct copies/uploads of a cached G-code file, which do
-    // not necessarily pass through Print::export_gcode() again.
-    m_fff_print->throw_if_continuous_slicing_export_blocked();
+    const bool research_preview = m_export_path.empty() && m_upload_job.empty();
+    const GCodeExportPurpose export_purpose = research_preview ?
+        GCodeExportPurpose::ContinuousResearchPreview : GCodeExportPurpose::PrinterReady;
+    // Preview and printer-ready generation use the same structural and
+    // serialized machine checks. Geometric quality misses remain warnings.
     PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
     m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
 	//BBS: add the logic to process from an existed gcode file
@@ -211,7 +213,7 @@ void BackgroundSlicingProcess::process_fff()
 		wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
 
 		m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
-		m_fff_print->throw_if_continuous_slicing_artifact_blocked(m_temp_output_path);
+		m_fff_print->throw_if_continuous_slicing_artifact_blocked(m_temp_output_path, research_preview);
 		if (! m_export_path.empty()) {
 			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: export gcode from %2% directly to %3%")%__LINE__%m_temp_output_path %m_export_path;
 		}
@@ -219,7 +221,7 @@ void BackgroundSlicingProcess::process_fff()
             if (m_upload_job.empty()) {
                 m_fff_print->export_gcode_from_previous_file(m_temp_output_path, m_gcode_result, [this](const ThumbnailsParams &params) {
                     return this->render_thumbnails(params);
-                });
+                }, export_purpose);
             }
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: export_gcode_from_previous_file from %2% finished")%__LINE__ % m_temp_output_path;
 		}
@@ -245,7 +247,11 @@ void BackgroundSlicingProcess::process_fff()
 
 		//BBS: add plate index into render params
 		m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
-		m_fff_print->export_gcode(m_temp_output_path, m_gcode_result, [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); });
+		m_fff_print->export_gcode(
+            m_temp_output_path,
+            m_gcode_result,
+            [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); },
+            export_purpose);
 		if(m_fff_print->is_BBL_printer())
 			run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config());
 
@@ -795,7 +801,6 @@ bool BackgroundSlicingProcess::invalidate_all_steps()
 // Copy the final G-code to target location (possibly a SD card, if it is a removable media, then verify that the file was written without an error).
 void BackgroundSlicingProcess::finalize_gcode()
 {
-	m_fff_print->throw_if_continuous_slicing_export_blocked();
 	m_fff_print->throw_if_continuous_slicing_artifact_blocked(m_temp_output_path);
 	m_print->set_status(95, _u8L("Running post-processing scripts"));
 
@@ -862,7 +867,6 @@ void BackgroundSlicingProcess::finalize_gcode()
 // Copy the final G-code to target location (possibly a SD card, if it is a removable media, then verify that the file was written without an error).
 void BackgroundSlicingProcess::export_gcode()
 {
-	m_fff_print->throw_if_continuous_slicing_export_blocked();
 	m_fff_print->throw_if_continuous_slicing_artifact_blocked(m_temp_output_path);
 	// Perform the final post-processing of the export path by applying the print statistics over the file name.
 	std::string export_path = m_fff_print->print_statistics().finalize_output_path(m_export_path);
@@ -918,7 +922,6 @@ void BackgroundSlicingProcess::export_gcode()
 void BackgroundSlicingProcess::prepare_upload()
 {
 	if (m_print == m_fff_print) {
-		m_fff_print->throw_if_continuous_slicing_export_blocked();
 		m_fff_print->throw_if_continuous_slicing_artifact_blocked(m_temp_output_path);
 	}
 	// Generate a unique temp path to which the gcode/zip file is copied/exported

@@ -69,7 +69,10 @@ std::string GCodeWriter::preamble()
 
     if (FLAVOR_IS_NOT(gcfMakerWare)) {
         gcode << "G90\n";
-        gcode << "G21\n";
+        // Klipper uses millimetres and does not document G20/G21 in its
+        // supported standard command set.
+        if (FLAVOR_IS_NOT(gcfKlipper))
+            gcode << "G21\n";
     }
     if (FLAVOR_IS(gcfRepRapSprinter) ||
         FLAVOR_IS(gcfRepRapFirmware) ||

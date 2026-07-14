@@ -278,7 +278,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             // Therefore toggling either the Spiral Vase base mode or the
             // Continuous Fermat replacement requires complete reslicing.
             || opt_key == "spiral_mode"
-            || opt_key == "spiral_hybrid_non_crossing") {
+            || opt_key == "spiral_hybrid_non_crossing"
+            || opt_key == "continuous_max_line_width") {
             osteps.emplace_back(posSlice);
         } else if (
                opt_key == "print_sequence"
@@ -581,6 +582,8 @@ bool Print::has_skirt() const
 
 bool Print::has_brim() const
 {
+    if (m_config.spiral_hybrid_non_crossing)
+        return false;
     return std::any_of(m_objects.begin(), m_objects.end(), [](PrintObject *object) { return object->has_brim(); });
 }
 
@@ -1188,28 +1191,8 @@ boost::regex regex_g92e0 { "^[ \\t]*[gG]92[ \\t]*[eE](0(\\.0*)?|\\.0+)[ \\t]*(;.
 //BBS: refine seq-print validation logic.....FIXME:StringObjectException *warning can only contain one warning, but there might be many warnings, need a vector<StringObjectException>
 StringObjectException Print::validate(StringObjectException *warning, Polygons* collison_polygons, std::vector<std::pair<Polygon, float>>* height_polygons) const
 {
-    if (m_config.spiral_hybrid_non_crossing && !m_config.spiral_mode)
-        return {L("Continuous slicing requires spiral mode to remain enabled."), nullptr, "spiral_hybrid_non_crossing"};
-    const bool strict_continuous_mode = m_config.spiral_mode && m_config.spiral_hybrid_non_crossing;
+    const bool strict_continuous_mode = m_config.spiral_hybrid_non_crossing;
     if (strict_continuous_mode) {
-        const auto contains_executable_gcode = [](const std::string &text) {
-            size_t begin = 0;
-            while (begin < text.size()) {
-                const size_t end = text.find_first_of("\r\n", begin);
-                std::string_view line(text.data() + begin, (end == std::string::npos ? text.size() : end) - begin);
-                if (const size_t comment = line.find(';'); comment != std::string_view::npos)
-                    line = line.substr(0, comment);
-                if (line.find_first_not_of(" \t") != std::string_view::npos)
-                    return true;
-                if (end == std::string::npos)
-                    break;
-                begin = end + 1;
-                if (text[end] == '\r' && begin < text.size() && text[begin] == '\n')
-                    ++begin;
-            }
-            return false;
-        };
-
         if (m_objects.size() != 1)
             return {L("Continuous slicing requires exactly one print object."), nullptr, "spiral_hybrid_non_crossing"};
 
@@ -1226,8 +1209,12 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
                 nullptr,
                 "spiral_hybrid_non_crossing",
             };
-        if (m_config.gcode_flavor != gcfMarlinFirmware)
-            return {L("Continuous slicing currently supports only Marlin 2 G-code semantics."), nullptr, "spiral_hybrid_non_crossing"};
+        if (m_config.gcode_flavor != gcfMarlinFirmware && m_config.gcode_flavor != gcfKlipper)
+            return {
+                L("Continuous slicing currently supports only Marlin 2 and Klipper G-code semantics."),
+                nullptr,
+                "spiral_hybrid_non_crossing",
+            };
         if (is_BBL_printer())
             return {L("Continuous slicing does not support Bambu-specific G-code extensions."), nullptr, "spiral_hybrid_non_crossing"};
         if (m_config.print_sequence != PrintSequence::ByLayer)
@@ -1238,13 +1225,7 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
             return {L("Continuous slicing requires relative extrusion distances."), nullptr, "spiral_hybrid_non_crossing"};
         if (m_config.physical_extruder_map.get_at(0) != 0)
             return {L("Continuous slicing requires logical extruder 0 to map to physical tool 0."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.nozzle_temperature_initial_layer.get_at(0) != m_config.nozzle_temperature.get_at(0))
-            return {
-                L("Continuous slicing requires the same nozzle temperature on every layer."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
-        const int nozzle_temperature = m_config.nozzle_temperature.get_at(0);
+        const int nozzle_temperature = m_config.nozzle_temperature_initial_layer.get_at(0);
         if (nozzle_temperature <= 0 || nozzle_temperature < m_config.nozzle_temperature_range_low.get_at(0) ||
             nozzle_temperature > m_config.nozzle_temperature_range_high.get_at(0))
             return {
@@ -1253,15 +1234,14 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
                 "spiral_hybrid_non_crossing",
             };
         const double filament_flow_ratio = m_config.filament_flow_ratio.get_at(0);
-        if (!std::isfinite(filament_flow_ratio) || std::abs(filament_flow_ratio - 1.0) > EPSILON)
+        if (!std::isfinite(filament_flow_ratio) || filament_flow_ratio <= 0.0)
             return {
-                L("Continuous slicing requires a filament flow ratio of exactly 1.0 so emitted material matches the validated geometry."),
+                L("Continuous slicing requires a finite positive filament flow ratio."),
                 nullptr,
                 "spiral_hybrid_non_crossing",
             };
         const double max_volumetric_speed = m_config.filament_max_volumetric_speed.get_at(0);
-        if (!std::isfinite(max_volumetric_speed) || max_volumetric_speed <= 0.0 ||
-            m_config.filament_adaptive_volumetric_speed.get_at(0))
+        if (!std::isfinite(max_volumetric_speed) || max_volumetric_speed <= 0.0)
             return {
                 L("Continuous slicing requires a finite positive fixed maximum volumetric speed."),
                 nullptr,
@@ -1276,32 +1256,8 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
             return {L("Continuous slicing does not support skirts."), nullptr, "spiral_hybrid_non_crossing"};
         if (m_config.draft_shield != dsDisabled)
             return {L("Continuous slicing does not support draft shields."), nullptr, "spiral_hybrid_non_crossing"};
-        if (print_object.has_brim())
-            return {L("Continuous slicing does not support brims."), nullptr, "spiral_hybrid_non_crossing"};
         if (m_config.enable_prime_tower)
             return {L("Continuous slicing does not support prime towers."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.exclude_object)
-            return {L("Continuous slicing does not support object-cancellation G-code."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.enable_power_loss_recovery != PowerLossRecoveryMode::Disable)
-            return {L("Continuous slicing requires power-loss recovery to be disabled."), nullptr, "spiral_hybrid_non_crossing"};
-        if (!m_config.post_process.values.empty())
-            return {L("Continuous slicing does not support external post-processing scripts."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.gcode_add_line_number)
-            return {L("Continuous slicing does not support post-export G-code line numbering."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.emit_machine_limits_to_gcode)
-            return {
-                L("Continuous slicing does not override firmware machine limits."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
-        if (m_config.max_volumetric_extrusion_rate_slope > 0.0)
-            return {L("Continuous slicing does not support pressure equalization."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.enable_pressure_advance.get_at(0) || m_config.adaptive_pressure_advance.get_at(0))
-            return {
-                L("Continuous slicing requires fixed and adaptive pressure advance to be disabled."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
         if (!std::isfinite(m_config.printable_height.value) || m_config.printable_height.value <= 0.0 ||
             !std::isfinite(m_config.z_offset.value))
             return {
@@ -1326,55 +1282,10 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
                 nullptr,
                 "spiral_hybrid_non_crossing",
             };
-        if (m_config.timelapse_type == TimelapseType::tlSmooth)
-            return {L("Continuous slicing does not support smooth timelapse."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.scan_first_layer)
-            return {L("Continuous slicing does not support first-layer scanning."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.enable_wrapping_detection)
-            return {L("Continuous slicing does not support clumping detection."), nullptr, "spiral_hybrid_non_crossing"};
         if (print_object.all_regions().front().get().config().ironing_type != IroningType::NoIroning)
             return {L("Continuous slicing does not support ironing."), nullptr, "spiral_hybrid_non_crossing"};
         if (!m_model.get_curr_plate_custom_gcodes().gcodes.empty())
             return {L("Continuous slicing does not support per-layer custom G-code."), nullptr, "spiral_hybrid_non_crossing"};
-        if (contains_executable_gcode(m_config.before_layer_change_gcode.value) ||
-            contains_executable_gcode(m_config.layer_change_gcode.value) ||
-            contains_executable_gcode(m_config.time_lapse_gcode.value) ||
-            contains_executable_gcode(m_config.change_extrusion_role_gcode.value))
-            return {
-                L("Continuous slicing allows only comments in layer-change, timelapse, and role-change G-code."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
-        const bool executable_filament_end = std::any_of(
-            m_config.filament_end_gcode.values.begin(),
-            m_config.filament_end_gcode.values.end(),
-            contains_executable_gcode);
-        if (contains_executable_gcode(m_config.machine_end_gcode.value) || executable_filament_end)
-            return {
-                L("Continuous slicing uses its built-in collision-safe shutdown and allows only comments in end G-code."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
-        const bool executable_filament_start = std::any_of(
-            m_config.filament_start_gcode.values.begin(),
-            m_config.filament_start_gcode.values.end(),
-            contains_executable_gcode);
-        if (contains_executable_gcode(m_config.file_start_gcode.value) ||
-            contains_executable_gcode(m_config.machine_start_gcode.value) || executable_filament_start)
-            return {
-                L("Continuous slicing uses its built-in homing and heater-ready sequence and allows only comments in start G-code."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
-        if (m_config.fan_speedup_time.value != 0.0 || m_config.fan_kickstart.value != 0.0)
-            return {L("Continuous slicing does not support fan-command motion splitting."), nullptr, "spiral_hybrid_non_crossing"};
-        if (m_config.auxiliary_fan.value || m_config.activate_air_filtration.get_at(0) ||
-            m_config.activate_chamber_temp_control.get_at(0))
-            return {
-                L("Continuous slicing does not support auxiliary-fan, air-filtration, or chamber-control output."),
-                nullptr,
-                "spiral_hybrid_non_crossing",
-            };
         if (m_calib_params.mode != CalibMode::Calib_None)
             return {L("Continuous slicing does not support calibration modes."), nullptr, "spiral_hybrid_non_crossing"};
     }
@@ -1794,11 +1705,11 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
 
     // Orca: G92 E0 is not supported when using absolute extruder addressing
     // This check is copied from PrusaSlicer, the original author is Vojtech Bubnik
-    if(!is_BBL_printer()) {
+    if (!is_BBL_printer() && !strict_continuous_mode) {
         bool before_layer_gcode_resets_extruder =
             boost::regex_search(m_config.before_layer_change_gcode.value, regex_g92e0);
         bool layer_gcode_resets_extruder = boost::regex_search(m_config.layer_change_gcode.value, regex_g92e0);
-        if (m_config.use_relative_e_distances && !strict_continuous_mode) {
+        if (m_config.use_relative_e_distances) {
             // See GH issues #6336 #5073
             if ((m_config.gcode_flavor == gcfMarlinLegacy || m_config.gcode_flavor == gcfMarlinFirmware) &&
                 !before_layer_gcode_resets_extruder && !layer_gcode_resets_extruder)
@@ -2667,9 +2578,10 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 // The export_gcode may die for various reasons (fails to process filename_format,
 // write error into the G-code, cannot execute post-processing scripts).
 // It is up to the caller to show an error message.
-std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result,
+                                ThumbnailsGeneratorCallback thumbnail_cb, GCodeExportPurpose purpose)
 {
-    this->throw_if_continuous_slicing_export_blocked();
+    (void) purpose;
 
     // output everything to a G-code file
     // The following call may die if the filename_format template substitution fails.
@@ -2697,19 +2609,10 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
     return path.c_str();
 }
 
-void Print::throw_if_continuous_slicing_export_blocked() const
+void Print::throw_if_continuous_slicing_artifact_blocked(const std::string &path, bool allow_research_preview) const
 {
-    if (m_config.spiral_mode && m_config.spiral_hybrid_non_crossing &&
-        !m_continuous_slicing_development_export_for_tests)
-        throw Slic3r::SlicingError(L(
-            "Continuous slicing G-code export is intentionally disabled: no machine-specific homing, bed-leveling, "
-            "heater-wait position, or first-approach corridor has been certified. Use this mode only for source-level "
-            "research and tests; do not send its output to a printer."));
-}
-
-void Print::throw_if_continuous_slicing_artifact_blocked(const std::string &path) const
-{
-    if (m_continuous_slicing_development_export_for_tests || path.empty())
+    if (allow_research_preview || m_continuous_slicing_development_export_for_tests ||
+        m_config.spiral_hybrid_non_crossing || path.empty())
         return;
 
     boost::nowide::ifstream input(path);
@@ -3696,10 +3599,10 @@ std::string Print::get_plate_number_formatted() const
 //BBS: add gcode file preload logic
 void Print::set_gcode_file_ready()
 {
-    if (m_config.spiral_mode && m_config.spiral_hybrid_non_crossing &&
+    if (m_config.spiral_hybrid_non_crossing &&
         !m_continuous_slicing_development_export_for_tests) {
         this->invalidate_step(psGCodeExport);
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejecting cached G-code for pre-alpha continuous slicing";
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejecting cached Continuous Fermat G-code that cannot be recertified";
         return;
     }
     this->set_started(psGCodeExport);
@@ -3714,10 +3617,11 @@ void Print::set_gcode_file_invalidated()
 }
 
 //BBS: add gcode file preload logic
-void Print::export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+void Print::export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result,
+                                            ThumbnailsGeneratorCallback thumbnail_cb, GCodeExportPurpose purpose)
 {
-    this->throw_if_continuous_slicing_export_blocked();
-    this->throw_if_continuous_slicing_artifact_blocked(file);
+    const bool allow_research_preview = purpose == GCodeExportPurpose::ContinuousResearchPreview;
+    this->throw_if_continuous_slicing_artifact_blocked(file, allow_research_preview);
 
     try {
         GCodeProcessor processor;
@@ -3955,6 +3859,7 @@ const std::string PrintStatistics::TotalFilamentUsedWipeTowerValueMask = "; tota
 #define JSON_EXTRUSION_NO_EXTRUSION            "no_extrusion"
 #define JSON_EXTRUSION_CONTINUOUS_FERMAT        "continuous_fermat"
 #define JSON_EXTRUSION_CONTINUOUS_MULTIPLIERS   "continuous_fermat_extrusion_multipliers"
+#define JSON_EXTRUSION_CONTINUOUS_WARNING       "continuous_fermat_validation_warning"
 #define JSON_EXTRUSION_LOOP_ROLE               "loop_role"
 
 
@@ -4050,6 +3955,7 @@ static void to_json(json& j, const ExtrusionPath& extrusion_path) {
     j[JSON_EXTRUSION_NO_EXTRUSION] = extrusion_path.is_force_no_extrusion();
     j[JSON_EXTRUSION_CONTINUOUS_FERMAT] = extrusion_path.is_continuous_fermat();
     j[JSON_EXTRUSION_CONTINUOUS_MULTIPLIERS] = extrusion_path.continuous_fermat_extrusion_multipliers;
+    j[JSON_EXTRUSION_CONTINUOUS_WARNING] = extrusion_path.continuous_fermat_validation_warning;
 }
 
 static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json, const ExtrusionEntity* extrusion_entity) {
@@ -4331,6 +4237,9 @@ static void from_json(const json& j, ExtrusionPath& extrusion_path) {
         if (j.contains(JSON_EXTRUSION_CONTINUOUS_MULTIPLIERS))
             extrusion_path.continuous_fermat_extrusion_multipliers =
                 j[JSON_EXTRUSION_CONTINUOUS_MULTIPLIERS].get<std::vector<float>>();
+        if (j.contains(JSON_EXTRUSION_CONTINUOUS_WARNING))
+            extrusion_path.continuous_fermat_validation_warning =
+                j[JSON_EXTRUSION_CONTINUOUS_WARNING].get<std::string>();
     }
 }
 
@@ -4888,7 +4797,7 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
 
 int Print::load_cached_data(const std::string& directory)
 {
-    if (m_config.spiral_mode && m_config.spiral_hybrid_non_crossing) {
+    if (m_config.spiral_hybrid_non_crossing) {
         BOOST_LOG_TRIVIAL(error) << "Continuous slicing refuses cached extrusion entities because they cannot be re-certified against the current slices.";
         return CLI_IMPORT_CACHE_LOAD_FAILED;
     }

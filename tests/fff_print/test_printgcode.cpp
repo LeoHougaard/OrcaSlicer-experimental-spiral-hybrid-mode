@@ -58,7 +58,7 @@ DynamicPrintConfig strict_continuous_export_config()
 {
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
-        {"spiral_mode", true},
+        {"spiral_mode", false},
         {"spiral_hybrid_non_crossing", true},
         {"gcode_flavor", "marlin2"},
         {"print_sequence", "by layer"},
@@ -118,10 +118,12 @@ void apply_continuous_prism(
     Model &model,
     const DynamicPrintConfig &config,
     const Vec3d &offset = Vec3d(20.0, 20.0, 0.0),
-    bool allow_development_export_for_test = true)
+    bool allow_development_export_for_test = true,
+    float xy_scale = 1.2f,
+    float z_scale = 0.03f)
 {
     TriangleMesh prism = Test::mesh(TestMesh::cube_20x20x20);
-    prism.scale(Vec3f(1.2f, 1.2f, 0.03f));
+    prism.scale(Vec3f(xy_scale, xy_scale, z_scale));
     ModelObject *object = model.add_object();
     object->name = "continuous-test-prism.stl";
     object->add_volume(std::move(prism));
@@ -158,7 +160,7 @@ bool continuous_export_throws_slicing_error(Print &print)
 
 } // namespace
 
-TEST_CASE("Continuous slicing blocks printer-ready G-code export by default", "[PrintGCode][continuous]")
+TEST_CASE("Continuous slicing permits validated printer-ready G-code export", "[PrintGCode][continuous]")
 {
     DynamicPrintConfig config = strict_continuous_export_config();
     Print print;
@@ -169,22 +171,111 @@ TEST_CASE("Continuous slicing blocks printer-ready G-code export by default", "[
     print.process();
 
     const std::string path = boost::filesystem::unique_path().string();
-    const std::string sentinel = "existing destination must survive\n";
-    {
-        std::ofstream output(path, std::ios::binary);
-        REQUIRE(output.is_open());
-        output << sentinel;
-    }
-    REQUIRE_THROWS_WITH(
-        print.export_gcode(path, nullptr, nullptr),
-        Catch::Matchers::ContainsSubstring("Continuous slicing G-code export is intentionally disabled"));
+    REQUIRE_NOTHROW(print.export_gcode(path, nullptr, nullptr));
     {
         std::ifstream input(path, std::ios::binary);
         const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        CHECK(contents == sentinel);
+        CHECK(contents.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+        CHECK(contents.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
     }
     CHECK_FALSE(boost::filesystem::exists(path + ".tmp"));
     std::remove(path.c_str());
+
+    const std::string preview_path = boost::filesystem::unique_path().string();
+    REQUIRE_NOTHROW(print.export_gcode(
+        preview_path,
+        nullptr,
+        nullptr,
+        GCodeExportPurpose::ContinuousResearchPreview));
+    {
+        std::ifstream input(preview_path, std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        CHECK(contents.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+        CHECK(contents.find("; spiral_mode = 0") != std::string::npos);
+        CHECK(contents.find("; spiral_hybrid_non_crossing = 1") != std::string::npos);
+    }
+    std::remove(preview_path.c_str());
+}
+
+TEST_CASE("Continuous slicing exports structurally valid paths with geometric warnings", "[PrintGCode][continuous][advisory]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    Print print;
+    Model model;
+    // The 6 mm square is a known closed, finite candidate whose physical
+    // footprint misses at least one fixed geometric quality target at a
+    // 1.2 mm line width.
+    apply_continuous_prism(print, model, config, Vec3d(20.0, 20.0, 0.0), false, 0.3f, 0.03f);
+    REQUIRE(print.validate().string.empty());
+    print.set_status_silent();
+    REQUIRE_NOTHROW(print.process());
+
+    const std::string path = boost::filesystem::unique_path().string();
+    REQUIRE_NOTHROW(print.export_gcode(path, nullptr, nullptr));
+    std::ifstream input(path, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    CHECK(contents.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING") != std::string::npos);
+    CHECK(contents.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+    CHECK(contents.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
+    std::remove(path.c_str());
+}
+
+TEST_CASE("Continuous slicing ignores a wider first-layer line on a 0.4 mm nozzle", "[PrintGCode][continuous][regression]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    config.set_deserialize_strict("nozzle_diameter", "0.4");
+    config.set("outer_wall_line_width", 0.4);
+    config.set("initial_layer_line_width", 0.5);
+
+    Print print;
+    Model model;
+    apply_continuous_prism(print, model, config, Vec3d(20.0, 20.0, 0.0), true, 0.6f, 0.5f);
+    REQUIRE(print.validate().string.empty());
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
+}
+
+TEST_CASE("Continuous slicing processes a hole-free cylindrical prism", "[PrintGCode][continuous][regression]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    Print print;
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "continuous-test-cylinder.stl";
+    object->add_volume(make_cylinder(24.0, 0.6, PI / 48.0));
+    ModelInstance *instance = object->add_instance();
+    instance->set_offset(Vec3d(50.0, 50.0, 0.0));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.enable_continuous_slicing_development_export_for_tests();
+
+    REQUIRE(print.validate().string.empty());
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+    REQUIRE(std::count(gcode.begin(), gcode.end(), '\n') > 3);
+}
+
+TEST_CASE("Continuous slicing processes an overlapping pyramid cross-section", "[PrintGCode][continuous][regression]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    Print print;
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "continuous-test-pyramid.stl";
+    object->add_volume(Test::mesh(TestMesh::pyramid));
+    ModelInstance *instance = object->add_instance();
+    instance->set_offset(Vec3d(50.0, 50.0, 0.0));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.enable_continuous_slicing_development_export_for_tests();
+
+    REQUIRE(print.validate().string.empty());
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
 }
 
 TEST_CASE("Cached Continuous Fermat artifacts remain blocked after the mode is disabled", "[PrintGCode][continuous]")
@@ -197,6 +288,7 @@ TEST_CASE("Cached Continuous Fermat artifacts remain blocked after the mode is d
         REQUIRE(output.is_open());
         output << ";_CONTINUOUS_FERMAT_BEGIN\nG1 X1 Y1 E1\n;_CONTINUOUS_FERMAT_END\n";
     }
+    CHECK_NOTHROW(print.throw_if_continuous_slicing_artifact_blocked(path, true));
     REQUIRE_THROWS_WITH(
         print.throw_if_continuous_slicing_artifact_blocked(path),
         Catch::Matchers::ContainsSubstring("cached/imported Continuous Fermat G-code is intentionally disabled"));
@@ -370,6 +462,120 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
     REQUIRE(wait_position < begin_position);
 }
 
+TEST_CASE("Continuous slicing emits a Klipper-native protected preview contract", "[PrintGCode][continuous][klipper]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    config.set_deserialize_strict("gcode_flavor", "klipper");
+    config.set("file_start_gcode", "PRINT_START");
+    config.set("machine_start_gcode", "START_PRINT BED=60 HOTEND=200");
+    config.set("machine_end_gcode", "END_PRINT");
+
+    Print print;
+    Model model;
+    apply_continuous_prism(print, model, config);
+    REQUIRE(print.validate().string.empty());
+    const std::string gcode = Test::gcode(print);
+    if (const char *artifact_path = std::getenv("ORCA_CONTINUOUS_KLIPPER_TEST_GCODE");
+        artifact_path != nullptr && *artifact_path != '\0') {
+        std::ofstream artifact(artifact_path, std::ios::binary);
+        REQUIRE(artifact.good());
+        artifact.write(gcode.data(), std::streamsize(gcode.size()));
+        REQUIRE(artifact.good());
+    }
+
+    const size_t home = gcode.find("G28 ; continuous slicing: home all axes");
+    const size_t hotend_wait = gcode.find("M109 S200 ; continuous slicing: wait for certified nozzle temperature");
+    const size_t first_section = gcode.find(";_CONTINUOUS_FERMAT_BEGIN");
+    REQUIRE(home != std::string::npos);
+    REQUIRE(hotend_wait != std::string::npos);
+    REQUIRE(first_section != std::string::npos);
+    CHECK(home < hotend_wait);
+    CHECK(hotend_wait < first_section);
+    CHECK(gcode.find("SET_PRESSURE_ADVANCE ADVANCE=0 ; continuous slicing: disable pressure advance") != std::string::npos);
+    CHECK(gcode.find("M220 S100 ; continuous slicing: reset speed override") != std::string::npos);
+    CHECK(gcode.find("M221 S100 ; continuous slicing: reset flow override") != std::string::npos);
+    CHECK((gcode.find("M190 S") != std::string::npos || gcode.find("M140 S0 ; continuous slicing: heated bed disabled") != std::string::npos));
+    CHECK(gcode.find("\nPRINT_START\n") == std::string::npos);
+    CHECK(gcode.find("\nSTART_PRINT BED=60 HOTEND=200\n") == std::string::npos);
+    CHECK(gcode.find("\nEND_PRINT\n") == std::string::npos);
+    CHECK(gcode.find("\nG21") == std::string::npos);
+    CHECK(gcode.find("\nT0 ") == std::string::npos);
+    CHECK(gcode.find("\nM200 ") == std::string::npos);
+    CHECK(gcode.find("\nM900 ") == std::string::npos);
+    CHECK(gcode.find("\nM413 ") == std::string::npos);
+    CHECK(gcode.find("ACCEL_TO_DECEL") == std::string::npos);
+    CHECK(gcode.find("\nM73 ") == std::string::npos);
+}
+
+TEST_CASE("Continuous slicing preserves filament flow calibration and omits incompatible features", "[PrintGCode][continuous]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    config.set_deserialize_strict("gcode_flavor", "klipper");
+    config.set_deserialize_strict("filament_flow_ratio", "0.93");
+    config.set_deserialize_strict("brim_type", "outer_only");
+    config.set("brim_width", 3.0);
+    config.set("exclude_object", true);
+    config.set_deserialize_strict("enable_power_loss_recovery", "enable");
+    config.set("emit_machine_limits_to_gcode", true);
+    config.set("gcode_add_line_number", true);
+    config.set("max_volumetric_extrusion_rate_slope", 1.0);
+    config.set_deserialize_strict("filament_adaptive_volumetric_speed", "1");
+    config.set_deserialize_strict("nozzle_temperature_initial_layer", "205");
+    config.set_deserialize_strict("timelapse_type", "1");
+    config.set("scan_first_layer", true);
+    config.set("enable_wrapping_detection", true);
+    config.set_deserialize_strict("enable_pressure_advance", "1");
+    config.set_deserialize_strict("adaptive_pressure_advance", "1");
+    config.set("before_layer_change_gcode", "UNSAFE_BEFORE_LAYER");
+    config.set("layer_change_gcode", "UNSAFE_LAYER_CHANGE");
+    config.set("time_lapse_gcode", "TIMELAPSE_TAKE_FRAME");
+    config.set("change_extrusion_role_gcode", "SET_PRESSURE_ADVANCE ADVANCE=0.04");
+    config.set_deserialize_strict("fan_kickstart", "0.5");
+    config.set("auxiliary_fan", true);
+    config.set_deserialize_strict("activate_air_filtration", "1");
+    config.set_deserialize_strict("activate_chamber_temp_control", "1");
+
+    Print print;
+    Model model;
+    apply_continuous_prism(print, model, config);
+    REQUIRE(print.validate().string.empty());
+    const std::string gcode = Test::gcode(print);
+
+    constexpr double flow_ratio = 0.93;
+    constexpr double continuous_solid_fill_ratio = 1.019;
+    constexpr double target_layer_volume = 24.0 * 24.0 * 0.2;
+    const double filament_area = PI * 1.75 * 1.75 * 0.25;
+    bool inside = false;
+    size_t sections = 0;
+    double section_commanded_volume = 0.0;
+    std::istringstream stream(gcode);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line == ";_CONTINUOUS_FERMAT_BEGIN") {
+            REQUIRE_FALSE(inside);
+            inside = true;
+            section_commanded_volume = 0.0;
+        } else if (line == ";_CONTINUOUS_FERMAT_END") {
+            REQUIRE(inside);
+            CHECK(section_commanded_volume / target_layer_volume ==
+                  Catch::Approx(flow_ratio * continuous_solid_fill_ratio).margin(0.005));
+            inside = false;
+            ++sections;
+        } else if (inside && line.rfind("G1", 0) == 0) {
+            const auto words = parse_numeric_words(line);
+            if (const auto e = words.find('E'); e != words.end())
+                section_commanded_volume += e->second * filament_area;
+        }
+    }
+    CHECK_FALSE(inside);
+    CHECK(sections == 3);
+    CHECK(gcode.find("\nUNSAFE_BEFORE_LAYER\n") == std::string::npos);
+    CHECK(gcode.find("\nUNSAFE_LAYER_CHANGE\n") == std::string::npos);
+    CHECK(gcode.find("\nTIMELAPSE_TAKE_FRAME\n") == std::string::npos);
+    CHECK(gcode.find("\nSET_PRESSURE_ADVANCE ADVANCE=0.04\n") == std::string::npos);
+    CHECK(gcode.find("EXCLUDE_OBJECT_START") == std::string::npos);
+}
+
 TEST_CASE("Continuous slicing export rejects a protected bead outside a nonrectangular bed", "[PrintGCode][continuous]")
 {
     DynamicPrintConfig config = strict_continuous_export_config();
@@ -437,7 +643,7 @@ TEST_CASE("Continuous slicing first approach cannot Z-hop above the height limit
     CHECK(max_motion_z <= 0.7 + 1e-9);
 }
 
-TEST_CASE("Continuous slicing export rechecks serialized layer material", "[PrintGCode][continuous]")
+TEST_CASE("Continuous slicing reports finite serialized layer material deviations", "[PrintGCode][continuous][advisory]")
 {
     DynamicPrintConfig config = strict_continuous_export_config();
     Print print;
@@ -459,7 +665,9 @@ TEST_CASE("Continuous slicing export rechecks serialized layer material", "[Prin
         path->continuous_fermat_extrusion_multipliers.end(),
         0.85f);
 
-    REQUIRE(continuous_export_throws_slicing_error(print));
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING serialized_material_ratio=") != std::string::npos);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
 }
 
 SCENARIO( "PrintGCode basic functionality", "[PrintGCode][.]") {

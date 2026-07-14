@@ -14,22 +14,27 @@ class Layer;
 
 namespace ContinuousFermat {
 
-// Mandatory postconditions for a generated per-layer path.  These metrics are
-// evaluated against the physical extrusion footprint before normal Orca layer
-// entities are removed.  A path is usable only when `ok` is true.
+// Postconditions for a generated per-layer path. These metrics are evaluated
+// against the physical extrusion footprint before normal Orca layer entities
+// are removed. `emittable` covers structural and finite-flow requirements;
+// `ok` additionally covers advisory geometric-quality targets.
 struct PathValidation
 {
     bool ok { false };
+    bool emittable { false };
     bool closed { false };
     double exact_coverage_ratio { 0.0 };
     double coverage_ratio { 0.0 };
     double outside_ratio { 0.0 };
     double material_ratio { 0.0 };
+    double redeposition_ratio { 0.0 };
     size_t containment_violations { 0 };
     int crossings { 0 };
     int spacing_violations { 0 };
     int bead_overlap_violations { 0 };
     int turnback_violations { 0 };
+    std::string thin_feature_class;
+    double thin_feature_threshold_mm { 0.0 };
     std::string reason;
 };
 
@@ -46,8 +51,14 @@ struct GeneratedPath
 bool apply_to_layer(Layer &layer);
 
 // Exposed for focused geometry tests and debug tooling.
-Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow);
-GeneratedPath generate_layer_path_with_metadata(const ExPolygons &printable_area, const Flow &flow);
+// `max_line_width` is a physical bead width in millimetres. Zero preserves the
+// legacy 1.60 cross-section multiplier. In all cases the implementation keeps
+// the non-negotiable two-nozzle physical-width ceiling.
+Polyline generate_layer_path(const ExPolygons &printable_area, const Flow &flow, double max_line_width = 0.0);
+GeneratedPath generate_layer_path_with_metadata(
+    const ExPolygons &printable_area,
+    const Flow &flow,
+    double max_line_width = 0.0);
 
 // Validate a completed path using the same fail-closed contract applied by the
 // production layer integration.  Exposed for focused safety regression tests.
@@ -55,7 +66,8 @@ PathValidation validate_layer_path(
     const ExPolygons &printable_area,
     const Flow &flow,
     const Polyline &path,
-    const std::vector<float> &extrusion_multipliers);
+    const std::vector<float> &extrusion_multipliers,
+    double max_line_width = 0.0);
 
 } // namespace ContinuousFermat
 } // namespace Slic3r

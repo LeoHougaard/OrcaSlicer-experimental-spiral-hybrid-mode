@@ -18,7 +18,7 @@ DynamicPrintConfig strict_continuous_validation_config()
 {
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
-        {"spiral_mode", true},
+        {"spiral_mode", false},
         {"spiral_hybrid_non_crossing", true},
         {"gcode_flavor", "marlin2"},
         {"print_sequence", "by layer"},
@@ -105,38 +105,12 @@ SCENARIO("Print: strict continuous slicing validation is fail-closed", "[Print][
                  cfg.set("skirt_height", 1);
              }},
             {"a draft shield", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("draft_shield", "enabled"); }},
-            {"a brim", [](DynamicPrintConfig &cfg) {
-                 cfg.set_deserialize_strict("brim_type", "outer_only");
-                 cfg.set("brim_width", 2.0);
-             }},
-            {"smooth timelapse", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("timelapse_type", "1"); }},
-            {"first-layer scanning", [](DynamicPrintConfig &cfg) { cfg.set("scan_first_layer", true); }},
-            {"clumping detection", [](DynamicPrintConfig &cfg) { cfg.set("enable_wrapping_detection", true); }},
             {"ironing", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("ironing_type", "top"); }},
-            {"before-layer executable G-code", [](DynamicPrintConfig &cfg) { cfg.set("before_layer_change_gcode", "G1 X10"); }},
-            {"layer-change executable G-code", [](DynamicPrintConfig &cfg) { cfg.set("layer_change_gcode", "G92 E0"); }},
-            {"timelapse executable G-code", [](DynamicPrintConfig &cfg) { cfg.set("time_lapse_gcode", "G1 X10"); }},
-            {"role-change executable G-code", [](DynamicPrintConfig &cfg) { cfg.set("change_extrusion_role_gcode", "G1 E1"); }},
-            {"bare-CR hook bypass", [](DynamicPrintConfig &cfg) { cfg.set("layer_change_gcode", "; comment\rG1 X10"); }},
-            {"non-Marlin G-code semantics", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("gcode_flavor", "klipper"); }},
+            {"unsupported RepRapFirmware semantics", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("gcode_flavor", "reprapfirmware"); }},
             {"Marlin 1 G-code semantics", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("gcode_flavor", "marlin"); }},
-            {"the continuous flag without spiral mode", [](DynamicPrintConfig &cfg) { cfg.set("spiral_mode", false); }},
             {"absolute extrusion distances", [](DynamicPrintConfig &cfg) { cfg.set("use_relative_e_distances", false); }},
-            {"object cancellation", [](DynamicPrintConfig &cfg) { cfg.set("exclude_object", true); }},
-            {"power-loss recovery", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("enable_power_loss_recovery", "enable"); }},
-            {"pressure equalization", [](DynamicPrintConfig &cfg) { cfg.set("max_volumetric_extrusion_rate_slope", 1.0); }},
-            {"fixed pressure advance", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("enable_pressure_advance", "1"); }},
-            {"adaptive pressure advance", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("adaptive_pressure_advance", "1"); }},
-            {"firmware machine-limit overrides", [](DynamicPrintConfig &cfg) { cfg.set("emit_machine_limits_to_gcode", true); }},
-            {"post-export line numbering", [](DynamicPrintConfig &cfg) { cfg.set("gcode_add_line_number", true); }},
-            {"file-start executable G-code", [](DynamicPrintConfig &cfg) { cfg.set("file_start_gcode", "G28"); }},
-            {"machine-start executable G-code", [](DynamicPrintConfig &cfg) { cfg.set("machine_start_gcode", "G1 X10"); }},
-            {"filament-start executable G-code", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("filament_start_gcode", "G1 E5"); }},
             {"a nonzero physical tool mapping", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("physical_extruder_map", "1"); }},
-            {"a nozzle temperature transition", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("nozzle_temperature_initial_layer", "210"); }},
-            {"a non-unity filament flow ratio", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("filament_flow_ratio", "1.1"); }},
             {"no volumetric speed limit", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("filament_max_volumetric_speed", "0"); }},
-            {"an adaptive volumetric limit", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("filament_adaptive_volumetric_speed", "1"); }},
             {"a non-positive printable height", [](DynamicPrintConfig &cfg) { cfg.set("printable_height", 0.0); }},
             {"a non-finite Z offset", [](DynamicPrintConfig &cfg) { cfg.set("z_offset", std::numeric_limits<double>::quiet_NaN()); }},
             {"a bed exclusion polygon", [](DynamicPrintConfig &cfg) {
@@ -150,11 +124,6 @@ SCENARIO("Print: strict continuous slicing validation is fail-closed", "[Print][
                      new ConfigOptionPointsGroups({{Vec2d(0.0, 0.0), Vec2d(100.0, 0.0), Vec2d(100.0, 100.0), Vec2d(0.0, 100.0)}}));
              }},
             {"sequential printing", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("print_sequence", "by object"); }},
-            {"machine end motion", [](DynamicPrintConfig &cfg) { cfg.set("machine_end_gcode", "G28 X0"); }},
-            {"fan kickstart motion splitting", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("fan_kickstart", "0.5"); }},
-            {"an auxiliary fan", [](DynamicPrintConfig &cfg) { cfg.set("auxiliary_fan", true); }},
-            {"air filtration", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("activate_air_filtration", "1"); }},
-            {"chamber control", [](DynamicPrintConfig &cfg) { cfg.set_deserialize_strict("activate_chamber_temp_control", "1"); }},
         };
 
         for (const InvalidFeature &feature : invalid_features) {
@@ -167,6 +136,23 @@ SCENARIO("Print: strict continuous slicing validation is fail-closed", "[Print][
             }
         }
     }
+}
+
+SCENARIO("Print: strict continuous slicing accepts Klipper profiles", "[Print][validate][continuous][klipper]")
+{
+    DynamicPrintConfig config = strict_continuous_validation_config();
+    config.set_deserialize_strict("gcode_flavor", "klipper");
+    // These common profile hooks are deliberately omitted from the protected
+    // preview artifact rather than executed or required to be empty.
+    config.set("file_start_gcode", "PRINT_START");
+    config.set("machine_start_gcode", "START_PRINT BED=60 HOTEND=200");
+    config.set_deserialize_strict("filament_start_gcode", "G1 E5");
+    config.set("machine_end_gcode", "END_PRINT");
+    config.set_deserialize_strict("filament_end_gcode", "G1 E-5");
+
+    const StringObjectException error = validate_cube(config);
+    INFO(error.string);
+    CHECK(error.string.empty());
 }
 
 SCENARIO("Print: strict continuous slicing rejects an otherwise unused second nozzle", "[Print][validate][continuous]")
@@ -234,19 +220,40 @@ SCENARIO("Print: strict continuous slicing requires one object and one instance"
     }
 }
 
-SCENARIO("Print: strict continuous slicing permits comment-only layer hooks", "[Print][validate][continuous]")
+SCENARIO("Print: continuous slicing accepts material calibration and ignores incompatible output hooks", "[Print][validate][continuous]")
 {
     DynamicPrintConfig config = strict_continuous_validation_config();
-    config.set("before_layer_change_gcode", "; before {layer_num}");
-    config.set("layer_change_gcode", "  ; layer {layer_num}");
-    config.set("time_lapse_gcode", "; camera intentionally disabled");
-    config.set("change_extrusion_role_gcode", "; role {extrusion_role}");
-    CHECK(validate_cube(config).string.empty());
+    config.set_deserialize_strict("filament_flow_ratio", "0.93");
+    config.set_deserialize_strict("enable_pressure_advance", "1");
+    config.set_deserialize_strict("adaptive_pressure_advance", "1");
+    config.set("before_layer_change_gcode", "G1 X10");
+    config.set("layer_change_gcode", "G92 E0");
+    config.set("time_lapse_gcode", "TIMELAPSE_TAKE_FRAME");
+    config.set("change_extrusion_role_gcode", "SET_PRESSURE_ADVANCE ADVANCE=0.04");
+    config.set("exclude_object", true);
+    config.set_deserialize_strict("enable_power_loss_recovery", "enable");
+    config.set("emit_machine_limits_to_gcode", true);
+    config.set("gcode_add_line_number", true);
+    config.set("max_volumetric_extrusion_rate_slope", 1.0);
+    config.set_deserialize_strict("filament_adaptive_volumetric_speed", "1");
+    config.set_deserialize_strict("nozzle_temperature_initial_layer", "205");
+    config.set_deserialize_strict("timelapse_type", "1");
+    config.set("scan_first_layer", true);
+    config.set("enable_wrapping_detection", true);
+    config.set_key_value("post_process", new ConfigOptionStrings({"ignored-script"}));
+    config.set_deserialize_strict("fan_kickstart", "0.5");
+    config.set("auxiliary_fan", true);
+    config.set_deserialize_strict("activate_air_filtration", "1");
+    config.set_deserialize_strict("activate_chamber_temp_control", "1");
+    const StringObjectException error = validate_cube(config);
+    INFO(error.string);
+    CHECK(error.string.empty());
 }
 
 SCENARIO("Print: classic spiral mode keeps its existing validation", "[Print][validate][continuous]")
 {
     DynamicPrintConfig config = strict_continuous_validation_config();
+    config.set("spiral_mode", true);
     config.set("spiral_hybrid_non_crossing", false);
     config.set("use_relative_e_distances", false);
     config.set("skirt_loops", 1);
@@ -254,6 +261,17 @@ SCENARIO("Print: classic spiral mode keeps its existing validation", "[Print][va
     config.set_deserialize_strict("brim_type", "outer_only");
     config.set("brim_width", 2.0);
 
+    CHECK(validate_cube(config).string.empty());
+}
+
+SCENARIO("Print: continuous slicing is independent from classic spiral vase", "[Print][validate][continuous]")
+{
+    DynamicPrintConfig config = strict_continuous_validation_config();
+    CHECK_FALSE(config.opt_bool("spiral_mode"));
+    CHECK(config.opt_bool("spiral_hybrid_non_crossing"));
+    CHECK(validate_cube(config).string.empty());
+
+    config.set("spiral_mode", true);
     CHECK(validate_cube(config).string.empty());
 }
 

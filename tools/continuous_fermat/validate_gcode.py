@@ -2,13 +2,14 @@
 """Fail-closed validation for integrated Continuous Fermat G-code sections.
 
 The validator scans the whole file and models the modal state needed to audit
-the marked paths.  It deliberately implements Marlin's positioning semantics:
-G90/G91 select the mode for every axis, including E, and clear an E-only mode
-override previously selected by M82/M83.
+the marked paths. It supports explicit ``marlin2`` and ``klipper`` contracts;
+their G90/G91 interaction with the independently tracked E mode is modeled
+separately.
 
-A passing file has closed, continuously extruding marked strokes.  Between two
-marked strokes only a finite, positive Z transition at the same XY position is
-accepted.  Positive-E XY moves outside the markers are rejected; a reviewed
+A passing file has closed, continuously extruding marked strokes. Between two
+marked strokes, only a finite positive Z transition followed by at most one
+non-extruding linear XY approach is accepted. Positive-E XY moves outside the
+markers are rejected; a reviewed
 purge in start G-code can be opted in explicitly, but the exception never
 applies between sections or after the first section.
 """
@@ -34,6 +35,7 @@ FLOW_OVERRIDE_COMMANDS = {"M220", "M221"}
 VOLUMETRIC_E_COMMAND = "M200"
 POWER_LOSS_RECOVERY_COMMAND = "M413"
 LINEAR_ADVANCE_COMMAND = "M900"
+KLIPPER_PRESSURE_ADVANCE_COMMAND = "SET_PRESSURE_ADVANCE"
 UNSAFE_COORDINATE_COMMANDS = {
     "G20",  # inch units; the validator deliberately certifies millimetres only
     "G52",  # local coordinate offset
@@ -69,6 +71,7 @@ SAFE_SECTION_M_COMMANDS = {
 }
 SAFE_TRANSITION_M_COMMANDS = SAFE_SECTION_M_COMMANDS | {
     "M140",  # non-blocking bed temperature
+    "M190",  # blocking bed temperature
     "M400",  # wait for queued moves
 }
 SAFE_POSTAMBLE_M_COMMANDS = SAFE_TRANSITION_M_COMMANDS | {
@@ -103,6 +106,8 @@ COMMANDLESS_MOTION_RE = re.compile(
     rf"(?:^|\s)[XYZEFIJKRABCUVW]\s*{NUMBER_TEXT}",
     re.IGNORECASE,
 )
+NAMED_COMMAND_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\b")
+NAMED_PARAM_RE = re.compile(rf"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*({NUMBER_TEXT})", re.IGNORECASE)
 PAREN_COMMENT_RE = re.compile(r"\([^)]*\)")
 
 
@@ -124,7 +129,9 @@ class MachineState:
     linear_advance_disabled: bool | None = None
     all_axes_homed: bool = False
     hotend_ready_after_home: bool = False
+    bed_ready_after_home: bool = False
     active_tool: int | None = None
+    pressure_advance_disabled: bool | None = None
 
 
 @dataclass
@@ -235,7 +242,7 @@ def normalize_command(letter: str, number: str) -> str:
     return f"{letter.upper()}{number.upper()}"
 
 
-def parse_code(code: str) -> ParsedCode:
+def parse_code(code: str, firmware: str = "marlin2") -> ParsedCode:
     """Parse the commands whose parameters affect this validator.
 
     Unknown/custom commands are intentionally ignored.  For a motion or modal
@@ -251,7 +258,31 @@ def parse_code(code: str) -> ParsedCode:
     payload = code.split("*", 1)[0].rstrip()
     command_match = COMMAND_RE.match(payload)
     if command_match is None:
-        return ParsedCode()
+        named_match = NAMED_COMMAND_RE.match(payload)
+        if named_match is None:
+            return ParsedCode()
+        command = named_match.group(1).upper()
+        if firmware != "klipper" or command != KLIPPER_PRESSURE_ADVANCE_COMMAND:
+            return ParsedCode()
+
+        words: dict[str, float] = {}
+        errors: list[str] = []
+        position = named_match.end()
+        while position < len(payload):
+            while position < len(payload) and payload[position].isspace():
+                position += 1
+            if position >= len(payload):
+                break
+            param_match = NAMED_PARAM_RE.match(payload, position)
+            if param_match is None:
+                errors.append(f"malformed Klipper parameter near {payload[position:position + 16]!r}")
+                break
+            name = param_match.group(1).upper()
+            if name in words:
+                errors.append(f"duplicate {name} parameter")
+            words[name] = float(param_match.group(2))
+            position = param_match.end()
+        return ParsedCode(command=command, words=words, errors=errors)
 
     command = normalize_command(command_match.group(1), command_match.group(2))
     if command not in STRICT_PARSE_COMMANDS:
@@ -349,8 +380,9 @@ def validate_transition(
 ) -> None:
     """Validate the buffered commands between two completed sections."""
 
-    for line_no in pending.xy_lines:
-        result.fail(line_no, "unmarked XY move between Continuous Fermat sections")
+    if len(pending.xy_lines) > 1:
+        for line_no in pending.xy_lines[1:]:
+            result.fail(line_no, "more than one XY approach move between Continuous Fermat sections")
     for line_no, delta in pending.e_moves:
         kind = "retraction" if delta < 0.0 else "extrusion/unretraction"
         result.fail(line_no, f"unmarked {kind} between Continuous Fermat sections (delta E={delta:.9g})")
@@ -380,6 +412,11 @@ def validate_transition(
     elif not math.isfinite(z_delta) or z_delta <= z_tolerance:
         result.fail(next_section.start_line, f"section Z did not increase across transition (delta {z_delta:.9g} mm)")
 
+    if pending.xy_lines:
+        positive_z_lines = [line_no for line_no, delta in pending.z_words if delta is not None and delta > z_tolerance]
+        if not positive_z_lines or pending.xy_lines[0] <= max(positive_z_lines):
+            result.fail(pending.xy_lines[0], "inter-layer XY approach must occur after the positive Z transition")
+
     source_xy = pending.source.end_xy
     target_xy = xy_position(state)
     endpoint_gap = None
@@ -387,11 +424,6 @@ def validate_transition(
         result.fail(next_section.start_line, "cannot compare adjacent section endpoints because XY is unknown")
     else:
         endpoint_gap = xy_distance(source_xy, target_xy)
-        if endpoint_gap > xy_tolerance:
-            result.fail(
-                next_section.start_line,
-                f"section transition endpoint gap {endpoint_gap:.6f} mm exceeds tolerance",
-            )
 
     result.transitions.append(
         TransitionRecord(
@@ -443,12 +475,16 @@ def validate_lines(
     expected_sections: int | None = None,
     expected_layers: int | None = None,
     allow_unmarked_before_first_section: bool = False,
+    firmware: str = "marlin2",
 ) -> ValidationResult:
     """Validate an iterable of G-code lines.
 
     The first four positional parameters retain the original API.  Strict
     accounting and the narrowly scoped start-G-code exception are keyword-only.
     """
+
+    if firmware not in {"marlin2", "klipper"}:
+        raise ValueError("firmware must be 'marlin2' or 'klipper'")
 
     for name, value in (
         ("xy_tolerance", xy_tolerance),
@@ -461,7 +497,7 @@ def validate_lines(
         if value is not None and value < 0:
             raise ValueError(f"{name} must be non-negative")
 
-    state = MachineState()
+    state = MachineState(units_mm=True if firmware == "klipper" else None)
     result = ValidationResult(path=path)
     section: SectionState | None = None
     pending: PendingTransition | None = None
@@ -500,23 +536,29 @@ def validate_lines(
                     section_layer_counts[current_layer] = section_layer_counts.get(current_layer, 0) + 1
                 continue
 
-            if state.volumetric_e_disabled is not True:
-                result.fail(line_no, "M200 D0 was not explicitly established before the protected sequence")
-            if state.power_loss_recovery_disabled is not True:
-                result.fail(line_no, "M413 S0 was not explicitly established before the protected sequence")
-            if state.linear_advance_disabled is not True:
-                result.fail(line_no, "M900 K0 was not explicitly established before the protected sequence")
+            if firmware == "marlin2":
+                if state.volumetric_e_disabled is not True:
+                    result.fail(line_no, "M200 D0 was not explicitly established before the protected sequence")
+                if state.power_loss_recovery_disabled is not True:
+                    result.fail(line_no, "M413 S0 was not explicitly established before the protected sequence")
+                if state.linear_advance_disabled is not True:
+                    result.fail(line_no, "M900 K0 was not explicitly established before the protected sequence")
+            elif state.pressure_advance_disabled is not True:
+                result.fail(line_no, "SET_PRESSURE_ADVANCE ADVANCE=0 was not explicitly established before the protected sequence")
             if not state.all_axes_homed:
                 result.fail(line_no, "an exact all-axis G28 was not established before the protected sequence")
             if not state.hotend_ready_after_home:
-                result.fail(line_no, "M109 R with a positive target was not established after the final G28")
+                wait_form = "M109 R" if firmware == "marlin2" else "M109 S"
+                result.fail(line_no, f"{wait_form} with a positive target was not established after the final G28")
+            if firmware == "klipper" and not state.bed_ready_after_home:
+                result.fail(line_no, "Klipper bed state was not established after G28 with positive M190 S or exact M140 S0")
             if state.units_mm is not True:
                 result.fail(line_no, "G21 millimetre units were not explicitly established before the protected sequence")
             if state.absolute_xy is not True:
                 result.fail(line_no, "G90 absolute XYZ was not explicitly established before the protected sequence")
             if state.absolute_e is not False:
                 result.fail(line_no, "M83 relative E was not explicitly established after the final G90/G91")
-            if state.active_tool != 0:
+            if firmware == "marlin2" and state.active_tool != 0:
                 result.fail(line_no, "T0 was not explicitly selected before the protected sequence")
             if state.speed_factor is None or not math.isclose(state.speed_factor, 1.0, rel_tol=0.0, abs_tol=1e-9):
                 result.fail(line_no, "M220 S100 was not established before the protected sequence")
@@ -585,7 +627,7 @@ def validate_lines(
             section = None
             continue
 
-        parsed = parse_code(code)
+        parsed = parse_code(code, firmware)
         command, words = parsed.command, parsed.words
         if not command:
             if code:
@@ -609,8 +651,8 @@ def validate_lines(
         if non_finite:
             continue
 
-        # Marlin: G90/G91 clear an M82/M83 override and apply to E as well as
-        # XYZ.  This differs from keeping two independent booleans forever.
+        # Marlin G90/G91 clear an M82/M83 override and apply to E as well as
+        # XYZ. Klipper tracks the coordinate and extrusion modes independently.
         if command == "G90":
             if words:
                 result.fail(line_no, "G90 normalization has unexpected words")
@@ -620,7 +662,8 @@ def validate_lines(
                 pending.disruptive_lines.append((line_no, command))
                 pending.postamble_disruptive_lines.append((line_no, command))
             state.absolute_xy = True
-            state.absolute_e = True
+            if firmware == "marlin2":
+                state.absolute_e = True
             continue
         if command == "G91":
             if words:
@@ -631,7 +674,8 @@ def validate_lines(
                 pending.disruptive_lines.append((line_no, command))
                 pending.postamble_disruptive_lines.append((line_no, command))
             state.absolute_xy = False
-            state.absolute_e = False
+            if firmware == "marlin2":
+                state.absolute_e = False
             continue
         if command == "M82":
             if words:
@@ -697,6 +741,7 @@ def validate_lines(
             state.x = state.y = state.z = None
             state.all_axes_homed = not words
             state.hotend_ready_after_home = False
+            state.bed_ready_after_home = False
             continue
 
         if command == "G92":
@@ -789,15 +834,38 @@ def validate_lines(
                 pending.postamble_disruptive_lines.append((line_no, command))
             continue
 
+        if command == KLIPPER_PRESSURE_ADVANCE_COMMAND:
+            if set(words) != {"ADVANCE"}:
+                result.fail(line_no, "SET_PRESSURE_ADVANCE normalization must contain only ADVANCE")
+                state.pressure_advance_disabled = False
+                continue
+            state.pressure_advance_disabled = abs(words["ADVANCE"]) <= e_tolerance
+            if section is not None:
+                result.fail(line_no, "Klipper pressure-advance change inside Continuous Fermat section")
+            elif pending is not None:
+                pending.disruptive_lines.append((line_no, command))
+                pending.postamble_disruptive_lines.append((line_no, command))
+            continue
+
         if command in {"M104", "M109"} and section is None and pending is None:
             if command == "M109":
+                target_word = "R" if firmware == "marlin2" else "S"
                 state.hotend_ready_after_home = (
                     state.all_axes_homed
-                    and set(words) == {"R"}
-                    and words["R"] > e_tolerance
+                    and set(words) == {target_word}
+                    and words[target_word] > e_tolerance
                 )
             else:
                 state.hotend_ready_after_home = False
+            continue
+
+        if command in {"M140", "M190"} and section is None and pending is None and firmware == "klipper":
+            state.bed_ready_after_home = (
+                state.all_axes_homed
+                and set(words) == {"S"}
+                and ((command == "M190" and words["S"] > e_tolerance) or
+                     (command == "M140" and abs(words["S"]) <= e_tolerance))
+            )
             continue
 
         if command.startswith("T"):
@@ -1045,6 +1113,7 @@ def validate_file(
     expected_sections: int | None = None,
     expected_layers: int | None = None,
     allow_unmarked_before_first_section: bool = False,
+    firmware: str = "marlin2",
 ) -> ValidationResult:
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         return validate_lines(
@@ -1056,6 +1125,7 @@ def validate_file(
             expected_sections=expected_sections,
             expected_layers=expected_layers,
             allow_unmarked_before_first_section=allow_unmarked_before_first_section,
+            firmware=firmware,
         )
 
 
@@ -1080,6 +1150,12 @@ def main() -> int:
     parser.add_argument("--z-tolerance", type=finite_non_negative_float, default=1e-6, help="Z motion tolerance in mm")
     parser.add_argument("--e-tolerance", type=finite_non_negative_float, default=1e-7, help="extrusion delta tolerance")
     parser.add_argument("--expected-sections", type=non_negative_int, help="require exactly this many marked sections")
+    parser.add_argument(
+        "--firmware",
+        choices=("marlin2", "klipper"),
+        default="marlin2",
+        help="firmware-specific protected startup and modal contract",
+    )
     parser.add_argument(
         "--expected-layers",
         type=non_negative_int,
@@ -1112,6 +1188,7 @@ def main() -> int:
             expected_sections=args.expected_sections,
             expected_layers=args.expected_layers,
             allow_unmarked_before_first_section=args.allow_unmarked_before_first_section,
+            firmware=args.firmware,
         )
         behavior = (
             f"outside XY/E/R/Z={result.unmarked_xy_moves}/"

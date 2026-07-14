@@ -1990,16 +1990,13 @@ WipeTowerType GCode::wipe_tower_type()
     return WipeTowerType::Type2;
 }
 
-void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result,
+                      ThumbnailsGeneratorCallback thumbnail_cb)
 {
     PROFILE_CLEAR();
 
     // BBS
     m_curr_print = print;
-    // Defense in depth: keep the release gate ahead of cached-output reuse and
-    // ahead of removal of an existing destination file.
-    print->throw_if_continuous_slicing_export_blocked();
-
     GCodeWriter::full_gcode_comment = print->config().gcode_comments;
     CNumericLocalesSetter locales_setter;
 
@@ -2407,8 +2404,16 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_print = &print;
     m_timelapse_pos_picker.init(&print,m_writer.get_xy_offset().cast<coord_t>());
 
-    // modifies m_silent_time_estimator_enabled
-    DoExport::init_gcode_processor(print.config(), m_processor, m_silent_time_estimator_enabled);
+    // modifies m_silent_time_estimator_enabled. Klipper does not document M73,
+    // so keep it out of the complete strict artifact, including processor-
+    // inserted remaining-time updates.
+    if (print.config().spiral_hybrid_non_crossing && print.config().gcode_flavor == gcfKlipper) {
+        PrintConfig processor_config = print.config();
+        processor_config.disable_m73.value = true;
+        DoExport::init_gcode_processor(processor_config, m_processor, m_silent_time_estimator_enabled);
+    } else {
+        DoExport::init_gcode_processor(print.config(), m_processor, m_silent_time_estimator_enabled);
+    }
     const bool is_bbl_printers = print.is_BBL_printer();
     const WipeTowerType wipe_tower_type = print.wipe_tower_type();
     m_calib_config.clear();
@@ -2486,7 +2491,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     if (print.config().spiral_mode.value && !print.config().spiral_hybrid_non_crossing.value)
         m_spiral_vase = make_unique<SpiralVase>(print.config());
 
-    if (print.config().max_volumetric_extrusion_rate_slope.value > 0){
+    if (!print.config().spiral_hybrid_non_crossing && print.config().max_volumetric_extrusion_rate_slope.value > 0){
     		m_pressure_equalizer = make_unique<PressureEqualizer>(print.config());
     		m_enable_extrusion_role_markers = (bool)m_pressure_equalizer;
     } else
@@ -2495,8 +2500,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     if (!print.config().small_area_infill_flow_compensation_model.empty())
         m_small_area_infill_flow_compensator = make_unique<SmallAreaInfillFlowCompensator>(print.config());
     
-    // Process file_start_gcode - written at the very top of the file, before any header
-    {
+    // Strict continuous preview uses a firmware-specific, auditable startup
+    // below. Do not leak arbitrary profile macros into that artifact.
+    if (!print.config().spiral_hybrid_non_crossing) {
         std::string top_gcode_template = print.config().file_start_gcode.value;
         if (!top_gcode_template.empty()) {
             DynamicConfig top_config;
@@ -2760,10 +2766,12 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_pa_processor = std::make_unique<AdaptivePAProcessor>(*this, tool_ordering.all_extruders());
 
     // Emit machine envelope limits for the Marlin firmware.
-    this->print_machine_envelope(file, print);
+    if (!m_config.spiral_hybrid_non_crossing)
+        this->print_machine_envelope(file, print);
 
     // Disable fan.
-    if (m_config.auxiliary_fan.value && print.config().close_fan_the_first_x_layers.get_at(initial_extruder_id)) {
+    if (!m_config.spiral_hybrid_non_crossing && m_config.auxiliary_fan.value &&
+        print.config().close_fan_the_first_x_layers.get_at(initial_extruder_id)) {
         file.write(m_writer.set_fan(0));
         //BBS: disable additional fan
         file.write(m_writer.set_additional_fan(0));
@@ -2945,9 +2953,11 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     }
     bool activate_chamber_temp_control = false;
     auto max_chamber_temp              = 0;
-    for (const auto &extruder : m_writer.extruders()) {
-        activate_chamber_temp_control |= m_config.activate_chamber_temp_control.get_at(extruder.id());
-        max_chamber_temp = std::max(max_chamber_temp, m_config.chamber_temperature.get_at(extruder.id()));
+    if (!m_config.spiral_hybrid_non_crossing) {
+        for (const auto &extruder : m_writer.extruders()) {
+            activate_chamber_temp_control |= m_config.activate_chamber_temp_control.get_at(extruder.id());
+            max_chamber_temp = std::max(max_chamber_temp, m_config.chamber_temperature.get_at(extruder.id()));
+        }
     }
     {
         BedType curr_bed_type = m_config.curr_bed_type;
@@ -3052,7 +3062,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     this->placeholder_parser().set("print_time_sec", new ConfigOptionString(GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Print_Time_Sec_Placeholder)));
     this->placeholder_parser().set("used_filament_length", new ConfigOptionString(GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Used_Filament_Length_Placeholder)));
 
-    std::string machine_start_gcode = this->placeholder_parser_process("machine_start_gcode", print.config().machine_start_gcode.value, initial_extruder_id);
+    std::string machine_start_gcode;
+    if (!print.config().spiral_hybrid_non_crossing)
+        machine_start_gcode = this->placeholder_parser_process(
+            "machine_start_gcode", print.config().machine_start_gcode.value, initial_extruder_id);
     if (print.config().gcode_flavor != gcfKlipper) {
         // Set bed temperature if the start G-code does not contain any bed temp control G-codes.
         this->_print_first_layer_bed_temperature(file, print, machine_start_gcode, initial_extruder_id, true);
@@ -3117,11 +3130,13 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // Orca: when activate_air_filtration is set on any extruder, find and set the highest during_print_exhaust_fan_speed
     bool activate_air_filtration        = false;
     int  during_print_exhaust_fan_speed = 0;
-    for (const auto &extruder : m_writer.extruders()) {
-        activate_air_filtration |= m_config.activate_air_filtration.get_at(extruder.id());
-        if (m_config.activate_air_filtration.get_at(extruder.id()))
-            during_print_exhaust_fan_speed = std::max(during_print_exhaust_fan_speed,
-                                                      m_config.during_print_exhaust_fan_speed.get_at(extruder.id()));
+    if (!m_config.spiral_hybrid_non_crossing) {
+        for (const auto &extruder : m_writer.extruders()) {
+            activate_air_filtration |= m_config.activate_air_filtration.get_at(extruder.id());
+            if (m_config.activate_air_filtration.get_at(extruder.id()))
+                during_print_exhaust_fan_speed = std::max(during_print_exhaust_fan_speed,
+                                                          m_config.during_print_exhaust_fan_speed.get_at(extruder.id()));
+        }
     }
     if (activate_air_filtration)
         file.write(m_writer.set_exhaust_fan(during_print_exhaust_fan_speed, true));
@@ -3282,7 +3297,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                 // Orca: disable power loss recovery if it was enabled earlier
                 {
                     const auto plr_mode = print.config().enable_power_loss_recovery.value;
-                    if (m_second_layer_things_done && plr_mode == PowerLossRecoveryMode::Enable) {
+                    if (!m_config.spiral_hybrid_non_crossing && m_second_layer_things_done &&
+                        plr_mode == PowerLossRecoveryMode::Enable) {
                         file.write(m_writer.enable_power_loss_recovery(PowerLossRecoveryMode::Disable));
                     }
                 }
@@ -3346,24 +3362,45 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
             tool_ordering.cal_most_used_extruder(print.config());
 
-            if (m_config.spiral_mode && m_config.spiral_hybrid_non_crossing) {
-                // Marlin may retain these overrides and volumetric-E mode from
-                // an earlier job or a front-panel adjustment.  Normalize them
-                // after all start/purge scripts and immediately before the
-                // protected layer sequence.
-                file.write("G21 ; continuous slicing: millimetres\n");
-                file.write("G90 ; continuous slicing: absolute XYZ\n");
-                file.write("M83 ; continuous slicing: relative E\n");
-                file.write("T0 ; continuous slicing: select the certified tool\n");
-                file.write("M200 D0 ; continuous slicing: use filament-length E\n");
-                file.write("M220 S100 ; continuous slicing: reset speed override\n");
-                file.write("M221 S100 ; continuous slicing: reset flow override\n");
-                file.write("M900 K0 ; continuous slicing: disable linear advance\n");
-                file.write("M413 S0 ; continuous slicing: disable power-loss recovery\n");
-                file.write("G28 ; continuous slicing: home all axes\n");
-                file.write_format(
-                    "M109 R%d ; continuous slicing: wait for certified nozzle temperature while heating or cooling\n",
-                    m_config.nozzle_temperature_initial_layer.get_at(0));
+            if (m_config.spiral_hybrid_non_crossing) {
+                // Normalize firmware state immediately before the protected
+                // layer sequence. Klipper intentionally has no T0, M200,
+                // M900, or M413 dependency: those commands are not part of its
+                // documented standard command set.
+                if (m_config.gcode_flavor == gcfKlipper) {
+                    file.write("G90 ; continuous slicing: absolute XYZ\n");
+                    file.write("M83 ; continuous slicing: relative E\n");
+                    file.write("M220 S100 ; continuous slicing: reset speed override\n");
+                    file.write("M221 S100 ; continuous slicing: reset flow override\n");
+                    file.write("SET_PRESSURE_ADVANCE ADVANCE=0 ; continuous slicing: disable pressure advance\n");
+                    file.write("G28 ; continuous slicing: home all axes\n");
+                    const int bed_temperature = m_config.bed_temperature_formula == BedTempFormula::btfHighestTemp ?
+                        get_highest_bed_temperature(true, print) :
+                        get_bed_temperature(0, true, m_config.curr_bed_type);
+                    if (bed_temperature > 0)
+                        file.write_format(
+                            "M190 S%d ; continuous slicing: wait for certified bed temperature\n",
+                            bed_temperature);
+                    else
+                        file.write("M140 S0 ; continuous slicing: heated bed disabled\n");
+                    file.write_format(
+                        "M109 S%d ; continuous slicing: wait for certified nozzle temperature\n",
+                        m_config.nozzle_temperature_initial_layer.get_at(0));
+                } else {
+                    file.write("G21 ; continuous slicing: millimetres\n");
+                    file.write("G90 ; continuous slicing: absolute XYZ\n");
+                    file.write("M83 ; continuous slicing: relative E\n");
+                    file.write("T0 ; continuous slicing: select the certified tool\n");
+                    file.write("M200 D0 ; continuous slicing: use filament-length E\n");
+                    file.write("M220 S100 ; continuous slicing: reset speed override\n");
+                    file.write("M221 S100 ; continuous slicing: reset flow override\n");
+                    file.write("M900 K0 ; continuous slicing: disable linear advance\n");
+                    file.write("M413 S0 ; continuous slicing: disable power-loss recovery\n");
+                    file.write("G28 ; continuous slicing: home all axes\n");
+                    file.write_format(
+                        "M109 R%d ; continuous slicing: wait for certified nozzle temperature while heating or cooling\n",
+                        m_config.nozzle_temperature_initial_layer.get_at(0));
+                }
             }
 
             // Process all layers of all objects (non-sequential mode) with a parallel pipeline:
@@ -3382,7 +3419,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             }
 
             // Orca: disable power loss recovery
-            if (m_second_layer_things_done && print.config().enable_power_loss_recovery.value == PowerLossRecoveryMode::Enable) {
+            if (!m_config.spiral_hybrid_non_crossing && m_second_layer_things_done &&
+                print.config().enable_power_loss_recovery.value == PowerLossRecoveryMode::Enable) {
                 file.write(m_writer.enable_power_loss_recovery(PowerLossRecoveryMode::Disable));
             }
             if (m_wipe_tower)
@@ -3390,10 +3428,15 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                 file.write(m_wipe_tower->finalize(*this));
         }
     }
-    const bool strict_continuous_mode = m_config.spiral_mode && m_config.spiral_hybrid_non_crossing;
-    if (strict_continuous_mode &&
-        (m_continuous_fermat_section_count != m_layer_count ||
-         m_continuous_fermat_last_layer_index != m_layer_index))
+    const bool strict_continuous_mode = m_config.spiral_hybrid_non_crossing;
+    const bool complete_continuous_sections =
+        m_continuous_fermat_section_count == m_layer_count &&
+        m_continuous_fermat_last_layer_index == m_layer_index;
+    const bool omitted_single_terminal_apex =
+        m_layer_count > 0 && m_continuous_fermat_section_count + 1 == m_layer_count &&
+        (m_continuous_fermat_last_layer_index == m_layer_index ||
+         m_continuous_fermat_last_layer_index + 1 == m_layer_index);
+    if (strict_continuous_mode && !complete_continuous_sections && !omitted_single_terminal_apex)
         throw Slic3r::SlicingError(_(L("Continuous slicing did not emit exactly one protected stroke for every layer.")));
 
     if (strict_continuous_mode) {
@@ -3420,7 +3463,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
     file.write(m_writer.set_fan(0));
     //BBS: make sure the additional fan is closed when end
-    if(m_config.auxiliary_fan.value)
+    if (!strict_continuous_mode && m_config.auxiliary_fan.value)
         file.write(m_writer.set_additional_fan(0));
     if (is_bbl_printers) {
         //BBS: close spaghetti detector
@@ -3459,7 +3502,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         }
         file.writeln(this->placeholder_parser_process("machine_end_gcode", print.config().machine_end_gcode, m_writer.filament()->id(), &config));
     }
-    file.write(m_writer.update_progress(m_layer_count, m_layer_count, true)); // 100%
+    if (!strict_continuous_mode)
+        file.write(m_writer.update_progress(m_layer_count, m_layer_count, true)); // 100%
     file.write(m_writer.postamble());
 
     if (activate_chamber_temp_control && max_chamber_temp > 0)
@@ -3667,7 +3711,7 @@ void GCode::process_layers(
 
         CNumericLocalesSetter locales_setter;
 
-        if (config.fan_speedup_time.value != 0 || config.fan_kickstart.value > 0) {
+        if (!config.spiral_hybrid_non_crossing && (config.fan_speedup_time.value != 0 || config.fan_kickstart.value > 0)) {
             if (fan_mover.get() == nullptr)
                 fan_mover.reset(new Slic3r::FanMover(
                     writer,
@@ -3770,7 +3814,7 @@ void GCode::process_layers(
     const auto fan_mover = tbb::make_filter<std::string, std::string>(slic3r_tbb_filtermode::serial_in_order,
         [&fan_mover = this->m_fan_mover, &config = this->config(), &writer = this->m_writer](std::string in)->std::string {
 
-        if (config.fan_speedup_time.value != 0 || config.fan_kickstart.value > 0) {
+        if (!config.spiral_hybrid_non_crossing && (config.fan_speedup_time.value != 0 || config.fan_kickstart.value > 0)) {
             if (fan_mover.get() == nullptr)
                 fan_mover.reset(new Slic3r::FanMover(
                     writer,
@@ -4465,6 +4509,7 @@ LayerResult GCode::process_layer(
     }
 
     std::string gcode;
+    const bool strict_continuous_mode = m_config.spiral_hybrid_non_crossing;
     assert(is_decimal_separator_point()); // for the sprintfs
 
     // add tag for processor
@@ -4483,7 +4528,7 @@ LayerResult GCode::process_layer(
     m_last_height = height;
 
     // Set new layer - this will change Z and force a retraction if retract_when_changing_layer is enabled.
-    if (! m_config.before_layer_change_gcode.value.empty()) {
+    if (!strict_continuous_mode && !m_config.before_layer_change_gcode.value.empty()) {
         DynamicConfig config;
         config.set_key_value("layer_num",   new ConfigOptionInt(m_layer_index + 1));
         config.set_key_value("layer_z",     new ConfigOptionFloat(print_z));
@@ -4498,8 +4543,6 @@ LayerResult GCode::process_layer(
     bool sequence_by_layer = print_sequence == PrintSequence::ByLayer;
     bool is_i3_printer = printer_structure == PrinterStructure::psI3;
     bool is_multi_extruder = m_config.nozzle_diameter.size() > 1;
-    const bool strict_continuous_mode = m_config.spiral_mode && m_config.spiral_hybrid_non_crossing;
-
     bool need_insert_timelapse_gcode_for_traditional = false;
     if (!strict_continuous_mode && (!m_wipe_tower || !m_wipe_tower->enable_timelapse_print()) &&
         (is_BBL_Printer() || !m_config.time_lapse_gcode.value.empty())) {
@@ -4520,7 +4563,7 @@ LayerResult GCode::process_layer(
     m_layer = &layer;
     m_object_layer_over_raft = false;
 
-    if (!m_config.time_lapse_gcode.value.empty() && !is_BBL_Printer()) {
+    if (!strict_continuous_mode && !m_config.time_lapse_gcode.value.empty() && !is_BBL_Printer()) {
         DynamicConfig config;
         config.set_key_value("layer_num", new ConfigOptionInt(m_layer_index));
         config.set_key_value("layer_z", new ConfigOptionFloat(print_z));
@@ -4530,7 +4573,7 @@ LayerResult GCode::process_layer(
              + "\n";
     }
 
-    if (!m_config.layer_change_gcode.value.empty()) {
+    if (!strict_continuous_mode && !m_config.layer_change_gcode.value.empty()) {
         DynamicConfig config;
         config.set_key_value("most_used_physical_extruder_id", new ConfigOptionInt(m_config.physical_extruder_map.get_at(most_used_extruder)));
         config.set_key_value("layer_num", new ConfigOptionInt(m_layer_index));
@@ -4616,7 +4659,7 @@ LayerResult GCode::process_layer(
     }
 
     //BBS
-    if (first_layer) {
+    if (first_layer && !strict_continuous_mode) {
         // Orca: we don't need to optimize the Klipper as only set once
         if (m_config.default_acceleration.value > 0 && m_config.initial_layer_acceleration.value > 0) {
             gcode += m_writer.set_print_acceleration((unsigned int)floor(m_config.initial_layer_acceleration.value + 0.5));
@@ -4649,24 +4692,26 @@ LayerResult GCode::process_layer(
         }
       // Reset acceleration at sencond layer
       // Orca: only set once, don't need to call set_accel_and_jerk
-      if (m_config.default_acceleration.value > 0 && m_config.initial_layer_acceleration.value > 0) {
+      if (!strict_continuous_mode && m_config.default_acceleration.value > 0 && m_config.initial_layer_acceleration.value > 0) {
         gcode += m_writer.set_print_acceleration((unsigned int) floor(m_config.default_acceleration.value + 0.5));
       }
 
-      if (m_config.default_jerk.value > 0 && m_config.initial_layer_jerk.value > 0) {
+      if (!strict_continuous_mode && m_config.default_jerk.value > 0 && m_config.initial_layer_jerk.value > 0) {
         gcode += m_writer.set_jerk_xy(m_config.default_jerk.value);
       }
 
         // Transition from 1st to 2nd layer. Adjust nozzle temperatures as prescribed by the nozzle dependent
         // nozzle_temperature_initial_layer vs. temperature settings.
-        for (const Extruder& extruder : m_writer.extruders()) {
-            if ((print.config().single_extruder_multi_material.value || m_ooze_prevention.enable) &&
-                extruder.id() != m_writer.filament()->id())
-                // In single extruder multi material mode, set the temperature for the current extruder only.
-                continue;
-            int temperature = print.config().nozzle_temperature.get_at(extruder.id());
-            if (temperature > 0 && temperature != print.config().nozzle_temperature_initial_layer.get_at(extruder.id()))
-                gcode += m_writer.set_temperature(temperature, false, extruder.id());
+        if (!strict_continuous_mode) {
+            for (const Extruder& extruder : m_writer.extruders()) {
+                if ((print.config().single_extruder_multi_material.value || m_ooze_prevention.enable) &&
+                    extruder.id() != m_writer.filament()->id())
+                    // In single extruder multi material mode, set the temperature for the current extruder only.
+                    continue;
+                int temperature = print.config().nozzle_temperature.get_at(extruder.id());
+                if (temperature > 0 && temperature != print.config().nozzle_temperature_initial_layer.get_at(extruder.id()))
+                    gcode += m_writer.set_temperature(temperature, false, extruder.id());
+            }
         }
 
         // BBS
@@ -5098,7 +5143,7 @@ LayerResult GCode::process_layer(
                     }
                 }
 
-                if (print.config().enable_wrapping_detection && !has_insert_wrapping_detection_gcode) {
+                if (!strict_continuous_mode && print.config().enable_wrapping_detection && !has_insert_wrapping_detection_gcode) {
                     gcode += this->retract(false, false, auto_lift_type, true);
                     gcode += insert_wrapping_detection_gcode();
                     has_insert_wrapping_detection_gcode = true;
@@ -5119,7 +5164,7 @@ LayerResult GCode::process_layer(
                 has_insert_timelapse_gcode = true;
             }
 
-            if (print.config().enable_wrapping_detection && !has_insert_wrapping_detection_gcode) {
+            if (!strict_continuous_mode && print.config().enable_wrapping_detection && !has_insert_wrapping_detection_gcode) {
                 gcode += this->retract(false, false, auto_lift_type, true);
                 gcode += insert_wrapping_detection_gcode();
                 has_insert_wrapping_detection_gcode = true;
@@ -5429,7 +5474,7 @@ void GCode::apply_print_config(const PrintConfig &print_config)
     m_writer.apply_print_config(print_config);
     m_config.apply(print_config);
     m_scaled_resolution = scaled<double>(print_config.resolution.value);
-    m_enable_exclude_object = m_config.exclude_object;
+    m_enable_exclude_object = m_config.exclude_object && !m_config.spiral_hybrid_non_crossing;
 
 #if ORCA_CHECK_GCODE_PLACEHOLDERS
     // If the gcode value is empty, set a value so that the check code within the parser is run
@@ -5572,13 +5617,17 @@ std::string GCode::preamble()
 std::string GCode::change_layer(coordf_t print_z)
 {
     std::string gcode;
-    const bool strict_continuous_mode = m_config.spiral_mode && m_config.spiral_hybrid_non_crossing;
+    const bool strict_continuous_mode = m_config.spiral_hybrid_non_crossing;
     if (strict_continuous_mode && m_layer_index >= 0 &&
         m_continuous_fermat_last_layer_index != m_layer_index)
         throw Slic3r::SlicingError(_(L("Continuous slicing reached a layer change without exactly one protected stroke.")));
-    if (m_layer_count > 0)
-        // Increment a progress bar indicator.
-        gcode += m_writer.update_progress(++ m_layer_index, m_layer_count);
+    if (m_layer_count > 0) {
+        ++m_layer_index;
+        // Klipper does not document M73. Strict continuous output keeps the
+        // protected command set firmware-independent by omitting progress G-code.
+        if (!strict_continuous_mode)
+            gcode += m_writer.update_progress(m_layer_index, m_layer_count);
+    }
     //BBS
     coordf_t z = print_z + m_config.z_offset.value;  // in unscaled coordinates
     const double tool_height = m_config.extruder_printable_height.get_at(0);
@@ -6232,16 +6281,43 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 {
     std::string gcode;
     const bool continuous_fermat = path.is_continuous_fermat();
-    const bool strict_continuous_mode = m_config.spiral_mode && m_config.spiral_hybrid_non_crossing;
+    const bool strict_continuous_mode = m_config.spiral_hybrid_non_crossing;
+    const auto continuous_fermat_warning_comment = [&path]() {
+        if (path.continuous_fermat_validation_warning.empty())
+            return std::string();
+        std::string warning = path.continuous_fermat_validation_warning;
+        std::replace(warning.begin(), warning.end(), '\r', ' ');
+        std::replace(warning.begin(), warning.end(), '\n', ' ');
+        return std::string(";_CONTINUOUS_FERMAT_VALIDATION_WARNING ") + warning + '\n';
+    };
     const ExtrusionPathSloped *sloped = dynamic_cast<const ExtrusionPathSloped *>(&path);
     double continuous_fermat_target_volume = 0.0;
+    double continuous_min_material_ratio = 0.980;
+    const double continuous_nozzle_diameter = m_config.nozzle_diameter.get_at(0);
+    const double continuous_rounded_corner_loss = double(path.height) * (1.0 - 0.25 * PI);
+    const double continuous_nominal_cross_section = double(path.width) - continuous_rounded_corner_loss;
+    const double configured_continuous_max_width = m_config.continuous_max_line_width.get_abs_value(
+        continuous_nozzle_diameter);
+    const double continuous_max_physical_width = std::min(
+        2.0 * continuous_nozzle_diameter,
+        configured_continuous_max_width);
+    const double continuous_max_multiplier = continuous_nominal_cross_section > 0.0 ?
+        (continuous_max_physical_width - continuous_rounded_corner_loss) / continuous_nominal_cross_section : 0.0;
+    const double continuous_min_physical_width = std::max(
+        0.05 * continuous_nozzle_diameter,
+        continuous_rounded_corner_loss + 0.001);
+    const double continuous_min_multiplier = continuous_nominal_cross_section > 0.0 ?
+        (continuous_min_physical_width - continuous_rounded_corner_loss) / continuous_nominal_cross_section : 1.0;
     const bool has_continuous_fermat_extrusion_multipliers =
         continuous_fermat &&
         path.continuous_fermat_extrusion_multipliers.size() + 1 == path.polyline.points.size() &&
         std::all_of(
             path.continuous_fermat_extrusion_multipliers.begin(),
             path.continuous_fermat_extrusion_multipliers.end(),
-            [](const float multiplier) { return std::isfinite(multiplier) && multiplier >= 0.60f && multiplier <= 1.60f; });
+            [continuous_min_multiplier, continuous_max_multiplier](const float multiplier) {
+                return std::isfinite(multiplier) && multiplier + 1e-6 >= continuous_min_multiplier &&
+                       multiplier <= continuous_max_multiplier + 1e-6;
+            });
 
     // Keep a bidirectional emitter boundary: a strict job may emit only tagged
     // paths, while a stale tagged cache entry may never leak into a normal job.
@@ -6297,18 +6373,20 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         if (!diff_pl(Polylines { Polyline(serialized_points) }, printable_polygons).empty())
             throw Slic3r::SlicingError(_(L("Continuous slicing transformed a protected segment outside the printable machine polygon.")));
 
-        const double rounded_corner_loss = double(path.height) * (1.0 - 0.25 * PI);
-        const double nominal_cross_section = double(path.width) - rounded_corner_loss;
-        const double nozzle_diameter = m_config.nozzle_diameter.get_at(0);
+        const double rounded_corner_loss = continuous_rounded_corner_loss;
+        const double nominal_cross_section = continuous_nominal_cross_section;
+        const double nozzle_diameter = continuous_nozzle_diameter;
         if (!std::isfinite(rounded_corner_loss) || !std::isfinite(nominal_cross_section) || nominal_cross_section <= 0.0 ||
-            !std::isfinite(nozzle_diameter) || nozzle_diameter <= 0.0 || double(path.width) > 2.0 * nozzle_diameter + EPSILON)
+            !std::isfinite(nozzle_diameter) || nozzle_diameter <= 0.0 ||
+            !std::isfinite(continuous_max_physical_width) || continuous_max_physical_width <= 0.0 ||
+            double(path.width) > continuous_max_physical_width + EPSILON)
             throw Slic3r::SlicingError(_(L("Continuous slicing cannot reconstruct its physical bead width at the emitter.")));
         Polygons swept_beads;
         for (size_t i = 1; i < serialized_points.size(); ++i) {
             const double physical_width = rounded_corner_loss + nominal_cross_section *
                 double(path.continuous_fermat_extrusion_multipliers[i - 1]);
-            if (!std::isfinite(physical_width) || physical_width < 0.85 * nozzle_diameter - EPSILON ||
-                physical_width > 2.0 * nozzle_diameter + EPSILON)
+            if (!std::isfinite(physical_width) || physical_width < continuous_min_physical_width - EPSILON ||
+                physical_width > continuous_max_physical_width + EPSILON)
                 throw Slic3r::SlicingError(_(L("Continuous slicing has an invalid physical bead width at the emitter.")));
             Polygons bead = offset(
                 Polylines { Polyline(Points { serialized_points[i - 1], serialized_points[i] }) },
@@ -6341,9 +6419,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             throw Slic3r::SlicingError(_(L("Continuous slicing has no finite positive target material volume at the emitter.")));
     }
     if (m_continuous_fermat_started &&
-        (!m_last_pos_defined || m_last_pos != m_continuous_fermat_endpoint ||
-         path.first_point() != m_continuous_fermat_endpoint))
-        throw Slic3r::SlicingError(_(L("Continuous slicing generated an XY travel between layer strokes.")));
+        (!m_last_pos_defined || m_last_pos != m_continuous_fermat_endpoint))
+        throw Slic3r::SlicingError(_(L("Continuous slicing lost its previous protected endpoint.")));
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -6363,15 +6440,24 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     // Add m_need_change_layer_lift_z when change_layer in case of no lift if m_last_pos is equal to path.first_point() by chance
     if (!m_last_pos_defined || m_last_pos != path.first_point() || m_need_change_layer_lift_z || slope_need_z_travel) {
         if (continuous_fermat) {
-            if (m_continuous_fermat_started)
-                throw Slic3r::SlicingError(_(L("Continuous slicing attempted an unexpected approach move between protected strokes.")));
-            // There is no prior model extrusion to retract before the first
-            // stroke. Keep the already validated layer Z and approach directly
-            // in XY so profile wipe/lift settings cannot create an unchecked
-            // pre-section Z excursion.
+            const char *approach_comment = m_continuous_fermat_started ?
+                "continuous slicing inter-layer approach" :
+                "continuous slicing first-stroke approach";
+            if (m_continuous_fermat_started) {
+                Polygon printable_polygon = Polygon::new_scale(m_config.printable_area.values);
+                printable_polygon.make_counter_clockwise();
+                const Points serialized_travel {
+                    Point::new_scale(this->point_to_serialized_gcode_quantized(m_last_pos)),
+                    Point::new_scale(this->point_to_serialized_gcode_quantized(path.first_point())),
+                };
+                if (!diff_pl(Polylines { Polyline(serialized_travel) }, Polygons { printable_polygon }).empty())
+                    throw Slic3r::SlicingError(_(L("Continuous slicing inter-layer travel leaves the printable machine polygon.")));
+            }
+            // Keep the already validated layer Z and approach directly in XY
+            // without profile retract, wipe, or hop mutations.
             gcode += m_writer.travel_to_xy(
                 this->point_to_gcode(path.first_point()),
-                "continuous slicing first-stroke approach");
+                approach_comment);
             this->set_last_pos(path.first_point());
             m_need_change_layer_lift_z = false;
         } else {
@@ -6448,7 +6534,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     }
 
     if (m_writer.get_gcode_flavor() == gcfKlipper) {
-        gcode += m_writer.set_accel_and_jerk(acceleration_i, jerk);
+        if (continuous_fermat) {
+            // M204 S is in Klipper's documented standard command set. Avoid
+            // Orca's legacy ACCEL_TO_DECEL parameter in protected output.
+            if (acceleration_i > 0)
+                gcode += "M204 S" + std::to_string(acceleration_i) + " ; continuous slicing: set acceleration\n";
+        } else {
+            gcode += m_writer.set_accel_and_jerk(acceleration_i, jerk);
+        }
 
     } else {
         gcode += m_writer.set_print_acceleration(acceleration_i);
@@ -6550,7 +6643,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     }
     //BBS: if not set the speed, then use the filament_max_volumetric_speed directly
     double filament_max_volumetric_speed = FILAMENT_CONFIG(filament_max_volumetric_speed);
-    if (FILAMENT_CONFIG(filament_adaptive_volumetric_speed)){
+    if (!continuous_fermat && FILAMENT_CONFIG(filament_adaptive_volumetric_speed)){
         double fitted_value = calc_max_volumetric_speed(path.height, path.width, FILAMENT_CONFIG(volumetric_speed_coefficients));
         filament_max_volumetric_speed = std::min(filament_max_volumetric_speed, fitted_value);
     }
@@ -6718,7 +6811,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                        m_curr_print->calib_mode() == CalibMode::Calib_PA_Tower; 
     bool evaluate_adaptive_pa = false;
     bool role_change = (m_last_extrusion_role != path.role());
-    if (!is_pa_calib && FILAMENT_CONFIG(adaptive_pressure_advance) && FILAMENT_CONFIG(enable_pressure_advance)) {
+    if (!continuous_fermat && !is_pa_calib && FILAMENT_CONFIG(adaptive_pressure_advance) && FILAMENT_CONFIG(enable_pressure_advance)) {
         evaluate_adaptive_pa = true;
         // If we have already emmited a PA change because the m_multi_flow_segment_path_pa_set is set
         // skip re-issuing the PA change tag.
@@ -6736,7 +6829,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     // Orca: End of dynamic PA trigger flag segment
     
     //Orca: process custom gcode for extrusion role change
-    if (path.role() != m_last_extrusion_role && !m_config.change_extrusion_role_gcode.value.empty()) {
+    if (!continuous_fermat && path.role() != m_last_extrusion_role && !m_config.change_extrusion_role_gcode.value.empty()) {
             DynamicConfig config;
             config.set_key_value("extrusion_role", new ConfigOptionString(extrusion_role_to_string_for_parser(path.role())));
             config.set_key_value("last_extrusion_role", new ConfigOptionString(extrusion_role_to_string_for_parser(m_last_extrusion_role)));
@@ -6947,11 +7040,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             // ORCA: End of adaptive PA code segment
         }
         
-        const auto continuous_fermat_segment_multiplier = [&path, has_continuous_fermat_extrusion_multipliers](const size_t segment_index) {
+        const auto continuous_fermat_segment_multiplier = [
+            &path,
+            has_continuous_fermat_extrusion_multipliers,
+            continuous_min_multiplier,
+            continuous_max_multiplier](const size_t segment_index) {
             if (!has_continuous_fermat_extrusion_multipliers ||
                 segment_index >= path.continuous_fermat_extrusion_multipliers.size())
                 return 1.0;
-            return std::clamp(double(path.continuous_fermat_extrusion_multipliers[segment_index]), 0.60, 1.60);
+            return std::clamp(
+                double(path.continuous_fermat_extrusion_multipliers[segment_index]),
+                continuous_min_multiplier,
+                continuous_max_multiplier);
         };
 
         double last_set_F = -1.0;
@@ -6974,8 +7074,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
                 apply_role_based_fan_speed();
             }
-            if (continuous_fermat)
+            if (continuous_fermat) {
+                gcode += continuous_fermat_warning_comment();
                 gcode += ";_CONTINUOUS_FERMAT_BEGIN\n";
+            }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
             const bool classic_spiral_mode = m_config.spiral_mode && !m_config.spiral_hybrid_non_crossing;
@@ -7127,8 +7229,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             total_length = l.length() * SCALING_FACTOR;
         }
         gcode += m_writer.set_speed(last_set_speed, "", comment);
-        if (continuous_fermat)
+        if (continuous_fermat) {
+            gcode += continuous_fermat_warning_comment();
             gcode += ";_CONTINUOUS_FERMAT_BEGIN\n";
+        }
         Vec2d prev = this->point_to_gcode_quantized(new_points[0].p);
         bool pre_fan_enabled = false;
         bool cur_fan_enabled = false;
@@ -7242,9 +7346,22 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     if (continuous_fermat) {
         const double serialized_material_ratio =
             continuous_fermat_serialized_volume / continuous_fermat_target_volume;
-        if (!std::isfinite(serialized_material_ratio) || serialized_material_ratio < 0.980 - 1e-9 ||
-            serialized_material_ratio > 1.020 + 1e-9)
-            throw Slic3r::SlicingError(_(L("Continuous slicing serialized material falls outside the mandatory 0.980 through 1.020 layer ratio.")));
+        if (!std::isfinite(serialized_material_ratio))
+            throw Slic3r::SlicingError(_(L("Continuous slicing produced a non-finite serialized material ratio.")));
+        if (serialized_material_ratio < continuous_min_material_ratio - 1e-9 ||
+            serialized_material_ratio > 1.020 + 1e-9) {
+            gcode += Slic3r::format(
+                ";_CONTINUOUS_FERMAT_VALIDATION_WARNING serialized_material_ratio=%.9f expected=[%.9f,1.020000000]\n",
+                serialized_material_ratio,
+                continuous_min_material_ratio);
+            if (m_curr_print != nullptr)
+                m_curr_print->active_step_add_warning(
+                    PrintStateBase::WarningLevel::CRITICAL,
+                    _(L("Continuous slicing generated one or more layers outside its geometric quality targets. "
+                        "The G-code remains available; inspect its _CONTINUOUS_FERMAT_VALIDATION_WARNING comments "
+                        "and the preview before deciding whether to use it.")),
+                    PrintStateBase::SlicingContinuousFermatValidation);
+        }
         gcode += ";_CONTINUOUS_FERMAT_END\n";
     }
     if (m_enable_cooling_markers) {

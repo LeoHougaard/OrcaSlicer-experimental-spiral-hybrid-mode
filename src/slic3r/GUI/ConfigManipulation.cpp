@@ -321,10 +321,115 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         config->option<ConfigOptionBool>("spiral_hybrid_non_crossing") != nullptr &&
         config->option<ConfigOptionBool>("spiral_hybrid_non_crossing")->value;
 
-    if (spiral_hybrid_non_crossing && !config->opt_bool("spiral_mode")) {
+    if (spiral_hybrid_non_crossing) {
         DynamicPrintConfig new_conf = *config;
-        new_conf.set_key_value("spiral_mode", new ConfigOptionBool(true));
-        apply(config, &new_conf);
+        wxString changed_settings;
+        const auto note_change = [&changed_settings](const wxString &label) {
+            changed_settings += "\n  - " + label;
+        };
+        const auto set_bool = [&new_conf, &note_change](const char *key, bool value, const wxString &label) {
+            if (auto *option = new_conf.option<ConfigOptionBool>(key); option != nullptr && option->value != value) {
+                new_conf.set_key_value(key, new ConfigOptionBool(value));
+                note_change(label);
+            }
+        };
+        const auto set_int = [&new_conf, &note_change](const char *key, int value, const wxString &label) {
+            if (auto *option = new_conf.option<ConfigOptionInt>(key); option != nullptr && option->value != value) {
+                new_conf.set_key_value(key, new ConfigOptionInt(value));
+                note_change(label);
+            }
+        };
+        const auto set_float = [&new_conf, &note_change](const char *key, double value, const wxString &label) {
+            if (auto *option = new_conf.option<ConfigOptionFloat>(key); option != nullptr && std::abs(option->value - value) > EPSILON) {
+                new_conf.set_key_value(key, new ConfigOptionFloat(value));
+                note_change(label);
+            }
+        };
+        const auto copy_float_or_percent = [&new_conf, &note_change](
+                                               const char *target_key,
+                                               const char *source_key,
+                                               const wxString &label) {
+            const auto *target = new_conf.option<ConfigOptionFloatOrPercent>(target_key);
+            const auto *source = new_conf.option<ConfigOptionFloatOrPercent>(source_key);
+            if (target != nullptr && source != nullptr && target->serialize() != source->serialize()) {
+                new_conf.set_key_value(target_key, source->clone());
+                note_change(label);
+            }
+        };
+
+        set_bool("spiral_mode", false, _L("Spiral vase"));
+        copy_float_or_percent(
+            "initial_layer_line_width",
+            "outer_wall_line_width",
+            _L("First-layer line width: match outer wall"));
+        if (const auto *layer_height = new_conf.option<ConfigOptionFloat>("layer_height"); layer_height != nullptr)
+            set_float("initial_layer_print_height", layer_height->value, _L("First-layer height: match layer height"));
+        set_float("elefant_foot_compensation", 0.0, _L("Elephant-foot compensation"));
+        if (auto *option = new_conf.option<ConfigOptionEnum<PrintSequence>>("print_sequence");
+            option != nullptr && option->value != PrintSequence::ByLayer) {
+            new_conf.set_key_value("print_sequence", new ConfigOptionEnum<PrintSequence>(PrintSequence::ByLayer));
+            note_change(_L("Print sequence: By layer"));
+        }
+        set_bool("enable_support", false, _L("Support"));
+        set_int("enforce_support_layers", 0, _L("Enforced support layers"));
+        set_int("raft_layers", 0, _L("Raft"));
+        set_int("skirt_loops", 0, _L("Skirt"));
+        set_int("skirt_height", 0, _L("Skirt height"));
+        if (auto *option = new_conf.option<ConfigOptionEnum<DraftShield>>("draft_shield");
+            option != nullptr && option->value != DraftShield::dsDisabled) {
+            new_conf.set_key_value("draft_shield", new ConfigOptionEnum<DraftShield>(DraftShield::dsDisabled));
+            note_change(_L("Draft shield"));
+        }
+        if (auto *option = new_conf.option<ConfigOptionEnum<BrimType>>("brim_type");
+            option != nullptr && option->value != BrimType::btNoBrim) {
+            new_conf.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(BrimType::btNoBrim));
+            note_change(_L("Brim"));
+        }
+        set_float("brim_width", 0.0, _L("Brim width"));
+        set_bool("enable_prime_tower", false, _L("Prime tower"));
+        set_bool("exclude_object", false, _L("Object cancellation"));
+        if (auto *option = new_conf.option<ConfigOptionEnum<PowerLossRecoveryMode>>("enable_power_loss_recovery");
+            option != nullptr && option->value != PowerLossRecoveryMode::Disable) {
+            new_conf.set_key_value(
+                "enable_power_loss_recovery",
+                new ConfigOptionEnum<PowerLossRecoveryMode>(PowerLossRecoveryMode::Disable));
+            note_change(_L("Power-loss recovery"));
+        }
+        set_float("max_volumetric_extrusion_rate_slope", 0.0, _L("Pressure equalization"));
+        set_bool("emit_machine_limits_to_gcode", false, _L("Machine-limit G-code"));
+        set_bool("gcode_add_line_number", false, _L("G-code line numbering"));
+        if (auto *option = new_conf.option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
+            option != nullptr && option->value != TimelapseType::tlTraditional) {
+            new_conf.set_key_value("timelapse_type", new ConfigOptionEnum<TimelapseType>(TimelapseType::tlTraditional));
+            note_change(_L("Timelapse: Traditional"));
+        }
+        set_bool("scan_first_layer", false, _L("First-layer scanning"));
+        set_bool("enable_wrapping_detection", false, _L("Clumping detection"));
+        if (auto *option = new_conf.option<ConfigOptionEnum<IroningType>>("ironing_type");
+            option != nullptr && option->value != IroningType::NoIroning) {
+            new_conf.set_key_value("ironing_type", new ConfigOptionEnum<IroningType>(IroningType::NoIroning));
+            note_change(_L("Ironing"));
+        }
+        set_float("fan_speedup_time", 0.0, _L("Fan speedup"));
+        set_float("fan_kickstart", 0.0, _L("Fan kick-start"));
+        set_bool("auxiliary_fan", false, _L("Auxiliary fan"));
+
+        if (auto *option = new_conf.option<ConfigOptionStrings>("post_process");
+            option != nullptr && !option->values.empty()) {
+            new_conf.set_key_value("post_process", new ConfigOptionStrings());
+            note_change(_L("Post-processing scripts"));
+        }
+
+        if (!changed_settings.empty()) {
+            const wxString message =
+                _L("Continuous slicing automatically disabled incompatible features:") + changed_settings +
+                "\n\n" + _L("The filament flow ratio is preserved as material calibration.");
+            is_msg_dlg_already_exist = true;
+            apply(config, &new_conf);
+            MessageDialog dialog(m_msg_dlg_parent, message, _L("Continuous slicing settings"), wxICON_WARNING | wxOK);
+            dialog.ShowModal();
+            is_msg_dlg_already_exist = false;
+        }
     }
 
     if (!is_plate_config &&
