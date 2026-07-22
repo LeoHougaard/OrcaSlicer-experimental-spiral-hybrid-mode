@@ -102,6 +102,8 @@ set(lisbslic3r_sources
     Config.hpp
     ContinuousFermat.cpp
     ContinuousFermat.hpp
+    ContinuousFermatSeam.cpp
+    ContinuousFermatSeam.hpp
     CustomGCode.cpp
     CustomGCode.hpp
     CutUtils.cpp

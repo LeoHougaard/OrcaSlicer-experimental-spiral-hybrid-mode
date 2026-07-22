@@ -1,4 +1,5 @@
 #include "ContinuousFermat.hpp"
+#include "ContinuousFermatSeam.hpp"
 
 #include "ClipperUtils.hpp"
 #include "Exception.hpp"
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -643,14 +645,20 @@ std::vector<ContourLoop> filter_ring_medial_overlap(const std::vector<ContourLoo
     std::vector<ContourLoop> stable;
 
     for (const auto &[level, loops] : grouped) {
-        if (loops.size() == 2) {
-            const ContourLoop *a = &loops[0];
-            const ContourLoop *b = &loops[1];
-            if (a->area < b->area)
-                std::swap(a, b);
-            if (sampled_loop_gap(*a, *b) < spacing * 0.98)
-                break;
-        }
+        // Once the two wavefronts of a one-hole ring meet, polygon offset may
+        // split the residual medial band into several corner islands. Those
+        // are not additional topological branches to route; retaining them
+        // turns a simple cut-open strip back into a branch-search problem.
+        // Stop at the last two-loop level and let the dedicated residual-band
+        // pass below represent the remaining material.
+        if (loops.size() != 2)
+            break;
+        const ContourLoop *a = &loops[0];
+        const ContourLoop *b = &loops[1];
+        if (a->area < b->area)
+            std::swap(a, b);
+        if (sampled_loop_gap(*a, *b) < spacing * 0.98)
+            break;
         stable.insert(stable.end(), loops.begin(), loops.end());
     }
 
@@ -1672,7 +1680,11 @@ Points replace_long_connectors_with_contour_arcs(
     return path;
 }
 
-Points complete_outer_boundary_cycle(const Points &path, const ContourLoop &outer_loop, const double spacing)
+Points complete_outer_boundary_cycle(
+    const Points &path,
+    const ContourLoop &outer_loop,
+    const double spacing,
+    const bool prefer_shortest_arc = false)
 {
     if (path.size() < 2 || outer_loop.points.size() < 4)
         return path;
@@ -1717,7 +1729,9 @@ Points complete_outer_boundary_cycle(const Points &path, const ContourLoop &oute
     if (candidates.empty())
         return path;
 
-    auto better = [](const Candidate &a, const Candidate &b) {
+    auto better = [prefer_shortest_arc](const Candidate &a, const Candidate &b) {
+        if (prefer_shortest_arc && std::abs(a.arc_length - b.arc_length) > EPS)
+            return a.arc_length < b.arc_length;
         if (a.metrics.crossings != b.metrics.crossings)
             return a.metrics.crossings < b.metrics.crossings;
         if (a.metrics.close_pairs != b.metrics.close_pairs)
@@ -1918,7 +1932,7 @@ Points uncross_closed_tour(
     double spacing);
 int count_turnback_violations(const Points &path, double line_width, std::string *first_detail);
 
-Points build_branch_connected_fermat(
+Points build_legacy_branch_connected_fermat(
     const std::vector<ContourLoop> &contours,
     const ExPolygons &printable_area,
     const Point &start_anchor,
@@ -2084,6 +2098,283 @@ Points build_branch_connected_fermat(
     }
 
     return parent_path;
+}
+
+struct ContourTreeTour
+{
+    Points points;
+    // The owner of each edge in points. Connectors have no owner so later
+    // children may only replace an edge that still belongs to their actual
+    // parent contour.
+    std::vector<size_t> edge_owners;
+};
+
+static constexpr size_t NO_CONTOUR_OWNER = std::numeric_limits<size_t>::max();
+
+ContourTreeTour contour_cycle(const ContourLoop &loop, const size_t owner)
+{
+    ContourTreeTour tour;
+    if (!loop.closed || loop.points.size() < 3)
+        return tour;
+
+    tour.points = loop.points;
+    append_point(tour.points, loop.points.front());
+    tour.edge_owners.assign(tour.points.size() - 1, owner);
+    return tour;
+}
+
+bool connector_crosses_tour(
+    const Point &a,
+    const Point &b,
+    const ContourTreeTour &tour,
+    const size_t removed_edge)
+{
+    for (size_t edge = 0; edge < tour.edge_owners.size(); ++edge) {
+        if (edge == removed_edge)
+            continue;
+        const Point &c = tour.points[edge];
+        const Point &d = tour.points[edge + 1];
+        // The connector is expected to meet the two retained edges incident
+        // to its port. Any other touch or intersection is a real crossing.
+        if (a == c || a == d || b == c || b == d)
+            continue;
+        if (segments_intersect(a, b, c, d))
+            return true;
+    }
+    return false;
+}
+
+struct ContourSplice
+{
+    size_t parent_edge { 0 };
+    size_t child_edge { 0 };
+    bool cross_pairing { false };
+    double score { std::numeric_limits<double>::infinity() };
+};
+
+ContourTreeTour apply_contour_splice(
+    const ContourTreeTour &parent,
+    const ContourTreeTour &child,
+    const ContourSplice &splice)
+{
+    ContourTreeTour merged;
+    const size_t parent_edges = parent.edge_owners.size();
+    const size_t child_edges = child.edge_owners.size();
+    if (parent.points.size() != parent_edges + 1 || child.points.size() != child_edges + 1 ||
+        splice.parent_edge >= parent_edges || splice.child_edge >= child_edges)
+        return merged;
+
+    merged.points.reserve(parent.points.size() + child.points.size() + 2);
+    merged.edge_owners.reserve(parent_edges + child_edges + 2);
+    const auto start = [&](const Point &point) { merged.points.emplace_back(point); };
+    const auto append_edge = [&](const Point &point, const size_t owner) {
+        if (merged.points.empty()) {
+            merged.points.emplace_back(point);
+            return;
+        }
+        if (merged.points.back() == point)
+            return;
+        merged.points.emplace_back(point);
+        merged.edge_owners.emplace_back(owner);
+    };
+
+    start(parent.points.front());
+    for (size_t edge = 0; edge < splice.parent_edge; ++edge)
+        append_edge(parent.points[edge + 1], parent.edge_owners[edge]);
+
+    const size_t child_next = (splice.child_edge + 1) % child_edges;
+    size_t child_vertex = splice.cross_pairing ? child_next : splice.child_edge;
+    const size_t child_stop = splice.cross_pairing ? splice.child_edge : child_next;
+    append_edge(child.points[child_vertex], NO_CONTOUR_OWNER);
+
+    while (child_vertex != child_stop) {
+        if (splice.cross_pairing) {
+            const size_t edge = child_vertex;
+            child_vertex = (child_vertex + 1) % child_edges;
+            append_edge(child.points[child_vertex], child.edge_owners[edge]);
+        } else {
+            child_vertex = (child_vertex + child_edges - 1) % child_edges;
+            append_edge(child.points[child_vertex], child.edge_owners[child_vertex]);
+        }
+    }
+
+    append_edge(parent.points[splice.parent_edge + 1], NO_CONTOUR_OWNER);
+    for (size_t edge = splice.parent_edge + 1; edge < parent_edges; ++edge)
+        append_edge(parent.points[edge + 1], parent.edge_owners[edge]);
+
+    if (merged.points.size() != merged.edge_owners.size() + 1 || merged.points.front() != merged.points.back())
+        return {};
+    return merged;
+}
+
+ContourTreeTour splice_contour_tours(
+    const ContourTreeTour &parent,
+    const size_t parent_owner,
+    const ContourTreeTour &child,
+    const size_t child_owner,
+    const ExPolygon &printable_area,
+    const double spacing)
+{
+    if (parent.points.size() < 4 || child.points.size() < 4)
+        return {};
+
+    // Geometry at adjacent offset levels is about one spacing apart. Keep a
+    // small deterministic shortlist before doing line containment and route
+    // intersection checks; this avoids an expensive full-path audit for every
+    // pair of densely sampled contour edges.
+    std::vector<ContourSplice> candidates;
+    const auto retain = [&](ContourSplice candidate) {
+        candidates.emplace_back(candidate);
+        std::sort(candidates.begin(), candidates.end(), [](const ContourSplice &a, const ContourSplice &b) {
+            return std::tie(a.score, a.parent_edge, a.child_edge, a.cross_pairing) <
+                   std::tie(b.score, b.parent_edge, b.child_edge, b.cross_pairing);
+        });
+        if (candidates.size() > 48)
+            candidates.pop_back();
+    };
+
+    for (size_t parent_edge = 0; parent_edge < parent.edge_owners.size(); ++parent_edge) {
+        if (parent.edge_owners[parent_edge] != parent_owner)
+            continue;
+        const Point &p0 = parent.points[parent_edge];
+        const Point &p1 = parent.points[parent_edge + 1];
+        for (size_t child_edge = 0; child_edge < child.edge_owners.size(); ++child_edge) {
+            if (child.edge_owners[child_edge] != child_owner)
+                continue;
+            const Point &c0 = child.points[child_edge];
+            const Point &c1 = child.points[child_edge + 1];
+            const double same_a = point_distance(p0, c0);
+            const double same_b = point_distance(p1, c1);
+            const double cross_a = point_distance(p0, c1);
+            const double cross_b = point_distance(p1, c0);
+            if (std::max(same_a, same_b) <= spacing * 6.0)
+                retain({ parent_edge, child_edge, false, same_a + same_b });
+            if (std::max(cross_a, cross_b) <= spacing * 6.0)
+                retain({ parent_edge, child_edge, true, cross_a + cross_b });
+        }
+    }
+
+    for (const ContourSplice &candidate : candidates) {
+        const Point &p0 = parent.points[candidate.parent_edge];
+        const Point &p1 = parent.points[candidate.parent_edge + 1];
+        const Point &c0 = child.points[candidate.child_edge];
+        const Point &c1 = child.points[candidate.child_edge + 1];
+        const Point &first_child = candidate.cross_pairing ? c1 : c0;
+        const Point &last_child = candidate.cross_pairing ? c0 : c1;
+
+        if (!printable_area.contains(Line(p0, first_child)) ||
+            !printable_area.contains(Line(last_child, p1)) ||
+            segments_intersect(p0, first_child, last_child, p1) ||
+            connector_crosses_tour(p0, first_child, parent, candidate.parent_edge) ||
+            connector_crosses_tour(last_child, p1, parent, candidate.parent_edge) ||
+            connector_crosses_tour(p0, first_child, child, candidate.child_edge) ||
+            connector_crosses_tour(last_child, p1, child, candidate.child_edge))
+            continue;
+
+        ContourTreeTour merged = apply_contour_splice(parent, child, candidate);
+        if (!merged.points.empty())
+            return merged;
+    }
+
+    return {};
+}
+
+Points build_hole_free_contour_tree_tour(
+    const std::vector<ContourLoop> &contours,
+    const ExPolygons &printable_area,
+    const Point &start_anchor,
+    const double spacing)
+{
+    if (printable_area.size() != 1 || !printable_area.front().holes.empty() || contours.empty())
+        return {};
+
+    const size_t no_parent = std::numeric_limits<size_t>::max();
+    std::vector<size_t> parent(contours.size(), no_parent);
+    std::vector<std::vector<size_t>> children(contours.size());
+
+    // Inward offsets form a tree for a simply connected polygon: a contour
+    // either continues inside exactly one contour from the preceding level or
+    // is one child created when that contour splits at the medial axis.
+    for (size_t child = 0; child < contours.size(); ++child) {
+        size_t best_parent = no_parent;
+        size_t best_level = 0;
+        double best_area = std::numeric_limits<double>::infinity();
+        for (size_t candidate = 0; candidate < contours.size(); ++candidate) {
+            if (contours[candidate].level_index >= contours[child].level_index ||
+                contours[candidate].area <= contours[child].area)
+                continue;
+            Polygon parent_polygon(contours[candidate].points);
+            if (!parent_polygon.contains(contours[child].points.front()))
+                continue;
+            if (best_parent == no_parent || contours[candidate].level_index > best_level ||
+                (contours[candidate].level_index == best_level && contours[candidate].area < best_area)) {
+                best_parent = candidate;
+                best_level = contours[candidate].level_index;
+                best_area = contours[candidate].area;
+            }
+        }
+        parent[child] = best_parent;
+        if (best_parent != no_parent)
+            children[best_parent].emplace_back(child);
+    }
+
+    std::vector<size_t> roots;
+    for (size_t node = 0; node < contours.size(); ++node)
+        if (parent[node] == no_parent)
+            roots.emplace_back(node);
+    if (roots.size() != 1)
+        return {};
+
+    for (std::vector<size_t> &siblings : children)
+        std::sort(siblings.begin(), siblings.end(), [&](const size_t a, const size_t b) {
+            if (contours[a].area != contours[b].area)
+                return contours[a].area > contours[b].area;
+            if (contours[a].centroid.x() != contours[b].centroid.x())
+                return contours[a].centroid.x() < contours[b].centroid.x();
+            return contours[a].centroid.y() < contours[b].centroid.y();
+        });
+
+    bool failed = false;
+    std::function<ContourTreeTour(size_t)> build_subtree = [&](const size_t node) {
+        ContourTreeTour tour = contour_cycle(contours[node], node);
+        for (const size_t child : children[node]) {
+            ContourTreeTour child_tour = build_subtree(child);
+            if (failed || child_tour.points.empty()) {
+                failed = true;
+                return ContourTreeTour {};
+            }
+            ContourTreeTour merged = splice_contour_tours(
+                tour, node, child_tour, child, printable_area.front(), spacing);
+            if (merged.points.empty()) {
+                failed = true;
+                return ContourTreeTour {};
+            }
+            tour = std::move(merged);
+        }
+        return tour;
+    };
+
+    ContourTreeTour tour = build_subtree(roots.front());
+    if (failed || tour.points.size() < 4 || tour.points.front() != tour.points.back())
+        return {};
+
+    // Rotate the closed tour to the requested seam without changing any edge.
+    const size_t edge_count = tour.points.size() - 1;
+    size_t start = 0;
+    double best_distance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < edge_count; ++i) {
+        const double distance = point_distance(tour.points[i], start_anchor);
+        if (distance < best_distance) {
+            best_distance = distance;
+            start = i;
+        }
+    }
+    Points rotated;
+    rotated.reserve(tour.points.size());
+    for (size_t i = 0; i < edge_count; ++i)
+        rotated.emplace_back(tour.points[(start + i) % edge_count]);
+    rotated.emplace_back(rotated.front());
+    return rotated;
 }
 
 std::vector<Polygon> collect_holes(const ExPolygons &printable_area)
@@ -3250,7 +3541,11 @@ Points uncross_closed_tour(
     return path;
 }
 
-Points remove_short_turnback_spikes(Points path, const double line_width, const double spacing)
+Points remove_short_turnback_spikes(
+    const ExPolygons &printable_area,
+    Points path,
+    const double line_width,
+    const double spacing)
 {
     // A contour port may occasionally leave a short out-and-back vertex after
     // the in/out branches are joined.  Removing such a vertex is safe only as
@@ -3265,8 +3560,57 @@ Points remove_short_turnback_spikes(Points path, const double line_width, const 
         const PairMetrics baseline_pairs = path_pair_metrics(path, spacing);
         bool improved = false;
 
-        // Preserve the explicit closure endpoints.  A seam turnback remains a
-        // hard validation failure instead of silently rotating the path.
+        if (path.front() == path.back() && path.size() >= 5) {
+            const size_t last = path.size() - 2;
+            const double incoming = point_distance(path[last], path.front());
+            const double outgoing = point_distance(path.front(), path[1]);
+            if (incoming >= line_width * 0.35 && outgoing >= line_width * 0.35) {
+                const Vec2d a = (path.front() - path[last]).cast<double>();
+                const Vec2d b = (path[1] - path.front()).cast<double>();
+                const double cosine = std::clamp(a.dot(b) / (a.norm() * b.norm()), -1.0, 1.0);
+                if (cosine < -0.7071067811865476) {
+                    // Round the cyclic closure just like an interior U-turn.
+                    // Start the returned closed path at the middle of the
+                    // rounded splice, keeping the layer seam local instead of
+                    // rotating it to an unrelated point on the model.
+                    const double trim = std::min(incoming, outgoing) * 0.45;
+                    const Point before = lerp_point(path.front(), path[last], trim / incoming);
+                    const Point after = lerp_point(path.front(), path[1], trim / outgoing);
+                    Points rounded;
+                    rounded.reserve(7);
+                    for (size_t step = 0; step <= 6; ++step) {
+                        const double t = double(step) / 6.0;
+                        const double u = 1.0 - t;
+                        const Vec2d point = before.cast<double>() * (u * u) +
+                                            path.front().cast<double>() * (2.0 * u * t) +
+                                            after.cast<double>() * (t * t);
+                        append_point(rounded, Point(point.x(), point.y()));
+                    }
+
+                    Points candidate;
+                    candidate.reserve(path.size() + rounded.size());
+                    for (size_t i = 3; i < rounded.size(); ++i)
+                        append_point(candidate, rounded[i]);
+                    for (size_t i = 1; i <= last; ++i)
+                        append_point(candidate, path[i]);
+                    for (size_t i = 0; i < 3; ++i)
+                        append_point(candidate, rounded[i]);
+                    append_point(candidate, rounded[3]);
+
+                    if (count_containment_violations(printable_area, candidate, spacing) == 0 &&
+                        count_turnback_violations(candidate, line_width) < baseline_turnbacks) {
+                        const PairMetrics candidate_pairs = path_pair_metrics(candidate, spacing);
+                        if (candidate_pairs.crossings <= baseline_pairs.crossings) {
+                            path = std::move(candidate);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // The closure was handled cyclically above. Preserve its current
+        // endpoints while repairing ordinary interior branch splices.
         for (size_t i = 1; i + 1 < path.size(); ++i) {
             const double incoming = point_distance(path[i - 1], path[i]);
             const double outgoing = point_distance(path[i], path[i + 1]);
@@ -3293,15 +3637,17 @@ Points remove_short_turnback_spikes(Points path, const double line_width, const 
                 double removed_arc = 0.0;
                 for (size_t j = erase_begin; j <= right; ++j)
                     removed_arc += point_distance(path[j - 1], path[j]);
-                // Wide pockets may leave a longer radial out-and-back spur at
-                // a branch port.  The replacement is still local relative to
-                // the deposition spacing, and the unchanged final validator
-                // rejects any shortcut that loses containment or coverage.
+                // Branch routing no longer creates long, arbitrary parent
+                // detours. Keep this repair local so an acute but legitimate
+                // part boundary cannot trigger a combinatorial shortcut
+                // search through dozens of contour vertices.
                 if (replacement > spacing * 8.0 || removed_arc <= replacement + EPS)
                     continue;
 
                 Points candidate = path;
                 candidate.erase(candidate.begin() + erase_begin, candidate.begin() + i + 1);
+                if (count_containment_violations(printable_area, candidate, spacing) != 0)
+                    continue;
                 const int candidate_turnbacks = count_turnback_violations(candidate, line_width);
                 if (candidate_turnbacks >= baseline_turnbacks)
                     continue;
@@ -3326,6 +3672,8 @@ Points remove_short_turnback_spikes(Points path, const double line_width, const 
                         continue;
                     Points candidate = path;
                     candidate.erase(candidate.begin() + i, candidate.begin() + right);
+                    if (count_containment_violations(printable_area, candidate, spacing) != 0)
+                        continue;
                     if (count_turnback_violations(candidate, line_width) >= baseline_turnbacks)
                         continue;
                     const PairMetrics candidate_pairs = path_pair_metrics(candidate, spacing);
@@ -3336,6 +3684,62 @@ Points remove_short_turnback_spikes(Points path, const double line_width, const 
                     break;
                 }
             }
+            if (!improved) {
+                // At a branch splice the geometric apex may be a required
+                // boundary point while the redundant port immediately before
+                // or after it creates the reversal. Try either neighbour as a
+                // single semantic deletion. Long replacement segments are
+                // allowed only through this containment-audited path; the
+                // crossing and final swept-footprint gates remain unchanged.
+                for (const size_t vertex : { i > 1 ? i - 1 : size_t(0), i + 1 }) {
+                    if (vertex == 0 || vertex + 1 >= path.size())
+                        continue;
+                    Points candidate = path;
+                    candidate.erase(candidate.begin() + vertex);
+                    if (count_containment_violations(printable_area, candidate, spacing) != 0 ||
+                        count_turnback_violations(candidate, line_width) >= baseline_turnbacks)
+                        continue;
+                    const PairMetrics candidate_pairs = path_pair_metrics(candidate, spacing);
+                    if (candidate_pairs.crossings > baseline_pairs.crossings)
+                        continue;
+                    path = std::move(candidate);
+                    improved = true;
+                    break;
+                }
+            }
+            if (!improved) {
+                // Some alternating contour passes require a genuine U-turn;
+                // deleting its apex merely moves the reversal to the next
+                // vertex. Round that corner with a short quadratic splice so
+                // no individual controller move exceeds the turnback limit.
+                // The curve stays within the apex triangle and is still
+                // explicitly checked against the printable area and all
+                // non-local segments before acceptance.
+                const double trim = std::min(incoming, outgoing) * 0.45;
+                const Point before = lerp_point(path[i], path[i - 1], trim / incoming);
+                const Point after = lerp_point(path[i], path[i + 1], trim / outgoing);
+                Points rounded;
+                rounded.reserve(7);
+                for (size_t step = 0; step <= 6; ++step) {
+                    const double t = double(step) / 6.0;
+                    const double u = 1.0 - t;
+                    const Vec2d point = before.cast<double>() * (u * u) +
+                                        path[i].cast<double>() * (2.0 * u * t) +
+                                        after.cast<double>() * (t * t);
+                    append_point(rounded, Point(point.x(), point.y()));
+                }
+                Points candidate = path;
+                candidate.erase(candidate.begin() + i);
+                candidate.insert(candidate.begin() + i, rounded.begin(), rounded.end());
+                if (count_containment_violations(printable_area, candidate, spacing) == 0 &&
+                    count_turnback_violations(candidate, line_width) < baseline_turnbacks) {
+                    const PairMetrics candidate_pairs = path_pair_metrics(candidate, spacing);
+                    if (candidate_pairs.crossings <= baseline_pairs.crossings) {
+                        path = std::move(candidate);
+                        improved = true;
+                    }
+                }
+            }
             if (improved)
                 break;
         }
@@ -3344,6 +3748,59 @@ Points remove_short_turnback_spikes(Points path, const double line_width, const 
             break;
     }
     return path;
+}
+
+Points round_contour_tree_turns(
+    const ExPolygons &printable_area,
+    const Points &path,
+    const double line_width)
+{
+    if (path.size() < 4 || path.front() != path.back())
+        return path;
+
+    const size_t vertex_count = path.size() - 1;
+    Points rounded;
+    rounded.reserve(path.size() + vertex_count * 6);
+    for (size_t i = 0; i < vertex_count; ++i) {
+        const Point &previous = path[(i + vertex_count - 1) % vertex_count];
+        const Point &vertex = path[i];
+        const Point &next = path[(i + 1) % vertex_count];
+        const double incoming = point_distance(previous, vertex);
+        const double outgoing = point_distance(vertex, next);
+        if (incoming < line_width * 0.35 || outgoing < line_width * 0.35) {
+            append_point(rounded, vertex);
+            continue;
+        }
+
+        const Vec2d a = (vertex - previous).cast<double>();
+        const Vec2d b = (next - vertex).cast<double>();
+        const double cosine = std::clamp(a.dot(b) / (a.norm() * b.norm()), -1.0, 1.0);
+        if (cosine >= -0.7071067811865476) {
+            append_point(rounded, vertex);
+            continue;
+        }
+
+        // These are real corners of the inset contour, not branch-routing
+        // spurs. Round only a sub-bead neighbourhood; the previous 45%-of-edge
+        // trim could cut centimetres from an acute lobe and move most material
+        // into overlap.
+        const double trim = std::min({ line_width * 0.45, incoming * 0.20, outgoing * 0.20 });
+        const Point before = lerp_point(vertex, previous, trim / incoming);
+        const Point after = lerp_point(vertex, next, trim / outgoing);
+        append_point(rounded, before);
+        for (size_t step = 1; step < 6; ++step) {
+            const double t = double(step) / 6.0;
+            const double u = 1.0 - t;
+            const Vec2d point = before.cast<double>() * (u * u) +
+                                vertex.cast<double>() * (2.0 * u * t) +
+                                after.cast<double>() * (t * t);
+            append_point(rounded, Point(point.x(), point.y()));
+        }
+        append_point(rounded, after);
+    }
+    append_point(rounded, rounded.front());
+
+    return count_containment_violations(printable_area, rounded, line_width) == 0 ? rounded : path;
 }
 
 Points remove_sub_gcode_resolution_segments(Points path)
@@ -3385,11 +3842,180 @@ LayerPathResult generate_layer_path_candidate(
     // the whole fill instead of leaving a terminal hole whose size depends on
     // the offset phase.
     const double spacing = double(flow.scaled_spacing()) * spacing_factor;
+    const bool planning_width_is_adaptive =
+        double(flow.scaled_width()) > scale_(double(flow.nozzle_diameter()) * 1.01);
+
+    // A one-hole layer is a strip with its ends identified. Cut it once,
+    // generate the ordinary simply-connected path in a flat rectangle, then
+    // bend that rectangle back between the two boundaries. The rectangle's
+    // x=0 and x=length edges stay distinct throughout generation and become
+    // the two uncrossable sides of the seam after mapping.
+    if (printable_area.size() == 1 && printable_area.front().holes.size() == 1 &&
+        !planning_width_is_adaptive) {
+        const ExPolygon &annulus = printable_area.front();
+        const HoleRemovalResult cut = remove_holes_topologically(annulus);
+        if (cut.ok && cut.seams.size() == 1) {
+            Points outer = annulus.contour.points;
+            Points inner = annulus.holes.front().points;
+            if (signed_area(outer) * signed_area(inner) < 0.0)
+                std::reverse(inner.begin(), inner.end());
+
+            const double outer_length = polyline_length(outer, true);
+            const double inner_length = polyline_length(inner, true);
+            const double strip_length = 0.5 * (outer_length + inner_length);
+            const double strip_width = strip_length > EPS ? std::abs(area(printable_area)) / strip_length : 0.0;
+            if (strip_length > double(flow.scaled_width()) * 4.0 &&
+                strip_width > double(flow.scaled_width()) * 1.05) {
+                const coord_t flat_length = coord_t(std::llround(strip_length));
+                const coord_t flat_width = coord_t(std::llround(strip_width));
+                ExPolygon flat_strip({
+                    Point(0, 0),
+                    Point(flat_length, 0),
+                    Point(flat_length, flat_width),
+                    Point(0, flat_width),
+                });
+                LayerPathResult flat = generate_layer_path_candidate(
+                    { flat_strip }, flow, configured_max_line_width, spacing_factor);
+                if (flat.path.points.size() >= 4 &&
+                    flat.extrusion_multipliers.size() + 1 == flat.path.points.size()) {
+                    const Points coarse_flat_points = flat.path.points;
+                    const std::vector<float> coarse_multipliers = flat.extrusion_multipliers;
+                    const double mapping_step = std::max(double(flow.scaled_spacing()) * 0.5, scale_(0.05));
+                    Points flat_points;
+                    std::vector<float> mapped_multipliers;
+                    flat_points.reserve(size_t(std::ceil(polyline_length(coarse_flat_points, false) / mapping_step)) + 1);
+                    mapped_multipliers.reserve(flat_points.capacity());
+                    flat_points.emplace_back(coarse_flat_points.front());
+                    for (size_t i = 1; i < coarse_flat_points.size(); ++i) {
+                        const Point &a = coarse_flat_points[i - 1];
+                        const Point &b = coarse_flat_points[i];
+                        const size_t steps = std::max<size_t>(
+                            1, size_t(std::ceil(point_distance(a, b) / mapping_step)));
+                        for (size_t step = 1; step <= steps; ++step) {
+                            const Point point = lerp_point(a, b, double(step) / double(steps));
+                            if (point == flat_points.back())
+                                continue;
+                            flat_points.emplace_back(point);
+                            mapped_multipliers.emplace_back(coarse_multipliers[i - 1]);
+                        }
+                    }
+                    flat.extrusion_multipliers = std::move(mapped_multipliers);
+                    const double outer_start = loop_nearest_index(outer, cut.seams.front().parent_point);
+                    const double inner_start = loop_nearest_index(inner, cut.seams.front().child_point);
+                    const auto boundary_point = [](const Points &points, const double start, const double fraction) {
+                        const double length = polyline_length(points, true);
+                        return loop_point_at_index(
+                            points,
+                            loop_forward_by_distance(points, start, std::clamp(fraction, 0.0, 1.0) * length));
+                    };
+
+                    Points mapped;
+                    mapped.reserve(flat_points.size());
+                    const double seam_inset_fraction = std::min(
+                        0.1, double(flow.scaled_width()) / strip_length);
+                    for (const Point &point : flat_points) {
+                        const double source_u = std::clamp(double(point.x()) / strip_length, 0.0, 1.0);
+                        const double u = seam_inset_fraction + source_u * (1.0 - 2.0 * seam_inset_fraction);
+                        const double v = std::clamp(double(point.y()) / strip_width, 0.0, 1.0);
+                        const Point outside = boundary_point(outer, outer_start, u);
+                        const Point inside = boundary_point(inner, inner_start, u);
+                        append_point(mapped, lerp_point(inside, outside, v));
+                    }
+
+                    if (mapped.size() == flat_points.size()) {
+                        const double cut_clearance = double(flow.scaled_width()) * 0.45;
+                        const Polylines cut_centerline {
+                            Polyline(Points { cut.seams.front().parent_point, cut.seams.front().child_point })
+                        };
+                        const Polygons cut_guard = offset(
+                            cut_centerline,
+                            float(cut_clearance),
+                            ClipperLib::jtMiter,
+                            2.0,
+                            ClipperLib::etOpenSquare);
+                        const ExPolygons guarded_domain = diff_ex(printable_area, cut_guard);
+                        mapped = remove_short_turnback_spikes(
+                            guarded_domain.empty() ? cut.planning_domain : guarded_domain,
+                            std::move(mapped),
+                            double(flow.scaled_width()),
+                            spacing);
+                        flat.path = Polyline(std::move(mapped));
+                        flat.extrusion_multipliers.assign(flat.path.points.size() - 1, 1.0f);
+                        const PathValidation validation = validate_layer_path(
+                            printable_area,
+                            flow,
+                            flat.path,
+                            flat.extrusion_multipliers,
+                            configured_max_line_width);
+                        bool cut_is_clear = true;
+                        double minimum_cut_distance = std::numeric_limits<double>::infinity();
+                        for (size_t i = 1; i < flat.path.points.size(); ++i)
+                            minimum_cut_distance = std::min(minimum_cut_distance, segment_distance(
+                                flat.path.points[i - 1],
+                                flat.path.points[i],
+                                cut.seams.front().parent_point,
+                                cut.seams.front().child_point));
+                        cut_is_clear = minimum_cut_distance >= cut_clearance;
+                        if (validation.emittable && cut_is_clear &&
+                            validation.outside_ratio <= 0.020 + 1e-9 &&
+                            (validation.redeposition_ratio <= 0.040 + 1e-9 ||
+                             validation.material_ratio >= 0.980 - 1e-9)) {
+                            if (perf_timing_enabled())
+                                BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile strategy=twisted_rectangle"
+                                                           << " strip_length_mm=" << unscale<double>(strip_length)
+                                                           << " strip_width_mm=" << unscale<double>(strip_width)
+                                                           << " points=" << flat.path.points.size();
+                            return flat;
+                        }
+                        if (perf_timing_enabled())
+                            BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile strategy=twisted_rectangle_rejected"
+                                                       << " reason=" << validation.reason
+                                                       << " containment=" << validation.containment_violations
+                                                       << " crossings=" << validation.crossings
+                                                       << " turnbacks=" << validation.turnback_violations
+                                                       << " cut_clear=" << cut_is_clear
+                                                       << " cut_distance_mm=" << unscale<double>(minimum_cut_distance)
+                                                       << " outside=" << validation.outside_ratio
+                                                       << " coverage=" << validation.exact_coverage_ratio
+                                                       << " material=" << validation.material_ratio;
+                    }
+                }
+            }
+        }
+    }
+
+    ExPolygons planning_area = printable_area;
+    HoleRemovalResult cut_domain;
+    bool cut_open_domain = false;
+    if (printable_area.size() == 1 && !printable_area.front().holes.empty()) {
+        cut_domain = remove_holes_topologically(printable_area.front());
+        if (cut_domain.ok && cut_domain.planning_domain.size() == 1 &&
+            cut_domain.planning_domain.front().holes.empty()) {
+            // From here through every connector and repair, the seam is an
+            // ordinary, uncrossable boundary. The path generator therefore
+            // sees one simply connected area and has no hole-specific route.
+            Polylines seam_centerlines;
+            seam_centerlines.reserve(cut_domain.seams.size());
+            for (const CutSeam &seam : cut_domain.seams)
+                seam_centerlines.emplace_back(Points { seam.parent_point, seam.child_point });
+            const Polygons centerline_guard = offset(
+                seam_centerlines,
+                float(double(flow.scaled_width()) * 0.45),
+                ClipperLib::jtMiter,
+                2.0,
+                ClipperLib::etOpenSquare);
+            const ExPolygons guarded_domain = diff_ex(printable_area, centerline_guard);
+            planning_area = !planning_width_is_adaptive && guarded_domain.size() == 1 && guarded_domain.front().holes.empty() ?
+                guarded_domain : cut_domain.planning_domain;
+            cut_open_domain = true;
+        }
+    }
+
     std::vector<ContourLoop> contours = generate_offset_contours(
-        printable_area, double(flow.scaled_width()), spacing, 3);
+        planning_area, double(flow.scaled_width()), spacing, 3);
     if (contours.empty())
-        contours = generate_narrow_feature_contours(printable_area, flow, spacing);
-    contours = add_ring_medial_contours(printable_area, std::move(contours), flow);
+        contours = generate_narrow_feature_contours(planning_area, flow, spacing);
+    contours = add_ring_medial_contours(planning_area, std::move(contours), flow);
     contours = add_terminal_medial_gap_fill(
         contours,
         double(flow.scaled_width()),
@@ -3412,9 +4038,13 @@ LayerPathResult generate_layer_path_candidate(
     for (const auto &[level, loops] : grouped)
         multi_loop |= loops.size() > 1;
 
-    const bool branch_single_island = multi_loop;
-    const bool multi_hole = collect_holes(printable_area).size() >= 2;
-    const Point start_anchor = point_at_closed_fraction(ordered.front().points, 0.0);
+    const bool hole_free_input = printable_area.size() == 1 && printable_area.front().holes.empty();
+    const bool use_contour_tree = hole_free_input &&
+        (multi_loop || !polygon_is_convex(printable_area.front().contour));
+    const bool branch_single_island = multi_loop || use_contour_tree;
+    const bool multi_hole = collect_holes(planning_area).size() >= 2;
+    const Point start_anchor = cut_open_domain && !cut_domain.seams.empty() ?
+        cut_domain.seams.front().parent_point : point_at_closed_fraction(ordered.front().points, 0.0);
 
     const ContourLoop *outer_loop = &ordered.front();
     for (const ContourLoop &loop : contours) {
@@ -3422,7 +4052,7 @@ LayerPathResult generate_layer_path_candidate(
             outer_loop = &loop;
     }
 
-    const auto finish_path = [&](Points path) {
+    const auto finish_path = [&](Points path, const bool topology_safe_route = false) {
         const PerfClock::time_point finish_start = PerfClock::now();
         LayerPathResult result;
         if (path.size() < 2)
@@ -3442,42 +4072,70 @@ LayerPathResult generate_layer_path_candidate(
 
         PerfClock::time_point phase_start = PerfClock::now();
         PerfCounters phase_before = perf_counters;
-        path = replace_long_connectors_with_contour_arcs(std::move(path), contours, spacing);
-        profile_phase("replace_connectors", phase_start, phase_before);
-        phase_start = PerfClock::now();
-        phase_before = perf_counters;
-        path = complete_outer_boundary_cycle(path, *outer_loop, spacing);
-        profile_phase("outer_boundary", phase_start, phase_before);
+        // The tree builder already used every contour edge once and certified
+        // both sides of every splice. Generic connector repair can only weaken
+        // that invariant.
+        if (!topology_safe_route) {
+            if (!cut_open_domain || planning_width_is_adaptive) {
+                path = replace_long_connectors_with_contour_arcs(std::move(path), contours, spacing);
+                profile_phase("replace_connectors", phase_start, phase_before);
+                phase_start = PerfClock::now();
+                phase_before = perf_counters;
+                path = complete_outer_boundary_cycle(path, *outer_loop, spacing, cut_open_domain);
+                profile_phase("outer_boundary", phase_start, phase_before);
+            } else {
+                path = complete_outer_boundary_cycle(path, *outer_loop, spacing, true);
+            }
+        }
+        bool simplified_dense_route = false;
+        if (path.size() > MAX_EXHAUSTIVE_REPAIR_POINTS) {
+            // Residual-pocket insertion performs many non-local pair audits.
+            // Offset curves are deliberately oversampled for connector
+            // placement, but retaining thousands of collinear / near-arc
+            // samples here made every audit needlessly quadratic. Apply the
+            // same sub-nozzle 0.01 mm simplification that was previously done
+            // only after pocket insertion, while the route is already fixed.
+            Polyline simplified(path);
+            simplified.simplify(scale_(0.01));
+            if (simplified.points.size() >= 4 && simplified.points.front() == simplified.points.back()) {
+                path = std::move(simplified.points);
+                simplified_dense_route = true;
+            }
+        }
         if (multi_hole) {
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = insert_uncovered_pocket_spirals(printable_area, contours, std::move(path), spacing);
+            path = insert_uncovered_pocket_spirals(planning_area, contours, std::move(path), spacing);
             profile_phase("uncovered_pockets", phase_start, phase_before);
         }
-        if (multi_loop) {
+        if (!topology_safe_route && multi_loop && (!cut_open_domain || planning_width_is_adaptive)) {
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = insert_residual_gap_spirals(printable_area, flow, std::move(path), spacing, &path_contours);
+            path = insert_residual_gap_spirals(planning_area, flow, std::move(path), spacing, &path_contours);
             profile_phase("residual_gaps", phase_start, phase_before);
         }
-        const bool dense_path = path.size() > MAX_EXHAUSTIVE_REPAIR_POINTS;
+        const bool dense_path = simplified_dense_route || path.size() > MAX_EXHAUSTIVE_REPAIR_POINTS;
         result.complexity_limited = dense_path;
-        if (!dense_path) {
+        if (topology_safe_route) {
+            if (perf_timing_enabled())
+                BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile phase=topology_repairs_not_needed"
+                                           << " points=" << path.size();
+        } else if (!dense_path) {
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = uncross_closed_tour(printable_area, std::move(path), double(flow.scaled_width()), spacing);
+            path = uncross_closed_tour(planning_area, std::move(path), double(flow.scaled_width()), spacing);
             profile_phase("uncross_1", phase_start, phase_before);
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = remove_short_turnback_spikes(std::move(path), double(flow.scaled_width()), spacing);
+            path = remove_short_turnback_spikes(planning_area, std::move(path), double(flow.scaled_width()), spacing);
             profile_phase("turnbacks_1", phase_start, phase_before);
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = uncross_closed_tour(printable_area, std::move(path), double(flow.scaled_width()), spacing);
+            path = uncross_closed_tour(planning_area, std::move(path), double(flow.scaled_width()), spacing);
             profile_phase("uncross_2", phase_start, phase_before);
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = remove_short_turnback_spikes(std::move(path), double(flow.scaled_width()), spacing);
+            path = remove_short_turnback_spikes(planning_area, std::move(path), double(flow.scaled_width()), spacing);
             profile_phase("turnbacks_2", phase_start, phase_before);
         } else if (perf_timing_enabled()) {
             BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile phase=topology_repairs_skipped"
@@ -3498,22 +4156,30 @@ LayerPathResult generate_layer_path_candidate(
             // Repair the compact route rather than its oversampled planning
             // representation. Pairwise work now sees hundreds of segments
             // instead of many thousands.
+            if (!topology_safe_route) {
+                phase_start = PerfClock::now();
+                phase_before = perf_counters;
+                path = uncross_closed_tour(planning_area, std::move(path), double(flow.scaled_width()), spacing);
+                profile_phase("dense_uncross_1", phase_start, phase_before);
+                phase_start = PerfClock::now();
+                phase_before = perf_counters;
+                path = remove_short_turnback_spikes(planning_area, std::move(path), double(flow.scaled_width()), spacing);
+                profile_phase("dense_turnbacks_1", phase_start, phase_before);
+                phase_start = PerfClock::now();
+                phase_before = perf_counters;
+                path = uncross_closed_tour(planning_area, std::move(path), double(flow.scaled_width()), spacing);
+                profile_phase("dense_uncross_2", phase_start, phase_before);
+                phase_start = PerfClock::now();
+                phase_before = perf_counters;
+                path = remove_short_turnback_spikes(planning_area, std::move(path), double(flow.scaled_width()), spacing);
+                profile_phase("dense_turnbacks_2", phase_start, phase_before);
+            }
+        }
+        if (topology_safe_route) {
             phase_start = PerfClock::now();
             phase_before = perf_counters;
-            path = uncross_closed_tour(printable_area, std::move(path), double(flow.scaled_width()), spacing);
-            profile_phase("dense_uncross_1", phase_start, phase_before);
-            phase_start = PerfClock::now();
-            phase_before = perf_counters;
-            path = remove_short_turnback_spikes(std::move(path), double(flow.scaled_width()), spacing);
-            profile_phase("dense_turnbacks_1", phase_start, phase_before);
-            phase_start = PerfClock::now();
-            phase_before = perf_counters;
-            path = uncross_closed_tour(printable_area, std::move(path), double(flow.scaled_width()), spacing);
-            profile_phase("dense_uncross_2", phase_start, phase_before);
-            phase_start = PerfClock::now();
-            phase_before = perf_counters;
-            path = remove_short_turnback_spikes(std::move(path), double(flow.scaled_width()), spacing);
-            profile_phase("dense_turnbacks_2", phase_start, phase_before);
+            path = round_contour_tree_turns(planning_area, path, double(flow.scaled_width()));
+            profile_phase("contour_tree_rounding", phase_start, phase_before);
         }
         path = remove_sub_gcode_resolution_segments(std::move(path));
 
@@ -3573,12 +4239,36 @@ LayerPathResult generate_layer_path_candidate(
         return result;
     };
 
+    if (cut_open_domain && perf_timing_enabled())
+        BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile strategy=cut_open_domain"
+                                   << " holes=" << printable_area.front().holes.size()
+                                   << " seams=" << cut_domain.seams.size()
+                                   << " planning_contours=" << contours.size()
+                                   << " levels=" << grouped.size();
+
     if (branch_single_island) {
         const PerfClock::time_point branch_start = PerfClock::now();
-        Points branch_path = build_branch_connected_fermat(contours, printable_area, start_anchor, spacing);
+        Points branch_path;
+        if (use_contour_tree) {
+            const PerfClock::time_point tree_start = PerfClock::now();
+            branch_path = build_hole_free_contour_tree_tour(contours, planning_area, start_anchor, spacing);
+            if (perf_timing_enabled())
+                BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile contour_tree_ms="
+                                           << elapsed_milliseconds(tree_start)
+                                           << " points=" << branch_path.size();
+        }
+        const bool used_contour_tree = !branch_path.empty();
+        if (branch_path.empty())
+            branch_path = build_legacy_branch_connected_fermat(contours, planning_area, start_anchor, spacing);
         if (perf_timing_enabled())
             BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat profile branch_ms=" << elapsed_milliseconds(branch_start)
                                        << " branch_points=" << branch_path.size() << " contours=" << contours.size();
+
+        // The contour-tree route is already a closed cycle assembled from
+        // contained, non-crossing splices. Do not compare it with the same
+        // flattened chain that this path is specifically replacing.
+        if (used_contour_tree)
+            return finish_path(std::move(branch_path), true);
 
         // The post-finish alternative is recovery for adaptive planning or a
         // thin multiply-connected feature. At nominal width on broad hole
@@ -3586,18 +4276,16 @@ LayerPathResult generate_layer_path_candidate(
         // otherwise a harmless footprint defect can make every such layer
         // pay for two complete repair and validation passes.
         double boundary_length = 0.0;
-        for (const ExPolygon &expoly : printable_area) {
+        for (const ExPolygon &expoly : planning_area) {
             boundary_length += expoly.contour.length();
             for (const Polygon &hole : expoly.holes)
                 boundary_length += hole.length();
         }
         const double thickness_proxy = boundary_length > EPS ?
-            2.0 * std::abs(area(printable_area)) / boundary_length :
+            2.0 * std::abs(area(planning_area)) / boundary_length :
             std::numeric_limits<double>::infinity();
-        const bool adaptive_planning_width =
-            double(flow.scaled_width()) > scale_(double(flow.nozzle_diameter()) * 1.01);
         const bool thin_feature = thickness_proxy <= double(flow.scaled_width()) * 3.0;
-        if (!adaptive_planning_width && !thin_feature) {
+        if (!planning_width_is_adaptive && !thin_feature) {
             if (branch_path.size() > MAX_EXHAUSTIVE_REPAIR_POINTS)
                 return finish_path(std::move(branch_path));
             Points chain_path = build_best_single_chain_path(ordered, start_anchor, spacing);
@@ -3613,7 +4301,7 @@ LayerPathResult generate_layer_path_candidate(
 
         LayerPathResult branch_result = finish_path(std::move(branch_path));
         const PathValidation branch_validation = validate_layer_path(
-            printable_area,
+            planning_area,
             flow,
             branch_result.path,
             branch_result.extrusion_multipliers,
@@ -3640,7 +4328,7 @@ LayerPathResult generate_layer_path_candidate(
             return branch_result;
         LayerPathResult chain_result = finish_path(std::move(chain_path));
         const PathValidation chain_validation = validate_layer_path(
-            printable_area,
+            planning_area,
             flow,
             chain_result.path,
             chain_result.extrusion_multipliers,
@@ -3687,14 +4375,14 @@ LayerPathResult generate_layer_path_candidate(
     LayerPathResult primary = finish_path(build_best_single_chain_path(ordered, start_anchor, spacing));
     const PathValidation primary_validation =
         validate_layer_path(
-            printable_area, flow, primary.path, primary.extrusion_multipliers, configured_max_line_width);
+            planning_area, flow, primary.path, primary.extrusion_multipliers, configured_max_line_width);
     if (primary_validation.ok ||
         (primary_validation.spacing_violations <= 3 && primary_validation.bead_overlap_violations == 0))
         return primary;
 
     LayerPathResult retry = finish_path(build_best_single_chain_path(ordered, start_anchor, spacing, true, 1.25));
     const PathValidation retry_validation = validate_layer_path(
-        printable_area, flow, retry.path, retry.extrusion_multipliers, configured_max_line_width);
+        planning_area, flow, retry.path, retry.extrusion_multipliers, configured_max_line_width);
     if (retry_validation.ok)
         return retry;
 
@@ -4052,6 +4740,16 @@ PathValidation validate_layer_path(
     std::string first_turnback;
     validation.turnback_violations = count_turnback_violations(points, line_width, &first_turnback);
 
+    // Geometric fidelity may be advisory, but topology and containment are
+    // motion-safety requirements. In particular, an exactly closed polyline
+    // with valid flow metadata is not safe to emit when its closing chord
+    // crosses a hole. Keeping these failures non-emittable prevents the
+    // preview/export layer from turning a failed seam construction into a
+    // real extrusion.
+    if (validation.containment_violations != 0 || validation.crossings != 0 ||
+        validation.turnback_violations != 0)
+        validation.emittable = false;
+
     // A cell-center sample is not an area integral. Keep it visible in
     // diagnostics and corpus output, while exact polygon clipping alone gates
     // swept-area coverage.
@@ -4153,6 +4851,7 @@ bool apply_to_layer(Layer &layer)
         return fail("printable area is empty; " + layer_diagnostics(layer, printable_area));
     if (printable_area.size() != 1)
         return fail("disconnected islands are not supported in strict continuous mode; " + layer_diagnostics(layer, printable_area));
+    const bool has_holes = !printable_area.front().holes.empty();
     const BoundingBox printable_bounds = get_extents(printable_area);
     const coord_t min_printable_span = std::min(
         printable_bounds.max.x() - printable_bounds.min.x(),
@@ -4216,6 +4915,11 @@ bool apply_to_layer(Layer &layer)
         BOOST_LOG_TRIVIAL(debug) << "Continuous Fermat omitting a nongeneratable zero-area terminal apex on layer " << layer.id() << '.';
         return true;
     }
+    if (generated_path.path.points.size() < 2 && has_holes) {
+        BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat could not generate a safe cut-open path on layer "
+                                   << layer.id() << "; retaining OrcaSlicer's normal toolpaths.";
+        return false;
+    }
     if (generated_path.path.points.size() < 2)
         return fail("generated path is empty or degenerate; " + layer_diagnostics(layer, printable_area, &flow));
 
@@ -4223,6 +4927,11 @@ bool apply_to_layer(Layer &layer)
         validate_layer_path(
             printable_area, flow, generated_path.path, generated_path.extrusion_multipliers, max_line_width);
     if (!validation.emittable) {
+        if (has_holes) {
+            BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat rejected the cut-open path on layer " << layer.id()
+                                       << " (" << validation.reason << "); retaining OrcaSlicer's normal toolpaths.";
+            return false;
+        }
         std::ostringstream reason;
         reason << "final path is not structurally emittable:" << validation.reason
                << " coverage=" << validation.coverage_ratio << " exact_coverage=" << validation.exact_coverage_ratio

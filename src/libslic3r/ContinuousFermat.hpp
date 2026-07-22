@@ -16,8 +16,9 @@ namespace ContinuousFermat {
 
 // Postconditions for a generated per-layer path. These metrics are evaluated
 // against the physical extrusion footprint before normal Orca layer entities
-// are removed. `emittable` covers structural and finite-flow requirements;
-// `ok` additionally covers advisory geometric-quality targets.
+// are removed. `emittable` covers structural, finite-flow, containment, and
+// topology safety requirements; `ok` additionally covers geometric-quality
+// targets such as coverage and material balance.
 struct PathValidation
 {
     bool ok { false };

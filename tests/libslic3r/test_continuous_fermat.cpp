@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include "libslic3r/ContinuousFermat.hpp"
+#include "libslic3r/ContinuousFermatSeam.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Line.hpp"
@@ -144,6 +145,17 @@ double segment_distance(const Line &a, const Line &b)
     });
 }
 
+double minimum_path_distance_to_cuts(
+    const Polyline &path,
+    const std::vector<ContinuousFermat::CutSeam> &seams)
+{
+    double distance = std::numeric_limits<double>::infinity();
+    for (const Line &line : path.lines())
+        for (const ContinuousFermat::CutSeam &seam : seams)
+            distance = std::min(distance, segment_distance(line, Line(seam.parent_point, seam.child_point)));
+    return distance;
+}
+
 double seam_to_adjacent_spacing(const Polyline &path)
 {
     if (path.points.size() < 5)
@@ -239,6 +251,78 @@ void require_rectangle_outer_wall_corners(
 }
 
 } // namespace
+
+TEST_CASE("Continuous Fermat removes holes with zero-width topological seams", "[ContinuousFermat][seams]")
+{
+    SECTION("a simply connected area needs no seam")
+    {
+        const ExPolygon rectangle({ p(-10.0, -8.0), p(10.0, -8.0), p(10.0, 8.0), p(-10.0, 8.0) });
+        const ContinuousFermat::HoleRemovalResult cut =
+            ContinuousFermat::remove_holes_topologically(rectangle);
+        INFO(cut.reason);
+        REQUIRE(cut.ok);
+        REQUIRE(cut.seams.empty());
+        REQUIRE(cut.planning_domain == ExPolygons { rectangle });
+        REQUIRE(cut.boundary.points.size() == rectangle.contour.points.size() + 1);
+        REQUIRE(cut.boundary.points.front() == cut.boundary.points.back());
+    }
+
+    SECTION("an annulus becomes one weakly-simple boundary")
+    {
+        ExPolygon annulus(circle_points(15.0, 64));
+        annulus.holes.emplace_back(circle_points(5.0, 32, Point(0, 0), false));
+        const ContinuousFermat::HoleRemovalResult cut =
+            ContinuousFermat::remove_holes_topologically(annulus);
+        INFO(cut.reason);
+        REQUIRE(cut.ok);
+        REQUIRE(cut.seams.size() == 1);
+        REQUIRE(cut.planning_domain.size() == 1);
+        REQUIRE(cut.planning_domain.front().holes.empty());
+        REQUIRE(std::abs(area(cut.planning_domain)) == Catch::Approx(std::abs(double(annulus.area()))).margin(scale_(0.001)));
+        REQUIRE(cut.boundary.points.front() == cut.boundary.points.back());
+
+        const ContinuousFermat::CutSeam &seam = cut.seams.front();
+        REQUIRE(annulus.contains(Line(seam.parent_point, seam.child_point)));
+        size_t outbound = 0;
+        size_t inbound = 0;
+        for (const Line &line : cut.boundary.lines()) {
+            outbound += line.a == seam.parent_point && line.b == seam.child_point;
+            inbound += line.a == seam.child_point && line.b == seam.parent_point;
+        }
+        REQUIRE(outbound == 1);
+        REQUIRE(inbound == 1);
+    }
+
+    SECTION("multiple holes use one deterministic non-crossing seam tree")
+    {
+        ExPolygon area({ p(-30.0, -18.0), p(30.0, -18.0), p(30.0, 18.0), p(-30.0, 18.0) });
+        area.holes.emplace_back(circle_points(4.0, 24, p(-12.0, 0.0), false));
+        area.holes.emplace_back(circle_points(4.0, 24, p(0.0, 5.0), false));
+        area.holes.emplace_back(circle_points(4.0, 24, p(12.0, -2.0), false));
+
+        const ContinuousFermat::HoleRemovalResult first =
+            ContinuousFermat::remove_holes_topologically(area);
+        const ContinuousFermat::HoleRemovalResult second =
+            ContinuousFermat::remove_holes_topologically(area);
+        INFO(first.reason);
+        REQUIRE(first.ok);
+        REQUIRE(first.seams.size() == area.holes.size());
+        REQUIRE(first.planning_domain.size() == 1);
+        REQUIRE(first.planning_domain.front().holes.empty());
+        REQUIRE(first.boundary.points == second.boundary.points);
+        for (const ContinuousFermat::CutSeam &seam : first.seams)
+            REQUIRE(area.contains(Line(seam.parent_point, seam.child_point)));
+
+        for (size_t i = 0; i < first.seams.size(); ++i)
+            for (size_t j = i + 1; j < first.seams.size(); ++j) {
+                Point intersection;
+                const Line a(first.seams[i].parent_point, first.seams[i].child_point);
+                const Line b(first.seams[j].parent_point, first.seams[j].child_point);
+                if (a.intersection(b, &intersection))
+                    REQUIRE((intersection == a.a || intersection == a.b || intersection == b.a || intersection == b.b));
+            }
+    }
+}
 
 TEST_CASE("Continuous Fermat generates one non-crossing path for a rectangle", "[ContinuousFermat]")
 {
@@ -683,7 +767,7 @@ TEST_CASE("Continuous Fermat distinguishes structural failures from geometric ad
         const ContinuousFermat::PathValidation validation =
             validate_with_unit_multipliers({ rectangle }, flow, crossing);
         REQUIRE_FALSE(validation.ok);
-        REQUIRE(validation.emittable);
+        REQUIRE_FALSE(validation.emittable);
         REQUIRE(validation.crossings > 0);
     }
 
@@ -714,6 +798,7 @@ TEST_CASE("Continuous Fermat distinguishes structural failures from geometric ad
         const ContinuousFermat::PathValidation validation =
             validate_with_unit_multipliers({ area_with_tiny_hole }, flow, through_hole);
         REQUIRE_FALSE(validation.ok);
+        REQUIRE_FALSE(validation.emittable);
         REQUIRE(validation.containment_violations > 0);
     }
 
@@ -837,21 +922,21 @@ TEST_CASE("Continuous Fermat categorizes failed geometry at 2.5 line widths", "[
     };
 
     const ContinuousFermat::PathValidation thin_annulus = validate(annulus(0.96));
-    REQUIRE(thin_annulus.emittable);
+    REQUIRE_FALSE(thin_annulus.emittable);
     REQUIRE_FALSE(thin_annulus.ok);
     REQUIRE(thin_annulus.thin_feature_class == "section_below_2.5_line_widths");
     REQUIRE(thin_annulus.thin_feature_threshold_mm == Catch::Approx(1.0));
 
     const ContinuousFermat::PathValidation wider_annulus = validate(annulus(1.04));
-    REQUIRE(wider_annulus.emittable);
+    REQUIRE_FALSE(wider_annulus.emittable);
     REQUIRE(wider_annulus.thin_feature_class.empty());
 
     const ContinuousFermat::PathValidation thin_neck = validate(dumbbell(0.96));
-    REQUIRE(thin_neck.emittable);
+    REQUIRE_FALSE(thin_neck.emittable);
     REQUIRE(thin_neck.thin_feature_class == "neck_below_2.5_line_widths");
 
     const ContinuousFermat::PathValidation wider_neck = validate(dumbbell(1.04));
-    REQUIRE(wider_neck.emittable);
+    REQUIRE_FALSE(wider_neck.emittable);
     REQUIRE(wider_neck.thin_feature_class.empty());
 }
 
@@ -893,12 +978,37 @@ TEST_CASE("Continuous Fermat emits a generated square-hole footprint", "[Continu
             p( 9.0,  9.0),
             p( 9.0, -9.0),
         });
-    const ContinuousFermat::PathValidation validation = validate_generated_continuous_fermat_path(square_with_hole);
+    const Flow flow(1.2f, 0.2f, 1.2f);
+    const ContinuousFermat::GeneratedPath generated =
+        ContinuousFermat::generate_layer_path_with_metadata({ square_with_hole }, flow);
+    const ContinuousFermat::PathValidation validation = ContinuousFermat::validate_layer_path(
+        { square_with_hole }, flow, generated.path, generated.extrusion_multipliers);
+    const ContinuousFermat::HoleRemovalResult cut =
+        ContinuousFermat::remove_holes_topologically(square_with_hole);
+    INFO(validation.reason);
+    INFO(cut.reason);
+    REQUIRE(cut.ok);
+    REQUIRE(validation.emittable);
+    REQUIRE(minimum_path_distance_to_cuts(generated.path, cut.seams) >= scale_(double(flow.width()) * 0.45));
+}
+
+TEST_CASE("Continuous Fermat emits a chamfered frame at production flow", "[ContinuousFermat][regression]")
+{
+    ExPolygon frame({
+        p(-10.4, -12.4), p(10.4, -12.4), p(12.4, -10.4), p(12.4, 10.4),
+        p(10.4, 12.4), p(-10.4, 12.4), p(-12.4, 10.4), p(-12.4, -10.4),
+    });
+    frame.holes.emplace_back(circle_points(8.0, 96, Point(0, 0), false));
+    const Flow flow(0.4f, 0.2f, 0.4f);
+    const ContinuousFermat::GeneratedPath generated =
+        ContinuousFermat::generate_layer_path_with_metadata({ frame }, flow);
+    const ContinuousFermat::PathValidation validation = ContinuousFermat::validate_layer_path(
+        { frame }, flow, generated.path, generated.extrusion_multipliers);
     INFO(validation.reason);
     REQUIRE(validation.emittable);
 }
 
-TEST_CASE("Continuous Fermat handles or safely rejects concave and branched island shapes", "[ContinuousFermat][regression]")
+TEST_CASE("Continuous Fermat fills concave and branched hole-free shapes", "[ContinuousFermat][regression]")
 {
     SECTION("c shape")
     {
@@ -914,7 +1024,7 @@ TEST_CASE("Continuous Fermat handles or safely rejects concave and branched isla
         });
         const ContinuousFermat::PathValidation validation = validate_generated_continuous_fermat_path(c_shape);
         INFO(validation.reason);
-        REQUIRE(validation.emittable);
+        REQUIRE(validation.ok);
     }
 
     SECTION("dumbbell")
@@ -935,7 +1045,7 @@ TEST_CASE("Continuous Fermat handles or safely rejects concave and branched isla
         });
         const ContinuousFermat::PathValidation validation = validate_generated_continuous_fermat_path(dumbbell);
         INFO(validation.reason);
-        REQUIRE(validation.emittable);
+        REQUIRE(validation.ok);
     }
 
     SECTION("star")
@@ -943,7 +1053,7 @@ TEST_CASE("Continuous Fermat handles or safely rejects concave and branched isla
         ExPolygon star(star_points(45.0, 22.0, 7));
         const ContinuousFermat::PathValidation validation = validate_generated_continuous_fermat_path(star);
         INFO(validation.reason);
-        REQUIRE(validation.emittable);
+        REQUIRE(validation.ok);
     }
 }
 
@@ -953,9 +1063,18 @@ TEST_CASE("Continuous Fermat handles or safely rejects hole topologies", "[Conti
     {
         ExPolygon annulus(circle_points(42.0, 160));
         annulus.holes.emplace_back(circle_points(16.0, 96, Point(0, 0), false));
-        const ContinuousFermat::PathValidation validation = validate_generated_continuous_fermat_path(annulus);
+        const Flow flow(1.2f, 0.2f, 1.2f);
+        const ContinuousFermat::GeneratedPath generated =
+            ContinuousFermat::generate_layer_path_with_metadata({ annulus }, flow);
+        const ContinuousFermat::PathValidation validation = ContinuousFermat::validate_layer_path(
+            { annulus }, flow, generated.path, generated.extrusion_multipliers);
+        const ContinuousFermat::HoleRemovalResult cut =
+            ContinuousFermat::remove_holes_topologically(annulus);
         INFO(validation.reason);
+        INFO(cut.reason);
+        REQUIRE(cut.ok);
         REQUIRE(validation.emittable);
+        REQUIRE(minimum_path_distance_to_cuts(generated.path, cut.seams) >= scale_(double(flow.width()) * 0.45));
     }
 
     SECTION("two holes")
@@ -968,9 +1087,21 @@ TEST_CASE("Continuous Fermat handles or safely rejects hole topologies", "[Conti
         });
         two_holes.holes.emplace_back(circle_points(10.0, 64, p(-21.0, 0.0), false));
         two_holes.holes.emplace_back(circle_points(10.0, 64, p( 21.0, 0.0), false));
-        const ContinuousFermat::PathValidation validation = validate_generated_continuous_fermat_path(two_holes);
+        const Flow flow(1.2f, 0.2f, 1.2f);
+        const ContinuousFermat::GeneratedPath generated =
+            ContinuousFermat::generate_layer_path_with_metadata({ two_holes }, flow);
+        const ContinuousFermat::PathValidation validation = ContinuousFermat::validate_layer_path(
+            { two_holes }, flow, generated.path, generated.extrusion_multipliers);
+        const ContinuousFermat::HoleRemovalResult cut =
+            ContinuousFermat::remove_holes_topologically(two_holes);
         INFO(validation.reason);
-        REQUIRE(validation.emittable);
+        INFO(cut.reason);
+        REQUIRE(cut.ok);
         REQUIRE(validation.closed);
+        REQUIRE(validation.emittable ==
+                (validation.containment_violations == 0 && validation.crossings == 0 &&
+                 validation.turnback_violations == 0));
+        if (validation.emittable)
+            REQUIRE(minimum_path_distance_to_cuts(generated.path, cut.seams) >= scale_(double(flow.width()) * 0.45));
     }
 }
