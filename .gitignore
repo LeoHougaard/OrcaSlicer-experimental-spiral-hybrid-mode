@@ -46,3 +46,10 @@ test.js
 internal_docs/
 *.flatpak
 /flatpak-repo/
+
+# Continuous Fermat local research outputs
+/sandboxes/continuous_fermat_corpus/
+/sandboxes/continuous-fermat-*.csv
+/sandboxes/continuous-fermat-*.jsonl
+/tools/continuous_fermat/__pycache__/
+/????-????-????-????
