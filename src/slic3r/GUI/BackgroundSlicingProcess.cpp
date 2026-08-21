@@ -199,7 +199,8 @@ void BackgroundSlicingProcess::process_fff()
     const GCodeExportPurpose export_purpose = research_preview ?
         GCodeExportPurpose::ContinuousResearchPreview : GCodeExportPurpose::PrinterReady;
     // Preview and printer-ready generation use the same structural and
-    // serialized machine checks. Geometric quality misses remain warnings.
+    // serialized machine checks. Geometric quality failures remain visible in
+    // preview, but Print::export_gcode blocks them from printer-ready output.
     PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
     m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
 	//BBS: add the logic to process from an existed gcode file

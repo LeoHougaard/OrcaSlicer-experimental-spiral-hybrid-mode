@@ -5652,9 +5652,16 @@ std::string GCode::change_layer(coordf_t print_z)
         if (m_continuous_fermat_started &&
             (!m_last_pos_defined || m_last_pos != m_continuous_fermat_endpoint))
             throw Slic3r::SlicingError(_(L("Continuous slicing lost its endpoint before a layer change.")));
-        std::ostringstream comment;
-        comment << "continuous slicing Z-only layer change (" << m_layer_index << ")";
-        gcode += m_writer.travel_to_z(z, comment.str());
+        // The first layer still needs an ordinary non-extruding approach from
+        // the machine's startup position. Later layers deliberately leave Z
+        // at the preceding layer here: the next cyclic path raises Z while
+        // extruding along its opening scarf, so pressure never has to stop and
+        // restart at a layer boundary.
+        if (!m_continuous_fermat_started) {
+            std::ostringstream comment;
+            comment << "continuous slicing first-layer Z approach (" << m_layer_index << ")";
+            gcode += m_writer.travel_to_z(z, comment.str());
+        }
     } else if (m_spiral_vase) {
         //BBS: force to normal lift immediately in spiral vase mode
         std::ostringstream comment;
@@ -5665,7 +5672,8 @@ std::string GCode::change_layer(coordf_t print_z)
     m_need_change_layer_lift_z = !strict_continuous_mode;
 
     m_nominal_z = z;
-    m_writer.get_position().z() = z;
+    if (!strict_continuous_mode || !m_continuous_fermat_started)
+        m_writer.get_position().z() = z;
 
     // forget last wiping path as wiping after raising Z is pointless
     // BBS. Dont forget wiping path to reduce stringing.
@@ -6042,6 +6050,88 @@ std::string GCode::extrude_path(ExtrusionPath path, std::string description, dou
     // Orca: Reset average multipath flow as this is a single line, single extrude volumetric speed path
     m_multi_flow_segment_path_pa_set = false;
     m_multi_flow_segment_path_average_mm3_per_mm = 0;
+    if (path.is_continuous_fermat() && m_continuous_fermat_started) {
+        Points &points = path.polyline.points;
+        std::vector<float> &multipliers = path.continuous_fermat_extrusion_multipliers;
+        if (points.size() < 4 || points.front() != points.back() ||
+            multipliers.size() + 1 != points.size())
+            throw Slic3r::SlicingError(_(L("Continuous slicing cannot rotate malformed cyclic path metadata.")));
+
+        // A closed layer has no intrinsic beginning. Split it at the point
+        // nearest the preceding layer's endpoint, then rotate the segment
+        // metadata with it. This makes the inter-layer splice local without
+        // changing a single edge of the certified planar tour.
+        size_t best_segment = 0;
+        double best_t = 0.0;
+        double best_distance_sq = std::numeric_limits<double>::max();
+        const Vec2d anchor = m_continuous_fermat_endpoint.cast<double>();
+        for (size_t i = 0; i + 1 < points.size(); ++i) {
+            const Vec2d a = points[i].cast<double>();
+            const Vec2d delta = points[i + 1].cast<double>() - a;
+            const double length_sq = delta.squaredNorm();
+            if (length_sq <= 0.0)
+                continue;
+            const double t = std::clamp((anchor - a).dot(delta) / length_sq, 0.0, 1.0);
+            const double distance_sq = (anchor - (a + t * delta)).squaredNorm();
+            if (distance_sq < best_distance_sq) {
+                best_distance_sq = distance_sq;
+                best_segment = i;
+                best_t = t;
+            }
+        }
+
+        size_t seam_index = best_segment;
+        if (best_t >= 1.0 - EPSILON) {
+            seam_index = (best_segment + 1) % (points.size() - 1);
+        } else if (best_t > EPSILON) {
+            const Vec2d a = points[best_segment].cast<double>();
+            const Vec2d b = points[best_segment + 1].cast<double>();
+            const Point projected = (a + best_t * (b - a)).cast<coord_t>();
+            const Vec2d serialized = this->point_to_serialized_gcode_quantized(projected);
+            const Vec2d serialized_a = this->point_to_serialized_gcode_quantized(points[best_segment]);
+            const Vec2d serialized_b = this->point_to_serialized_gcode_quantized(points[best_segment + 1]);
+            if (projected != points[best_segment] && projected != points[best_segment + 1] &&
+                serialized != serialized_a && serialized != serialized_b) {
+                points.insert(points.begin() + best_segment + 1, projected);
+                multipliers.insert(multipliers.begin() + best_segment, multipliers[best_segment]);
+                seam_index = best_segment + 1;
+            } else if ((anchor - a).squaredNorm() <= (anchor - b).squaredNorm()) {
+                seam_index = best_segment;
+            } else {
+                seam_index = (best_segment + 1) % (points.size() - 1);
+            }
+        }
+
+        const size_t segment_count = points.size() - 1;
+        Points rotated_points;
+        std::vector<float> rotated_multipliers;
+        rotated_points.reserve(points.size() + 1);
+        rotated_multipliers.reserve(multipliers.size() + 1);
+        for (size_t offset = 0; offset < segment_count; ++offset) {
+            const size_t index = (seam_index + offset) % segment_count;
+            rotated_points.emplace_back(points[index]);
+            rotated_multipliers.emplace_back(multipliers[index]);
+        }
+        rotated_points.emplace_back(rotated_points.front());
+
+        const Point seam = rotated_points.front();
+        const double connector_length = unscale<double>(
+            (seam - m_continuous_fermat_endpoint).cast<double>().norm());
+        const double max_connector_length = 2.5 * std::max(
+            double(path.width), m_config.nozzle_diameter.get_at(0));
+        if (!std::isfinite(connector_length) || connector_length > max_connector_length + EPSILON)
+            throw Slic3r::SlicingError(_(L(
+                "Continuous slicing could not place a local inter-layer scarf within 2.5 bead widths.")));
+
+        if (seam != m_continuous_fermat_endpoint) {
+            rotated_points.insert(rotated_points.begin(), m_continuous_fermat_endpoint);
+            // The connector is a nominal-width bead. Feed-rate compensation
+            // below keeps its volumetric extrusion rate equal to the layer.
+            rotated_multipliers.insert(rotated_multipliers.begin(), 1.0f);
+        }
+        path.polyline.points = std::move(rotated_points);
+        path.continuous_fermat_extrusion_multipliers = std::move(rotated_multipliers);
+    }
     //    description += ExtrusionEntity::role_to_string(path.role());
     std::string gcode = this->_extrude(path, description, speed);
     if (m_wipe.enable && FILAMENT_CONFIG(wipe)) {
@@ -6282,6 +6372,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     std::string gcode;
     const bool continuous_fermat = path.is_continuous_fermat();
     const bool strict_continuous_mode = m_config.spiral_hybrid_non_crossing;
+    const bool continuous_fermat_transition = continuous_fermat && m_continuous_fermat_started;
     const auto continuous_fermat_warning_comment = [&path]() {
         if (path.continuous_fermat_validation_warning.empty())
             return std::string();
@@ -6292,7 +6383,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     };
     const ExtrusionPathSloped *sloped = dynamic_cast<const ExtrusionPathSloped *>(&path);
     double continuous_fermat_target_volume = 0.0;
-    double continuous_min_material_ratio = 0.980;
+    const double continuous_min_material_ratio = 0.980;
     const double continuous_nozzle_diameter = m_config.nozzle_diameter.get_at(0);
     const double continuous_rounded_corner_loss = double(path.height) * (1.0 - 0.25 * PI);
     const double continuous_nominal_cross_section = double(path.width) - continuous_rounded_corner_loss;
@@ -6318,6 +6409,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 return std::isfinite(multiplier) && multiplier + 1e-6 >= continuous_min_multiplier &&
                        multiplier <= continuous_max_multiplier + 1e-6;
             });
+    Points continuous_fermat_emission_points;
+    std::vector<double> continuous_fermat_emission_multipliers;
 
     // Keep a bidirectional emitter boundary: a strict job may emit only tagged
     // paths, while a stale tagged cache entry may never leak into a normal job.
@@ -6329,12 +6422,61 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         throw Slic3r::SlicingError(_(L("Continuous slicing generated more than one extrusion stroke for a layer.")));
     if (continuous_fermat && path.role() != erExternalPerimeter)
         throw Slic3r::SlicingError(_(L("Continuous slicing reached the emitter with an unexpected extrusion role.")));
-    if (continuous_fermat &&
-        (path.polyline.points.size() < 4 || path.first_point() != path.last_point()))
+    const bool continuous_cyclic_path = continuous_fermat && path.polyline.points.size() >= 4 &&
+        path.first_point() == path.last_point();
+    const bool continuous_stitched_path = continuous_fermat_transition && path.polyline.points.size() >= 5 &&
+        path.first_point() == m_continuous_fermat_endpoint &&
+        path.polyline.points[1] == path.last_point();
+    if (continuous_fermat && !continuous_cyclic_path && !continuous_stitched_path)
         throw Slic3r::SlicingError(_(L("Continuous slicing reached the emitter with an open or degenerate path.")));
     if (continuous_fermat) {
         if (!has_continuous_fermat_extrusion_multipliers)
             throw Slic3r::SlicingError(_(L("Continuous slicing lost or corrupted its per-segment extrusion metadata.")));
+
+        // Real mesh intersections may leave positive but sub-resolution
+        // segments. Merge only consecutive points that serialize to the same
+        // XY, carrying their exact planned volume into the resulting chord.
+        // The physical-width and complete serialized-output checks below gate
+        // the merged result, so an unsafe merge still fails closed.
+        continuous_fermat_emission_points.reserve(path.polyline.points.size());
+        continuous_fermat_emission_multipliers.reserve(path.continuous_fermat_extrusion_multipliers.size());
+        continuous_fermat_emission_points.emplace_back(path.polyline.points.front());
+        std::vector<double> weighted_lengths;
+        weighted_lengths.reserve(path.continuous_fermat_extrusion_multipliers.size());
+        double pending_weighted_length = 0.0;
+        const double serialized_xy_tolerance =
+            GCodeFormatter::pow_10_inv[GCodeFormatter::XYZF_EXPORT_DIGITS];
+        for (size_t i = 0; i + 1 < path.polyline.points.size(); ++i) {
+            const double segment_length = (path.polyline.points[i + 1] - path.polyline.points[i]).cast<double>().norm();
+            pending_weighted_length += segment_length * double(path.continuous_fermat_extrusion_multipliers[i]);
+            const Vec2d serialized_next = this->point_to_serialized_gcode_quantized(path.polyline.points[i + 1]);
+            const Vec2d serialized_kept =
+                this->point_to_serialized_gcode_quantized(continuous_fermat_emission_points.back());
+            if ((serialized_next - serialized_kept).norm() > serialized_xy_tolerance + 1e-9) {
+                continuous_fermat_emission_points.emplace_back(path.polyline.points[i + 1]);
+                weighted_lengths.emplace_back(pending_weighted_length);
+                pending_weighted_length = 0.0;
+            }
+        }
+        if (pending_weighted_length > 0.0) {
+            if (weighted_lengths.empty())
+                throw Slic3r::SlicingError(_(L("Continuous slicing collapses completely at G-code XYZ precision.")));
+            continuous_fermat_emission_points.back() = path.polyline.points.back();
+            weighted_lengths.back() += pending_weighted_length;
+        }
+        if (continuous_fermat_emission_points.size() < 4 ||
+            weighted_lengths.size() + 1 != continuous_fermat_emission_points.size())
+            throw Slic3r::SlicingError(_(L("Continuous slicing becomes degenerate at G-code XYZ precision.")));
+        for (size_t i = 0; i < weighted_lengths.size(); ++i) {
+            const double chord_length =
+                (continuous_fermat_emission_points[i + 1] - continuous_fermat_emission_points[i]).cast<double>().norm();
+            const double multiplier = chord_length > 0.0 ? weighted_lengths[i] / chord_length : 0.0;
+            if (!std::isfinite(multiplier) || multiplier + 1e-6 < continuous_min_multiplier ||
+                multiplier > continuous_max_multiplier + 1e-6)
+                throw Slic3r::SlicingError(_(L(
+                    "Continuous slicing cannot merge a sub-resolution segment within the physical width limits.")));
+            continuous_fermat_emission_multipliers.emplace_back(multiplier);
+        }
         if (m_config.printable_area.values.size() < 3 ||
             !std::all_of(m_config.printable_area.values.begin(), m_config.printable_area.values.end(),
                          [](const Vec2d &point) { return point.allFinite(); }))
@@ -6352,10 +6494,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
         size_t nonzero_segments = 0;
         Points serialized_points;
-        serialized_points.reserve(path.polyline.points.size());
+        serialized_points.reserve(continuous_fermat_emission_points.size());
         Vec2d previous_serialized;
-        for (size_t i = 0; i < path.polyline.points.size(); ++i) {
-            const Vec2d serialized = this->point_to_serialized_gcode_quantized(path.polyline.points[i]);
+        for (size_t i = 0; i < continuous_fermat_emission_points.size(); ++i) {
+            const Vec2d serialized = this->point_to_serialized_gcode_quantized(continuous_fermat_emission_points[i]);
             if (!serialized.allFinite() || !printable_bbox.contains(serialized))
                 throw Slic3r::SlicingError(_(L("Continuous slicing transformed its path outside the printable machine polygon.")));
             serialized_points.emplace_back(Point::new_scale(serialized));
@@ -6363,8 +6505,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 previous_serialized = serialized;
                 continue;
             }
-            nonzero_segments += path.polyline.points[i - 1] != path.polyline.points[i];
-            if (path.polyline.points[i - 1] == path.polyline.points[i] || serialized == previous_serialized)
+            nonzero_segments += continuous_fermat_emission_points[i - 1] != continuous_fermat_emission_points[i];
+            if (continuous_fermat_emission_points[i - 1] == continuous_fermat_emission_points[i] ||
+                (serialized - previous_serialized).norm() <= serialized_xy_tolerance + 1e-9)
                 throw Slic3r::SlicingError(_(L("Continuous slicing contains a segment that collapses at G-code XYZ precision.")));
             previous_serialized = serialized;
         }
@@ -6384,7 +6527,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         Polygons swept_beads;
         for (size_t i = 1; i < serialized_points.size(); ++i) {
             const double physical_width = rounded_corner_loss + nominal_cross_section *
-                double(path.continuous_fermat_extrusion_multipliers[i - 1]);
+                continuous_fermat_emission_multipliers[i - 1];
             if (!std::isfinite(physical_width) || physical_width < continuous_min_physical_width - EPSILON ||
                 physical_width > continuous_max_physical_width + EPSILON)
                 throw Slic3r::SlicingError(_(L("Continuous slicing has an invalid physical bead width at the emitter.")));
@@ -6417,10 +6560,114 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             std::abs(area(target_area)) * SCALING_FACTOR * SCALING_FACTOR * double(path.height);
         if (!std::isfinite(continuous_fermat_target_volume) || continuous_fermat_target_volume <= 0.0)
             throw Slic3r::SlicingError(_(L("Continuous slicing has no finite positive target material volume at the emitter.")));
+
+        if (continuous_stitched_path) {
+            ExPolygons transition_domain = target_area;
+            if (m_layer->lower_layer != nullptr) {
+                ExPolygons lower_area = m_layer->lower_layer->lslices;
+                if (lower_area.empty()) {
+                    for (const LayerRegion *region : m_layer->lower_layer->regions())
+                        if (region != nullptr)
+                            append(lower_area, to_expolygons(region->slices.surfaces));
+                }
+                append(transition_domain, std::move(lower_area));
+            }
+            transition_domain = union_ex(transition_domain);
+            const Polyline connector(Points {
+                continuous_fermat_emission_points[0], continuous_fermat_emission_points[1] });
+            if (!diff_pl(Polylines { connector }, transition_domain).empty())
+                throw Slic3r::SlicingError(_(L(
+                    "Continuous slicing inter-layer scarf leaves the adjacent model cross-sections.")));
+
+            const double connector_width = continuous_rounded_corner_loss +
+                continuous_nominal_cross_section * double(path.continuous_fermat_extrusion_multipliers.front());
+            const ExPolygons connector_bead = union_ex(offset(
+                Polylines { connector },
+                float(scale_(0.5 * connector_width)),
+                ClipperLib::jtRound,
+                SCALED_RESOLUTION,
+                ClipperLib::etOpenRound));
+            const double connector_area = std::abs(area(connector_bead));
+            const double outside_area = std::abs(area(diff_ex(connector_bead, transition_domain)));
+            if (!(connector_area > 0.0) || !std::isfinite(outside_area) ||
+                outside_area / connector_area > 0.020 + EPSILON)
+                throw Slic3r::SlicingError(_(L(
+                    "Continuous slicing inter-layer scarf exceeds the adjacent model footprint.")));
+        }
     }
     if (m_continuous_fermat_started &&
         (!m_last_pos_defined || m_last_pos != m_continuous_fermat_endpoint))
         throw Slic3r::SlicingError(_(L("Continuous slicing lost its previous protected endpoint.")));
+
+    double continuous_ramp_start_z = m_nominal_z;
+    std::vector<double> continuous_fermat_z_by_point;
+    if (continuous_fermat_transition) {
+        continuous_ramp_start_z = m_writer.get_position()(2);
+        const double z_delta = m_nominal_z - continuous_ramp_start_z;
+        const double available_length = Polyline(continuous_fermat_emission_points).length() * SCALING_FACTOR;
+        const double required_length = std::max(
+            20.0 * z_delta,
+            10.0 * continuous_nozzle_diameter);
+        if (!std::isfinite(continuous_ramp_start_z) || !std::isfinite(z_delta) || z_delta <= EPSILON ||
+            !std::isfinite(available_length) || !std::isfinite(required_length) ||
+            available_length + EPSILON < required_length)
+            throw Slic3r::SlicingError(_(L(
+                "Continuous slicing cannot fit a finite 20:1 inter-layer scarf into the next cyclic path.")));
+
+        // Allocate Z in the same 0.001 mm units that will be serialized. A Z
+        // step is assigned only to a move whose serialized XY run supports the
+        // certified 20:1 slope, avoiding locally steep moves after rounding.
+        const double xyz_step = GCodeFormatter::pow_10_inv[GCodeFormatter::XYZF_EXPORT_DIGITS];
+        const double serialized_start_z = GCodeFormatter::quantize_xyzf(continuous_ramp_start_z);
+        const double serialized_target_z = GCodeFormatter::quantize_xyzf(m_nominal_z);
+        const size_t total_z_steps = size_t(std::llround((serialized_target_z - serialized_start_z) / xyz_step));
+        std::vector<size_t> segment_capacities(continuous_fermat_emission_points.size() - 1, 0);
+        size_t ramp_start_segment = 0;
+        size_t run_start_segment = 0;
+        size_t run_capacity = 0;
+        bool found_ramp = false;
+        double pre_ramp_length = 0.0;
+        for (size_t i = 0; i < segment_capacities.size(); ++i) {
+            const Vec2d serialized_a =
+                this->point_to_serialized_gcode_quantized(continuous_fermat_emission_points[i]);
+            const Vec2d serialized_b =
+                this->point_to_serialized_gcode_quantized(continuous_fermat_emission_points[i + 1]);
+            const double planar_length = (serialized_b - serialized_a).norm();
+            segment_capacities[i] = size_t(std::floor((planar_length + 1e-9) / (20.0 * xyz_step)));
+            if (segment_capacities[i] == 0) {
+                run_start_segment = i + 1;
+                run_capacity = 0;
+            } else {
+                run_capacity += segment_capacities[i];
+                if (run_capacity >= total_z_steps) {
+                    ramp_start_segment = run_start_segment;
+                    found_ramp = true;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < ramp_start_segment; ++i) {
+            const Vec2d serialized_a =
+                this->point_to_serialized_gcode_quantized(continuous_fermat_emission_points[i]);
+            const Vec2d serialized_b =
+                this->point_to_serialized_gcode_quantized(continuous_fermat_emission_points[i + 1]);
+            pre_ramp_length += (serialized_b - serialized_a).norm();
+        }
+        if (!found_ramp || pre_ramp_length > 2.5 * continuous_max_physical_width + 1e-9)
+            throw Slic3r::SlicingError(_(L(
+                "Continuous slicing cannot serialize one contiguous 20:1 opening scarf on this path.")));
+
+        size_t emitted_z_steps = 0;
+        continuous_fermat_z_by_point.assign(continuous_fermat_emission_points.size(), serialized_start_z);
+        for (size_t i = 1; i < continuous_fermat_emission_points.size(); ++i) {
+            if (i - 1 >= ramp_start_segment)
+                emitted_z_steps += std::min(segment_capacities[i - 1], total_z_steps - emitted_z_steps);
+            continuous_fermat_z_by_point[i] = serialized_start_z + double(emitted_z_steps) * xyz_step;
+        }
+        if (emitted_z_steps != total_z_steps)
+            throw Slic3r::SlicingError(_(L(
+                "Continuous slicing cannot serialize a complete 20:1 inter-layer scarf on this path.")));
+    }
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -7041,15 +7288,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         }
         
         const auto continuous_fermat_segment_multiplier = [
-            &path,
-            has_continuous_fermat_extrusion_multipliers,
+            &continuous_fermat_emission_multipliers,
+            continuous_fermat,
             continuous_min_multiplier,
             continuous_max_multiplier](const size_t segment_index) {
-            if (!has_continuous_fermat_extrusion_multipliers ||
-                segment_index >= path.continuous_fermat_extrusion_multipliers.size())
+            if (!continuous_fermat || segment_index >= continuous_fermat_emission_multipliers.size())
                 return 1.0;
             return std::clamp(
-                double(path.continuous_fermat_extrusion_multipliers[segment_index]),
+                continuous_fermat_emission_multipliers[segment_index],
                 continuous_min_multiplier,
                 continuous_max_multiplier);
         };
@@ -7084,14 +7330,23 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || classic_spiral_mode || continuous_fermat || sloped != nullptr) {
                 double path_length = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
-                for (size_t point_index = 1; point_index < path.polyline.points.size(); ++point_index) {
+                double continuous_previous_z = continuous_ramp_start_z;
+                const Points &emission_points =
+                    continuous_fermat ? continuous_fermat_emission_points : path.polyline.points;
+                for (size_t point_index = 1; point_index < emission_points.size(); ++point_index) {
                     std::string tempDescription = description;
                     const size_t segment_index = point_index - 1;
-                    const Line line(path.polyline.points[point_index - 1], path.polyline.points[point_index]);
-                    const double line_length = line.length() * SCALING_FACTOR;
-                    if (line_length < EPSILON)
+                    const Line line(emission_points[point_index - 1], emission_points[point_index]);
+                    const double planar_line_length = line.length() * SCALING_FACTOR;
+                    if (planar_line_length < EPSILON)
                         continue;
-                    path_length += line_length;
+                    path_length += planar_line_length;
+                    const double continuous_destination_z = continuous_fermat_transition ?
+                        continuous_fermat_z_by_point[point_index] :
+                        m_nominal_z;
+                    const double line_length = continuous_fermat_transition ?
+                        std::hypot(planar_line_length, continuous_destination_z - continuous_previous_z) :
+                        planar_line_length;
                     const double segment_extrusion_multiplier = continuous_fermat_segment_multiplier(segment_index);
                     auto dE = e_per_mm * line_length * segment_extrusion_multiplier;
                     if (continuous_fermat && (!std::isfinite(dE) || dE <= 0.0 ||
@@ -7110,7 +7365,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                     if (continuous_fermat) {
                         const Vec2d serialized_a = this->point_to_serialized_gcode_quantized(line.a);
                         const Vec2d serialized_b = this->point_to_serialized_gcode_quantized(line.b);
-                        const double serialized_length = (serialized_b - serialized_a).norm();
+                        const double serialized_z_a = GCodeFormatter::quantize_xyzf(continuous_previous_z);
+                        const double serialized_z_b = GCodeFormatter::quantize_xyzf(continuous_destination_z);
+                        const double serialized_length = std::hypot(
+                            (serialized_b - serialized_a).norm(),
+                            serialized_z_b - serialized_z_a);
                         const double serialized_e = GCodeFormatter::quantize_e(dE);
                         const double e_per_mm3 = m_writer.filament()->e_per_mm3();
                         if (!std::isfinite(serialized_length) || serialized_length <= 0.0 ||
@@ -7136,7 +7395,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         gcode += m_writer.set_speed(segment_F, "", comment);
                         last_set_F = segment_F;
                     }
-                    if (sloped == nullptr) {
+                    if (continuous_fermat_transition && continuous_previous_z < m_nominal_z - EPSILON) {
+                        const Vec2d dest2d = this->point_to_gcode(line.b);
+                        gcode += m_writer.extrude_to_xyz(
+                            Vec3d(dest2d(0), dest2d(1), continuous_destination_z),
+                            dE,
+                            GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
+                    } else if (sloped == nullptr) {
                         // Normal extrusion
                         gcode += m_writer.extrude_to_xy(
                             this->point_to_gcode(line.b),
@@ -7152,6 +7417,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             dE * e_ratio,
                             GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
                     }
+                    continuous_previous_z = continuous_destination_z;
                 }
             } else {
                 // BBS: start to generate gcode from arc fitting data which includes line and arc
@@ -7344,24 +7610,17 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         }
     }
     if (continuous_fermat) {
+        if (continuous_fermat_transition &&
+            std::abs(m_writer.get_position()(2) - m_nominal_z) > 0.0005 + EPSILON)
+            throw Slic3r::SlicingError(_(L(
+                "Continuous slicing inter-layer scarf did not reach the nominal layer Z.")));
         const double serialized_material_ratio =
             continuous_fermat_serialized_volume / continuous_fermat_target_volume;
-        if (!std::isfinite(serialized_material_ratio))
-            throw Slic3r::SlicingError(_(L("Continuous slicing produced a non-finite serialized material ratio.")));
-        if (serialized_material_ratio < continuous_min_material_ratio - 1e-9 ||
-            serialized_material_ratio > 1.020 + 1e-9) {
-            gcode += Slic3r::format(
-                ";_CONTINUOUS_FERMAT_VALIDATION_WARNING serialized_material_ratio=%.9f expected=[%.9f,1.020000000]\n",
-                serialized_material_ratio,
-                continuous_min_material_ratio);
-            if (m_curr_print != nullptr)
-                m_curr_print->active_step_add_warning(
-                    PrintStateBase::WarningLevel::CRITICAL,
-                    _(L("Continuous slicing generated one or more layers outside its geometric quality targets. "
-                        "The G-code remains available; inspect its _CONTINUOUS_FERMAT_VALIDATION_WARNING comments "
-                        "and the preview before deciding whether to use it.")),
-                    PrintStateBase::SlicingContinuousFermatValidation);
-        }
+        if (!std::isfinite(serialized_material_ratio) ||
+            serialized_material_ratio < continuous_min_material_ratio - 1e-9 ||
+            serialized_material_ratio > 1.020 + 1e-9)
+            throw Slic3r::SlicingError(_(L(
+                "Continuous slicing serialized material falls outside the mandatory 0.980 through 1.020 layer ratio.")));
         gcode += ";_CONTINUOUS_FERMAT_END\n";
     }
     if (m_enable_cooling_markers) {

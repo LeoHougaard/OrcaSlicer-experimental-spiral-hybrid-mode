@@ -925,7 +925,8 @@ public:
                                      ThumbnailsGeneratorCallback thumbnail_cb = nullptr,
                                      GCodeExportPurpose purpose = GCodeExportPurpose::PrinterReady);
     // Cached/imported artifacts cannot be recertified against current slices.
-    // Fresh printer-ready output is governed by the normal print and G-code validators.
+    // Fresh output with geometric quality failures is preview-only; printer-ready
+    // output remains governed by all geometry and serialized G-code validators.
     void                throw_if_continuous_slicing_artifact_blocked(const std::string &path, bool allow_research_preview = false) const;
     void                enable_continuous_slicing_development_export_for_tests() { m_continuous_slicing_development_export_for_tests = true; }
     //return 0 means successful

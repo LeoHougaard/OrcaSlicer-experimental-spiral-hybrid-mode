@@ -520,7 +520,8 @@ void write_layer_csv(std::ostream &out, const CorpusEntry &entry, const LayerRes
     out << std::setprecision(10) << "layer," << csv_escape(entry.id) << ',' << csv_escape(entry.path.u8string()) << ',' << layer.index << ','
         << layer.z << ',' << layer.islands << ',' << layer.holes << ',' << layer.area_mm2 << ',' << layer.overlap_mm2 << ',' << layer.eligible << ','
         << layer.attempted << ',' << layer.passed << ',' << layer.quality_ok << ',' << csv_escape(layer.category) << ',' << csv_escape(layer.reason) << ',' << layer.generation_ms
-        << ',' << layer.validation_ms << ',' << layer.path_points << ',' << v.closed << ',' << v.exact_coverage_ratio << ',' << v.coverage_ratio << ','
+        << ',' << layer.validation_ms << ',' << layer.path_points << ',' << v.closed << ',' << v.emittable << ','
+        << v.exact_coverage_ratio << ',' << v.coverage_ratio << ','
         << v.outside_ratio << ',' << v.material_ratio << ',' << v.redeposition_ratio << ',' << v.containment_violations << ',' << v.crossings << ','
         << v.spacing_violations << ',' << v.bead_overlap_violations << ',' << v.turnback_violations << ',' << csv_escape(v.thin_feature_class) << ','
         << v.thin_feature_threshold_mm << ",,,,,," << layer.layer_elapsed_ms << ','
@@ -604,12 +605,15 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
     std::ofstream csv(output_prefix.string() + ".csv", std::ios::trunc);
     REQUIRE(jsonl.good());
     REQUIRE(csv.good());
-    csv << "record,id,path,layer,z_mm,islands,holes,area_mm2,overlap_mm2,eligible,attempted,passed,quality_ok,category,reason,generation_ms,validation_ms,path_points,closed,exact_coverage,coverage,outside,material,redeposition,containment,crossings,spacing,bead_overlaps,turnbacks,thin_feature_class,thin_feature_threshold_mm,load_ms,slice_ms,total_ms,effective_scale,source_url,layer_elapsed_ms,cache_hit,reused_from_layer,unique_geometries,cache_hits\n";
+    csv << "record,id,path,layer,z_mm,islands,holes,area_mm2,overlap_mm2,eligible,attempted,passed,quality_ok,category,reason,generation_ms,validation_ms,path_points,closed,emittable,exact_coverage,coverage,outside,material,redeposition,containment,crossings,spacing,bead_overlaps,turnbacks,thin_feature_class,thin_feature_threshold_mm,load_ms,slice_ms,total_ms,effective_scale,source_url,layer_elapsed_ms,cache_hit,reused_from_layer,unique_geometries,cache_hits\n";
 
     size_t processed_models = 0;
     size_t eligible_models = 0;
+    size_t emittable_models = 0;
     size_t passed_models = 0;
     size_t failed_layers = 0;
+    size_t emittable_layers = 0;
+    size_t quality_ok_layers = 0;
     size_t ineligible_models = 0;
     size_t harness_errors = 0;
     size_t total_unique_geometries = 0;
@@ -628,6 +632,7 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
         std::vector<LayerResult> results;
         std::vector<bool> layer_written;
         bool model_eligible = false;
+        bool model_emittable = false;
         bool model_passed = false;
         bool model_quality_ok = false;
         size_t unique_geometries = 0;
@@ -735,6 +740,7 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
 
                 if (model_eligible) {
                     ++eligible_models;
+                    model_emittable = true;
                     model_passed = true;
                     model_quality_ok = true;
                     const Flow flow { float(line_width), float(layer_height), float(nozzle_diameter) };
@@ -796,12 +802,10 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
                                     result.validation = ContinuousFermat::validate_layer_path(
                                         slices[i], flow, generated.path, generated.extrusion_multipliers, max_line_width);
                                     result.validation_ms = elapsed_ms(operation_start);
-                                    result.passed = result.validation.emittable;
+                                    result.passed = result.validation.ok;
                                     result.quality_ok = result.validation.ok;
                                     result.reason = result.validation.reason;
-                                    result.category = result.quality_ok ? "pass" :
-                                        result.passed ? "advisory_" + validation_category(result.validation) :
-                                                        validation_category(result.validation);
+                                    result.category = result.quality_ok ? "pass" : validation_category(result.validation);
                                 } catch (const std::exception &e) {
                                     if (validating)
                                         result.validation_ms = elapsed_ms(operation_start);
@@ -847,6 +851,12 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
                             }
                         }
                         result.layer_elapsed_ms = elapsed_ms(layer_start);
+                        if (result.validation.emittable)
+                            ++emittable_layers;
+                        else
+                            model_emittable = false;
+                        if (result.quality_ok)
+                            ++quality_ok_layers;
                         if (!result.passed) {
                             ++failed_layers;
                             model_passed = false;
@@ -857,7 +867,7 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
                     }
                     if (model_passed) {
                         ++passed_models;
-                        model_category = model_quality_ok ? "pass" : "pass_with_advisories";
+                        model_category = "pass";
                     }
                     else if (budget_exceeded) {
                         model_category = "budget_exceeded";
@@ -865,8 +875,10 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
                     }
                     else {
                         model_category = "fermat_failure";
-                        model_reason = "one or more eligible layers failed generation or validation";
+                        model_reason = "one or more eligible layers failed Continuous Fermat safety certification";
                     }
+                    if (model_emittable)
+                        ++emittable_models;
                 } else {
                     ++ineligible_models;
                     model_category = "topology_ineligible";
@@ -893,7 +905,9 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
         jsonl << std::setprecision(10) << "{\"record\":\"model\",\"id\":\"" << json_escape(entry.id)
               << "\",\"path\":\"" << json_escape(entry.path.u8string()) << "\",\"source_url\":\"" << json_escape(entry.source_url)
               << "\",\"scale\":" << effective_scale << ",\"layers\":" << results.size()
-              << ",\"eligible\":" << (model_eligible ? "true" : "false") << ",\"passed\":" << (model_passed ? "true" : "false")
+              << ",\"eligible\":" << (model_eligible ? "true" : "false")
+              << ",\"emittable\":" << (model_emittable ? "true" : "false")
+              << ",\"passed\":" << (model_passed ? "true" : "false")
               << ",\"quality_ok\":" << (model_quality_ok ? "true" : "false")
               << ",\"category\":\"" << json_escape(model_category) << "\",\"reason\":\"" << json_escape(model_reason)
               << "\",\"load_ms\":" << load_ms << ",\"slice_ms\":" << slice_ms << ",\"total_ms\":" << model_ms
@@ -903,7 +917,7 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
             csv << ',';
         csv << model_eligible << ",," << model_passed << ',' << model_quality_ok << ','
             << csv_escape(model_category) << ',' << csv_escape(model_reason);
-        for (size_t i = 0; i < 17; ++i)
+        for (size_t i = 0; i < 18; ++i)
             csv << ',';
         csv << load_ms << ',' << slice_ms << ',' << model_ms << ',' << effective_scale << ',' << csv_escape(entry.source_url) << ",,,,"
             << unique_geometries << ',' << cache_hits << '\n';
@@ -912,13 +926,17 @@ TEST_CASE("Continuous Fermat internet model corpus", "[.][ContinuousFermat][inte
     }
 
     jsonl << "{\"record\":\"run\",\"processed_models\":" << processed_models << ",\"eligible_models\":" << eligible_models
-          << ",\"passed_models\":" << passed_models << ",\"ineligible_models\":" << ineligible_models
-          << ",\"harness_errors\":" << harness_errors << ",\"failed_layers\":" << failed_layers << ",\"shard_index\":" << shard_index
+          << ",\"emittable_models\":" << emittable_models << ",\"passed_models\":" << passed_models
+          << ",\"ineligible_models\":" << ineligible_models << ",\"harness_errors\":" << harness_errors
+          << ",\"emittable_layers\":" << emittable_layers << ",\"quality_ok_layers\":" << quality_ok_layers
+          << ",\"failed_layers\":" << failed_layers << ",\"shard_index\":" << shard_index
           << ",\"shard_count\":" << shard_count << ",\"unique_geometries\":" << total_unique_geometries
           << ",\"cache_hits\":" << total_cache_hits << "}\n";
     INFO("results: " << output_prefix.u8string() << ".jsonl and .csv");
-    INFO("processed=" << processed_models << " eligible=" << eligible_models << " passed=" << passed_models
-         << " ineligible=" << ineligible_models << " harness_errors=" << harness_errors << " failed_layers=" << failed_layers);
+    INFO("processed=" << processed_models << " eligible=" << eligible_models << " emittable=" << emittable_models
+         << " passed=" << passed_models << " ineligible=" << ineligible_models << " harness_errors=" << harness_errors
+         << " emittable_layers=" << emittable_layers << " quality_ok_layers=" << quality_ok_layers
+         << " failed_layers=" << failed_layers);
     REQUIRE(processed_models > 0);
     if (require_all) {
         CHECK(harness_errors == 0);

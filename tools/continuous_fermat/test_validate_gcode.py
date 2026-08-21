@@ -61,6 +61,13 @@ def one_layer(body: str, *, preamble: str = "", postamble: str = "") -> str:
 
 
 class ContinuousFermatGCodeValidationTests(unittest.TestCase):
+    def test_rejects_failed_geometric_certification_marker(self):
+        fixture = one_layer("G1 X1 Y0 E0.2\nG1 X0 Y0 E0.2")
+        warning = ";_CONTINUOUS_FERMAT_VALIDATION_WARNING layer=0 exact_coverage=0.97<0.98"
+        result = audit(fixture.replace(BEGIN, f"{warning}\n{BEGIN}"))
+
+        self.assertIn("geometric safety certification failed", messages(result))
+
     def test_accepts_klipper_native_state_and_rejects_missing_guards(self):
         fixture = one_layer("G1 X1 Y0 E0.2\nG1 X0 Y0 E0.2")
         accepted = audit(fixture, firmware="klipper")
@@ -124,7 +131,7 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         self.assertIn("M900 K0 was not explicitly established", messages(active_pa))
         self.assertIn("M900 linear-advance change inside", messages(pa_inside))
 
-    def test_accepts_closed_sections_with_only_positive_z_between_them(self):
+    def test_accepts_continuous_sections_with_a_20_to_1_opening_scarf(self):
         result = audit(
             f"""
             G90
@@ -137,9 +144,9 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
             G1 X0 Y10 E1
             G1 X0 Y0 E1
             {END}
-            G1 Z0.4
             ;LAYER_CHANGE
             {BEGIN}
+            G1 X4 Y0 Z0.4 E1
             G1 X8 Y0 E1
             G1 X8 Y8 E1
             G1 X0 Y8 E1
@@ -156,7 +163,7 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         self.assertAlmostEqual(0.2, result.transitions[0].z_delta)
         self.assertAlmostEqual(0.0, result.transitions[0].endpoint_gap)
 
-    def test_accepts_one_non_extruding_xy_approach_after_positive_z(self):
+    def test_rejects_non_extruding_motion_between_sections(self):
         result = audit(
             f"""
             G90
@@ -169,10 +176,10 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
             G1 X0 Y10 E1
             G1 X0 Y0 E1
             {END}
-            G1 Z0.4
             G1 X2 Y2 F1200
             ;LAYER_CHANGE
             {BEGIN}
+            G1 X6 Y2 Z0.4 E1
             G1 X8 Y2 E1
             G1 X8 Y8 E1
             G1 X2 Y8 E1
@@ -183,7 +190,8 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
             expected_layers=2,
         )
 
-        self.assertEqual([], result.violations)
+        self.assertIn("XY motion is not allowed between", messages(result))
+        self.assertIn("adjacent section endpoint gap", messages(result))
         self.assertEqual(1, result.transitions[0].xy_moves)
         self.assertAlmostEqual(2.0 * 2.0**0.5, result.transitions[0].endpoint_gap)
 
@@ -257,7 +265,7 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         self.assertIn("purge starts from unknown XY", messages(unknown_start))
         self.assertIn("purge has no known positive feed rate", messages(unknown_start))
 
-    def test_transition_rejects_retraction_non_positive_z_and_xy_before_z(self):
+    def test_transition_rejects_retraction_and_all_axis_motion(self):
         result = audit(
             f"""
             G90
@@ -280,9 +288,9 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         )
         output = messages(result)
 
-        self.assertIn("XY approach must occur after", output)
+        self.assertIn("XY motion is not allowed between", output)
         self.assertIn("unmarked retraction between", output)
-        self.assertIn("non-positive Z transition", output)
+        self.assertIn("Z motion (", output)
 
     def test_transition_requires_a_known_positive_z_increase(self):
         result = audit(
@@ -303,8 +311,36 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
             """
         )
 
-        self.assertIn("missing positive Z transition", messages(result))
-        self.assertIn("section Z did not increase", messages(result))
+        self.assertIn("scarf did not raise Z positively", messages(result))
+
+    def test_rejects_a_steep_or_resumed_opening_scarf(self):
+        first_section = f"""
+            G90
+            M83
+            G1 X0 Y0 Z0.2 F1200
+            ;LAYER_CHANGE
+            {BEGIN}
+            G1 X10 Y0 E1
+            G1 X0 Y0 E1
+            {END}
+            ;LAYER_CHANGE
+            {BEGIN}
+        """
+        steep = audit(first_section + f"""
+            G1 X1 Y0 Z0.4 E1
+            G1 X0 Y0 E1
+            {END}
+        """)
+        resumed = audit(first_section + f"""
+            G1 X4 Y0 Z0.3 E1
+            G1 X8 Y0 E1
+            G1 X12 Y0 Z0.4 E1
+            G1 X0 Y0 E1
+            {END}
+        """)
+
+        self.assertIn("steeper than the certified 20:1 slope", messages(steep))
+        self.assertIn("resumed after the section reached flat-layer extrusion", messages(resumed))
 
     def test_every_section_requires_a_known_positive_constant_z(self):
         unknown = audit(
@@ -342,7 +378,7 @@ class ContinuousFermatGCodeValidationTests(unittest.TestCase):
         cases = {
             "travel": ("G1 X1 Y0", "non-positive-extrusion XY move"),
             "e_only": ("G1 E0.2", "E-only extrusion/retract"),
-            "z": ("G1 Z0.3", "Z motion inside"),
+            "z": ("G1 Z0.3", "first Continuous Fermat section must remain at constant Z"),
             "rapid": ("G0 X1 Y0 E0.2", "rapid G0 move"),
         }
         for name, (bad_line, expected) in cases.items():

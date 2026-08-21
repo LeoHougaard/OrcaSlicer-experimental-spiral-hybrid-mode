@@ -2578,10 +2578,41 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 // The export_gcode may die for various reasons (fails to process filename_format,
 // write error into the G-code, cannot execute post-processing scripts).
 // It is up to the caller to show an error message.
+static bool has_continuous_fermat_validation_warning(const ExtrusionEntity &entity)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path->is_continuous_fermat() && !path->continuous_fermat_validation_warning.empty();
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::any_of(collection->entities.begin(), collection->entities.end(), [](const ExtrusionEntity *child) {
+            return child != nullptr && has_continuous_fermat_validation_warning(*child);
+        });
+    return false;
+}
+
+static bool has_continuous_fermat_validation_warning(const Print &print)
+{
+    for (const PrintObject *object : print.objects()) {
+        for (const Layer *layer : object->layers()) {
+            for (const LayerRegion *region : layer->regions()) {
+                if (region != nullptr &&
+                    (has_continuous_fermat_validation_warning(region->perimeters) ||
+                     has_continuous_fermat_validation_warning(region->fills) ||
+                     has_continuous_fermat_validation_warning(region->thin_fills)))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result,
                                 ThumbnailsGeneratorCallback thumbnail_cb, GCodeExportPurpose purpose)
 {
-    (void) purpose;
+    if (purpose == GCodeExportPurpose::PrinterReady && m_config.spiral_hybrid_non_crossing &&
+        has_continuous_fermat_validation_warning(*this))
+        throw Slic3r::SlicingError(L(
+            "Continuous slicing printer-ready export is blocked because one or more layers failed geometric safety "
+            "certification. The marked paths remain available only for preview and diagnosis."));
 
     // output everything to a G-code file
     // The following call may die if the filename_format template substitution fails.
@@ -2611,22 +2642,30 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
 
 void Print::throw_if_continuous_slicing_artifact_blocked(const std::string &path, bool allow_research_preview) const
 {
-    if (allow_research_preview || m_continuous_slicing_development_export_for_tests ||
-        m_config.spiral_hybrid_non_crossing || path.empty())
+    if (allow_research_preview || path.empty())
         return;
 
     boost::nowide::ifstream input(path);
     if (!input.is_open())
         return;
 
+    bool has_continuous_section = false;
+    bool has_validation_warning = false;
     std::string line;
     while (std::getline(input, line)) {
+        has_validation_warning |= line.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING") != std::string::npos;
         if (line.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos ||
             line.find(";_CONTINUOUS_FERMAT_END") != std::string::npos)
-            throw Slic3r::SlicingError(L(
-                "Export or upload of cached/imported Continuous Fermat G-code is intentionally disabled because the "
-                "artifact has no certified machine startup and first-approach contract."));
+            has_continuous_section = true;
     }
+    if (has_validation_warning)
+        throw Slic3r::SlicingError(L(
+            "Export or upload of Continuous Fermat G-code with geometric safety certification failures is disabled. "
+            "The artifact is available only for preview and diagnosis."));
+    if (has_continuous_section && !m_continuous_slicing_development_export_for_tests)
+        throw Slic3r::SlicingError(L(
+            "Export or upload of cached/imported Continuous Fermat G-code is intentionally disabled because the "
+            "artifact cannot be recertified against the current slices and machine contract."));
 }
 
 void Print::_make_skirt()

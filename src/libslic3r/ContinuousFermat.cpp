@@ -4038,9 +4038,13 @@ LayerPathResult generate_layer_path_candidate(
     for (const auto &[level, loops] : grouped)
         multi_loop |= loops.size() > 1;
 
-    const bool hole_free_input = printable_area.size() == 1 && printable_area.front().holes.empty();
-    const bool use_contour_tree = hole_free_input &&
-        (multi_loop || !polygon_is_convex(printable_area.front().contour));
+    // A successfully cut-open hole domain is deliberately hole-free too. Use
+    // the topology-preserving contour-tree route for that planning geometry;
+    // sending it through the legacy flattened chain can reconnect opposite
+    // sides of a slit and create crossings when the path is mapped back to
+    // the original multiply-connected layer.
+    const bool use_contour_tree = planning_area.size() == 1 && planning_area.front().holes.empty() &&
+        (multi_loop || !polygon_is_convex(planning_area.front().contour));
     const bool branch_single_island = multi_loop || use_contour_tree;
     const bool multi_hole = collect_holes(planning_area).size() >= 2;
     const Point start_anchor = cut_open_domain && !cut_domain.seams.empty() ?
@@ -4414,6 +4418,33 @@ LayerPathResult generate_layer_path_result(
         nominal_validation.exact_coverage_ratio < 0.980 && nominal_validation.material_ratio < 0.980;
     if (nominal_validation.ok)
         return nominal;
+    const bool nominal_is_near_coverage_only = nominal_validation.emittable &&
+        nominal_validation.exact_coverage_ratio >= 0.950 && nominal_validation.exact_coverage_ratio < 0.980 &&
+        nominal_validation.outside_ratio <= 0.020 + 1e-9 &&
+        nominal_validation.redeposition_ratio <= 0.040 + 1e-9 &&
+        nominal_validation.material_ratio >= 0.980 - 1e-9 && nominal_validation.material_ratio <= 1.020 + 1e-9;
+    if (nominal_is_near_coverage_only) {
+        // The path already deposits the right total volume. Move a bounded
+        // share from overlapping segments toward its exact uncovered area,
+        // then keep the retry only if the unchanged full validator accepts it.
+        LayerPathResult rebalanced = nominal;
+        if (rebalance_widths_toward_uncovered_area(
+                printable_area,
+                rebalanced.path.points,
+                flow,
+                maximum_extrusion_multiplier(flow, configured_max_line_width),
+                maximum_physical_width(flow, configured_max_line_width),
+                rebalanced.extrusion_multipliers)) {
+            const PathValidation rebalanced_validation = validate_layer_path(
+                printable_area,
+                flow,
+                rebalanced.path,
+                rebalanced.extrusion_multipliers,
+                configured_max_line_width);
+            if (rebalanced_validation.ok)
+                return rebalanced;
+        }
+    }
     // Once a structurally valid path exists, only a single geometry-derived
     // width retry is worth delaying preview. Spacing sweeps and iterative
     // rebalance remain recovery tools for candidates that cannot be emitted.
@@ -4916,9 +4947,7 @@ bool apply_to_layer(Layer &layer)
         return true;
     }
     if (generated_path.path.points.size() < 2 && has_holes) {
-        BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat could not generate a safe cut-open path on layer "
-                                   << layer.id() << "; retaining OrcaSlicer's normal toolpaths.";
-        return false;
+        return fail("could not generate a safe cut-open path; " + layer_diagnostics(layer, printable_area, &flow));
     }
     if (generated_path.path.points.size() < 2)
         return fail("generated path is empty or degenerate; " + layer_diagnostics(layer, printable_area, &flow));
@@ -4927,11 +4956,6 @@ bool apply_to_layer(Layer &layer)
         validate_layer_path(
             printable_area, flow, generated_path.path, generated_path.extrusion_multipliers, max_line_width);
     if (!validation.emittable) {
-        if (has_holes) {
-            BOOST_LOG_TRIVIAL(warning) << "Continuous Fermat rejected the cut-open path on layer " << layer.id()
-                                       << " (" << validation.reason << "); retaining OrcaSlicer's normal toolpaths.";
-            return false;
-        }
         std::ostringstream reason;
         reason << "final path is not structurally emittable:" << validation.reason
                << " coverage=" << validation.coverage_ratio << " exact_coverage=" << validation.exact_coverage_ratio

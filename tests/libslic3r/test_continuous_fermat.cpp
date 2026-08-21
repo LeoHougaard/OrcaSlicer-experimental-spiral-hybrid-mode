@@ -439,6 +439,89 @@ TEST_CASE("Continuous Fermat derives a wider geometry phase for a thin ring", "[
     REQUIRE(*std::max_element(generated.extrusion_multipliers.begin(), generated.extrusion_multipliers.end()) > 1.0f);
 }
 
+TEST_CASE("Continuous Fermat redistributes width across a toothed ring", "[ContinuousFermat][regression][width-rebalance]")
+{
+    // Reduced layer-zero section of CC BY Thingiverse 213343. Collinear mesh
+    // intersections were removed; the polygonal footprint is unchanged.
+    ExPolygon toothed_ring(
+        Points {
+            p(30.088869, 11.839064), p(33.116618, 5.078378), p(33.126981, 5.055238),
+            p(26.719964, 8.773163), p(26.698035, 8.785888), p(26.695206, 8.784255),
+            p(25.868767, 8.307174), p(25.884947, 0.899424), p(25.885002, 0.874069),
+            p(21.543991, 6.876549), p(21.529133, 6.897093), p(21.525885, 6.896751),
+            p(20.577008, 6.796930), p(17.578892, 0.023184), p(17.568630, 0.000000),
+            p(16.044230, 7.249249), p(16.039012, 7.274061), p(16.035907, 7.275070),
+            p(15.128555, 7.569850), p(9.634348, 2.601066), p(9.615543, 2.584059),
+            p(11.171529, 9.826496), p(11.176855, 9.851284), p(11.174428, 9.853470),
+            p(10.465355, 10.491967), p(3.425299, 8.187525), p(3.401204, 8.179638),
+            p(7.768535, 14.163003), p(7.783483, 14.183482), p(7.782155, 14.186466),
+            p(7.393986, 15.058134), p(0.025221, 15.816340), p(0.000000, 15.818935),
+            p(6.423201, 19.508568), p(6.445185, 19.521197), p(6.445185, 19.524463),
+            p(6.445185, 20.478803), p(0.021985, 24.168451), p(0.000000, 24.181080),
+            p(7.368765, 24.939286), p(7.393986, 24.941881), p(7.395314, 24.944864),
+            p(7.783483, 25.816532), p(3.416152, 31.799898), p(3.401204, 31.820377),
+            p(10.441260, 29.515935), p(10.465355, 29.508048), p(10.467782, 29.510233),
+            p(11.176855, 30.148730), p(9.620869, 37.391152), p(9.615543, 37.415941),
+            p(15.109750, 32.447156), p(15.128555, 32.430150), p(15.131661, 32.431159),
+            p(16.039012, 32.725939), p(17.563413, 39.975188), p(17.568630, 40.000000),
+            p(20.566746, 33.226076), p(20.577008, 33.202891), p(20.580255, 33.202550),
+            p(21.529133, 33.102922), p(25.870144, 39.105386), p(25.885002, 39.125931),
+            p(25.868823, 31.718180), p(25.868767, 31.692826), p(25.871596, 31.691193),
+            p(26.698035, 31.214127), p(33.105052, 34.932036), p(33.126981, 34.944762),
+            p(30.099232, 28.184091), p(30.088869, 28.160951), p(30.090789, 28.158309),
+            p(30.651690, 27.386448), p(38.016941, 28.176828), p(38.042150, 28.179533),
+            p(32.526304, 23.234920), p(32.507425, 23.217996), p(32.508105, 23.214801),
+            p(32.706573, 22.281524), p(39.756768, 20.007693), p(39.780899, 19.999910),
+            p(32.730704, 17.726273), p(32.706573, 17.718491), p(32.705894, 17.715297),
+            p(32.507425, 16.782004), p(38.023271, 11.837405), p(38.042150, 11.820482),
+            p(30.676899, 12.610846), p(30.651690, 12.613552), p(30.649770, 12.610910),
+        },
+        Points {
+            p(9.866630, 18.376913), p(10.236861, 16.874735), p(10.238913, 16.869855),
+            p(10.838614, 15.443908), p(10.841402, 15.439406), p(11.655949, 14.124005),
+            p(11.659404, 14.119993), p(12.668719, 12.947684), p(12.672757, 12.944258),
+            p(13.852470, 11.943332), p(13.856991, 11.940576), p(15.178047, 11.135575),
+            p(15.182943, 11.133557), p(16.613181, 10.543997), p(16.618331, 10.542766),
+            p(18.123045, 10.183253), p(18.128324, 10.182839), p(19.670662, 10.061970),
+            p(19.675941, 10.062383), p(21.218280, 10.183253), p(21.223430, 10.184483),
+            p(22.728144, 10.543997), p(22.733039, 10.546015), p(24.163274, 11.135575),
+            p(24.167795, 11.138331), p(25.488855, 11.943332), p(25.492893, 11.946758),
+            p(26.672602, 12.947684), p(26.676057, 12.951696), p(27.685372, 14.124005),
+            p(27.688160, 14.128507), p(28.502710, 15.443908), p(28.504763, 15.448788),
+            p(29.104464, 16.874735), p(29.105731, 16.879877), p(29.475962, 18.382054),
+            p(29.479182, 18.382054), p(30.419871, 18.382054), p(30.419871, 21.606908),
+            p(30.419871, 21.617946), p(30.416651, 21.617946), p(29.475962, 21.617946),
+            p(29.474695, 21.623087), p(29.104464, 23.125265), p(29.102412, 23.130145),
+            p(28.502710, 24.556092), p(28.499922, 24.560594), p(27.685372, 25.876010),
+            p(27.681917, 25.880022), p(26.672602, 27.052316), p(26.668564, 27.055742),
+            p(25.488855, 28.056683), p(25.484334, 28.059438), p(24.163274, 28.864425),
+            p(24.158378, 28.866443), p(22.728144, 29.456003), p(22.722994, 29.457234),
+            p(21.218280, 29.816747), p(21.213001, 29.817160), p(19.670662, 29.937851),
+            p(19.665383, 29.937438), p(18.123045, 29.816747), p(18.117895, 29.815517),
+            p(16.613181, 29.456003), p(16.608285, 29.453985), p(15.178047, 28.864425),
+            p(15.173526, 28.861669), p(13.852470, 28.056683), p(13.848432, 28.053257),
+            p(12.668719, 27.052316), p(12.665265, 27.048304), p(11.655949, 25.876010),
+            p(11.653161, 25.871507), p(10.838614, 24.556092), p(10.836562, 24.551212),
+            p(10.236861, 23.125265), p(10.235593, 23.120123), p(9.865363, 21.617946),
+            p(9.862143, 21.617946), p(8.921454, 21.617946), p(8.921454, 18.393092),
+            p(8.921454, 18.382054), p(8.924674, 18.382054), p(9.865363, 18.382054),
+        });
+    toothed_ring.contour.make_counter_clockwise();
+    toothed_ring.holes.front().make_clockwise();
+
+    const Flow flow(0.4f, 0.2f, 0.4f);
+    const ContinuousFermat::GeneratedPath generated =
+        ContinuousFermat::generate_layer_path_with_metadata({ toothed_ring }, flow, 0.8);
+    const ContinuousFermat::PathValidation validation = ContinuousFermat::validate_layer_path(
+        { toothed_ring }, flow, generated.path, generated.extrusion_multipliers, 0.8);
+    INFO("exact=" << validation.exact_coverage_ratio << " material=" << validation.material_ratio <<
+         " redeposition=" << validation.redeposition_ratio << " reason=" << validation.reason);
+    REQUIRE(validation.ok);
+    REQUIRE(validation.exact_coverage_ratio >= 0.980);
+    REQUIRE(validation.material_ratio >= 0.980);
+    REQUIRE(validation.material_ratio <= 1.020);
+}
+
 TEST_CASE("Continuous Fermat validates a 0.5 mm line on a 0.4 mm nozzle", "[ContinuousFermat][regression]")
 {
     const Flow flow(0.5f, 0.2f, 0.4f);
@@ -618,6 +701,7 @@ TEST_CASE("Continuous Fermat 100-shape eligibility corpus", "[.][ContinuousFerma
 {
     const Flow flow(1.2f, 0.2f, 1.2f);
     size_t accepted = 0;
+    size_t certified = 0;
     std::map<std::string, size_t> rejection_categories;
     for (size_t index = 0; index < 100; ++index) {
         const ExPolygon shape = corpus_shape(index);
@@ -640,13 +724,14 @@ TEST_CASE("Continuous Fermat 100-shape eligibility corpus", "[.][ContinuousFerma
         } else {
             ++rejection_categories["other"];
         }
+        certified += validation.ok;
         if (!validation.ok)
-            std::cout << "corpus_advisory index=" << index << " exact=" << validation.exact_coverage_ratio
+            std::cout << "corpus_quality_failure index=" << index << " exact=" << validation.exact_coverage_ratio
                       << " sampled=" << validation.coverage_ratio << " material=" << validation.material_ratio
                       << " redeposition=" << validation.redeposition_ratio << " crossings=" << validation.crossings
                       << " overlap_pairs=" << validation.bead_overlap_violations << " reason=" << validation.reason << '\n';
     }
-    std::cout << "corpus_100 accepted=" << accepted;
+    std::cout << "corpus_100 accepted=" << accepted << " certified=" << certified;
     for (const auto &[category, count] : rejection_categories)
         std::cout << ' ' << category << '=' << count;
     std::cout << '\n';
@@ -693,6 +778,7 @@ TEST_CASE("Continuous Fermat sharp-point and hole corpus", "[.][ContinuousFermat
     };
     const Flow flow(0.4f, 0.2f, 0.4f);
     size_t accepted = 0;
+    size_t certified = 0;
     size_t evaluated = 0;
     const char *case_filter = std::getenv("CONTINUOUS_FERMAT_SHARP_HOLE_CASE");
     for (const auto &[name, shape] : cases) {
@@ -712,9 +798,12 @@ TEST_CASE("Continuous Fermat sharp-point and hole corpus", "[.][ContinuousFermat
                   << " crossings=" << validation.crossings << " turnbacks=" << validation.turnback_violations
                   << " reason=" << validation.reason << " crossing_detail=" << crossing_detail << '\n';
         accepted += validation.emittable;
+        certified += validation.ok;
     }
-    std::cout << "sharp_hole_corpus accepted=" << accepted << '/' << evaluated << '\n';
+    std::cout << "sharp_hole_corpus accepted=" << accepted << '/' << evaluated
+              << " certified=" << certified << '/' << evaluated << '\n';
     REQUIRE(accepted == evaluated);
+    REQUIRE(certified == evaluated);
 }
 
 TEST_CASE("Continuous Fermat safely rejects an undercovered size phase", "[ContinuousFermat][unsupported]")

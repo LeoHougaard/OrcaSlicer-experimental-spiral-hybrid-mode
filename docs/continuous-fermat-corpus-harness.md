@@ -46,9 +46,9 @@ Important variables:
 | `CONTINUOUS_FERMAT_CORPUS_PROGRESS_EVERY` | `1` | Print progress every N layers; `0` disables console progress |
 | `CONTINUOUS_FERMAT_CORPUS_LAYER_BUDGET_MS` | `0` | Optional per-layer elapsed budget; `0` disables it |
 | `CONTINUOUS_FERMAT_CORPUS_MODEL_BUDGET_MS` | `0` | Optional per-model elapsed budget; `0` disables it |
-| `CONTINUOUS_FERMAT_CORPUS_REQUIRE_ALL` | `false` | Make the Catch test fail if any eligible layer fails |
+| `CONTINUOUS_FERMAT_CORPUS_REQUIRE_ALL` | `false` | Fail on any uncertified eligible layer, elapsed-budget failure, or harness error |
 
-For discovery, leave `REQUIRE_ALL` false so every model is measured even when failures are expected. For a certification run, set it to `true`. This fails when an eligible layer is not structurally emittable and on harness errors such as import failures or the layer cap. A geometrically imperfect but emittable layer has `passed=true`, `quality_ok=false`, and an `advisory_*` category. Topology-ineligible models are reported separately.
+For discovery, leave `REQUIRE_ALL` false so every model is measured even when failures are expected. For a certification run, set it to `true`. This fails when an eligible layer misses any fixed quality target, when an elapsed budget is exceeded, or on harness errors such as import failures or the layer cap. `emittable` records the narrower structural result; `passed` and `quality_ok` both record complete certification. Topology-ineligible models are reported separately.
 
 ## Eligibility and results
 
@@ -60,6 +60,35 @@ The JSONL stream writes and flushes `model_start` immediately and a complete lay
 
 Elapsed budgets are discovery controls rather than printer-safety thresholds. When a layer exceeds its budget it is recorded as `layer_budget_exceeded`; when the model budget is exhausted, the current and remaining layers are recorded as `model_budget_exceeded` without beginning more Fermat work. The core generator has no cancellation callback, so a budget is checked immediately before and after each in-process generation/validation call rather than forcibly terminating C++ in the middle of a geometry operation. Use an outer process watchdog as well when investigating a suspected single-call deadlock.
 
-Eligible layers record generation, independent post-validation, and complete layer elapsed time, path size, structural emittability, `quality_ok`, exact and physical coverage, material and redeposition ratios, containment, crossing, spacing, bead-overlap, turnback counts, and the 2.5-line-width thin-feature category. Stable advisory and failure categories make results groupable without parsing English diagnostics. Model summaries additionally record import, mesh slicing, total elapsed time, unique geometries, cache hits, and whether all layers met the quality targets.
+Eligible layers record generation, independent post-validation, and complete layer elapsed time, path size, structural emittability, `quality_ok`, exact and physical coverage, material and redeposition ratios, containment, crossing, spacing, bead-overlap, turnback counts, and the 2.5-line-width thin-feature category. Stable failure categories make results groupable without parsing English diagnostics. Model summaries additionally record import, mesh slicing, total elapsed time, unique geometries, cache hits, and whether all layers met the quality targets.
 
 For a 1,000-model corpus, run separate shard processes with distinct output prefixes. Do not point simultaneous processes at the same output prefix.
+
+## Repository benchmark
+
+`tools/continuous_fermat/corpus/benchmark20.tsv` freezes a 20-model promotion
+set selected from the eligible Thingi10K pool. It is balanced across short and
+tall models, with and without holes. The adjacent
+`benchmark20-provenance.tsv` records license, face count, layer count, hole
+count, and the normalized mesh hash. The model files themselves remain under
+the ignored `sandboxes/continuous_fermat_corpus` directory.
+
+Run it with the standard 0.4 mm profile and no elapsed budget:
+
+```powershell
+$env:CONTINUOUS_FERMAT_CORPUS_MANIFEST = `
+    (Resolve-Path 'tools/continuous_fermat/corpus/benchmark20.tsv').Path
+$env:CONTINUOUS_FERMAT_CORPUS_OUTPUT = `
+    (Join-Path (Resolve-Path 'sandboxes/continuous_fermat_corpus/runs').Path 'benchmark20-run')
+$env:CONTINUOUS_FERMAT_CORPUS_LINE_WIDTH = '0.40'
+$env:CONTINUOUS_FERMAT_CORPUS_NOZZLE = '0.40'
+$env:CONTINUOUS_FERMAT_CORPUS_MAX_LINE_WIDTH = '0.80'
+$env:CONTINUOUS_FERMAT_CORPUS_DEDUPLICATE_LAYERS = '1'
+$env:CONTINUOUS_FERMAT_CORPUS_LAYER_BUDGET_MS = '0'
+$env:CONTINUOUS_FERMAT_CORPUS_MODEL_BUDGET_MS = '0'
+$env:CONTINUOUS_FERMAT_CORPUS_REQUIRE_ALL = '0'
+& .\build-cert\tests\libslic3r\Release\libslic3r_tests.exe '[internet-corpus]'
+```
+
+Keep `REQUIRE_ALL` disabled during failure discovery so all categories are
+measured. Enable it only when every eligible layer is expected to pass.

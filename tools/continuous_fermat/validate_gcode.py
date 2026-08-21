@@ -6,10 +6,11 @@ the marked paths. It supports explicit ``marlin2`` and ``klipper`` contracts;
 their G90/G91 interaction with the independently tracked E mode is modeled
 separately.
 
-A passing file has closed, continuously extruding marked strokes. Between two
-marked strokes, only a finite positive Z transition followed by at most one
-non-extruding linear XY approach is accepted. Positive-E XY moves outside the
-markers are rejected; a reviewed
+A passing file has one continuously extruding cyclic stroke per layer. After
+the first flat stroke, each section begins exactly where the preceding one
+ended and raises Z through a shallow positive-E XYZ scarf at the front of the
+next cycle. No motion is accepted between marked strokes. Positive-E XY moves
+outside the markers are rejected; a reviewed
 purge in start G-code can be opted in explicitly, but the exception never
 applies between sections or after the first section.
 """
@@ -27,6 +28,7 @@ from typing import Iterable
 
 BEGIN_MARKER = ";_CONTINUOUS_FERMAT_BEGIN"
 END_MARKER = ";_CONTINUOUS_FERMAT_END"
+VALIDATION_WARNING_MARKER = ";_CONTINUOUS_FERMAT_VALIDATION_WARNING"
 LAYER_MARKERS = {"CHANGE_LAYER", "LAYER_CHANGE"}
 MOTION_COMMANDS = {"G0", "G1", "G2", "G3"}
 UNMODELED_EXTRUSION_COMMANDS = {"G5", "G6"}
@@ -149,6 +151,9 @@ class SectionState:
     start_xy: tuple[float, float] | None
     start_z: float | None
     previous_extrusion_end: tuple[float, float] | None = None
+    first_extrusion_end: tuple[float, float] | None = None
+    saw_z_extrusion: bool = False
+    ramp_finished: bool = False
     extrusion_moves: int = 0
 
 
@@ -378,11 +383,10 @@ def validate_transition(
     xy_tolerance: float,
     z_tolerance: float,
 ) -> None:
-    """Validate the buffered commands between two completed sections."""
+    """Require adjacent marked strokes to meet with no intervening motion."""
 
-    if len(pending.xy_lines) > 1:
-        for line_no in pending.xy_lines[1:]:
-            result.fail(line_no, "more than one XY approach move between Continuous Fermat sections")
+    for line_no in pending.xy_lines:
+        result.fail(line_no, "XY motion is not allowed between continuously extruded layer sections")
     for line_no, delta in pending.e_moves:
         kind = "retraction" if delta < 0.0 else "extrusion/unretraction"
         result.fail(line_no, f"unmarked {kind} between Continuous Fermat sections (delta E={delta:.9g})")
@@ -393,29 +397,19 @@ def validate_transition(
     for line_no, command in pending.disruptive_lines:
         result.fail(line_no, f"{command} is not allowed between Continuous Fermat sections")
 
-    positive_z_moves = 0
     for line_no, delta in pending.z_words:
         if delta is None:
-            result.fail(line_no, "Z transition starts from an unknown or non-finite position")
-        elif delta < -z_tolerance:
-            result.fail(line_no, f"non-positive Z transition ({delta:.9g} mm) between Continuous Fermat sections")
-        elif delta > z_tolerance:
-            positive_z_moves += 1
+            result.fail(line_no, "Z motion between sections starts from an unknown or non-finite position")
+        elif abs(delta) > z_tolerance:
+            result.fail(line_no, f"Z motion ({delta:.9g} mm) is not allowed between Continuous Fermat sections")
 
     source_z = pending.source.end_z
     target_z = state.z
     z_delta = None if source_z is None or target_z is None else target_z - source_z
-    if positive_z_moves == 0:
-        result.fail(next_section.start_line, "missing positive Z transition between Continuous Fermat sections")
     if z_delta is None:
         result.fail(next_section.start_line, "cannot compare section Z endpoints because a Z position is unknown")
-    elif not math.isfinite(z_delta) or z_delta <= z_tolerance:
-        result.fail(next_section.start_line, f"section Z did not increase across transition (delta {z_delta:.9g} mm)")
-
-    if pending.xy_lines:
-        positive_z_lines = [line_no for line_no, delta in pending.z_words if delta is not None and delta > z_tolerance]
-        if not positive_z_lines or pending.xy_lines[0] <= max(positive_z_lines):
-            result.fail(pending.xy_lines[0], "inter-layer XY approach must occur after the positive Z transition")
+    elif not math.isfinite(z_delta) or abs(z_delta) > z_tolerance:
+        result.fail(next_section.start_line, f"section start is discontinuous in Z by {z_delta:.9g} mm")
 
     source_xy = pending.source.end_xy
     target_xy = xy_position(state)
@@ -424,6 +418,8 @@ def validate_transition(
         result.fail(next_section.start_line, "cannot compare adjacent section endpoints because XY is unknown")
     else:
         endpoint_gap = xy_distance(source_xy, target_xy)
+        if endpoint_gap > xy_tolerance:
+            result.fail(next_section.start_line, f"adjacent section endpoint gap {endpoint_gap:.6f} mm exceeds tolerance")
 
     result.transitions.append(
         TransitionRecord(
@@ -522,6 +518,11 @@ def validate_lines(
             layer_lines[current_layer] = line_no
 
         marker = f";{comment}" if comment is not None else ""
+        if marker.startswith(VALIDATION_WARNING_MARKER):
+            result.fail(
+                line_no,
+                "Continuous Fermat geometric safety certification failed; warning-marked G-code is diagnostic only",
+            )
         if marker == BEGIN_MARKER:
             if code:
                 result.fail(line_no, "Continuous Fermat begin marker must be on a standalone comment line")
@@ -597,6 +598,13 @@ def validate_lines(
                 result.fail(line_no, "cannot verify section closure because an XY endpoint is unknown")
             else:
                 closure_gap = xy_distance(section.start_xy, end_xy)
+                # A changing cross-section may need one short connector from
+                # the preceding seam to the newly rotated cycle. In that form
+                # the first extrusion endpoint is the cycle seam and must be
+                # where the section ends. The C++ emitter independently bounds
+                # that connector to 2.5 bead widths.
+                if section.first_extrusion_end is not None:
+                    closure_gap = min(closure_gap, xy_distance(section.first_extrusion_end, end_xy))
                 if closure_gap > xy_tolerance:
                     result.fail(line_no, f"Continuous Fermat section endpoint gap {closure_gap:.6f} mm exceeds tolerance")
 
@@ -606,8 +614,13 @@ def validate_lines(
                 if section.start_z <= z_tolerance:
                     result.fail(line_no, f"Continuous Fermat section Z must be positive, got {section.start_z:.9g} mm")
                 section_z_delta = state.z - section.start_z
-                if abs(section_z_delta) > z_tolerance:
-                    result.fail(line_no, f"Continuous Fermat section changed Z by {section_z_delta:.9g} mm")
+                if section.index == 1:
+                    if abs(section_z_delta) > z_tolerance:
+                        result.fail(line_no, f"first Continuous Fermat section changed Z by {section_z_delta:.9g} mm")
+                elif not section.saw_z_extrusion or section_z_delta <= z_tolerance:
+                    result.fail(line_no, f"Continuous Fermat scarf did not raise Z positively ({section_z_delta:.9g} mm)")
+                if section.index > 1 and result.transitions:
+                    result.transitions[-1].z_delta = section_z_delta
 
             record = SectionRecord(
                 index=section.index,
@@ -985,7 +998,21 @@ def validate_lines(
                 if not ({"I", "J", "R"} & words.keys()):
                     result.fail(line_no, "arc inside Continuous Fermat section has no I/J/R geometry")
             if has_z_motion:
-                result.fail(line_no, "Z motion inside Continuous Fermat section")
+                if section.index == 1:
+                    result.fail(line_no, "first Continuous Fermat section must remain at constant Z")
+                if not has_xy_motion or de <= e_tolerance:
+                    result.fail(line_no, "inter-layer Z scarf must be a positive-E XY extrusion move")
+                if z_delta is None or z_delta <= z_tolerance:
+                    result.fail(line_no, "inter-layer Z scarf must increase Z monotonically")
+                elif has_known_xy:
+                    xy_length = xy_distance(start_xy, end_xy)
+                    if z_delta > 0.051 * xy_length + z_tolerance:
+                        result.fail(line_no, "inter-layer Z scarf is steeper than the certified 20:1 slope")
+                if section.ramp_finished:
+                    result.fail(line_no, "inter-layer Z scarf resumed after the section reached flat-layer extrusion")
+                section.saw_z_extrusion = True
+            elif has_xy_motion and section.saw_z_extrusion:
+                section.ramp_finished = True
 
             if "E" in words and abs(de) > e_tolerance and not has_xy_motion:
                 result.fail(line_no, "E-only extrusion/retract inside Continuous Fermat section")
@@ -1012,6 +1039,8 @@ def validate_lines(
                     if not has_known_xy:
                         result.fail(line_no, "extrusion move starts from unknown XY position")
                     else:
+                        if section.first_extrusion_end is None:
+                            section.first_extrusion_end = end_xy
                         if section.previous_extrusion_end is not None:
                             gap = xy_distance(section.previous_extrusion_end, start_xy)
                             if gap > xy_tolerance:

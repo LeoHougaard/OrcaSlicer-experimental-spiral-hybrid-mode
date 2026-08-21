@@ -29,12 +29,13 @@ Use `--firmware klipper` for Klipper output. `--allow-unknown-counts` is diagnos
 The auditor requires firmware-correct absolute XYZ, relative E, unity speed/flow overrides, disabled pressure advance, all-axis homing, and heater-ready state. It checks:
 
 - balanced standalone section markers and exact layer/section counts;
-- finite coordinates, positive feed, and positive constant Z in each section;
-- strictly positive E on every in-section XY move;
-- no travel, retract, Z, arc, reset, or disruptive modal change inside a section;
-- closed section endpoints;
+- rejection of `_CONTINUOUS_FERMAT_VALIDATION_WARNING` diagnostic artifacts;
+- finite coordinates and positive feed; the first section stays flat and every later section raises Z monotonically through its opening scarf;
+- strictly positive E on every in-section XY/XYZ move;
+- no travel, retract, arc, reset, or disruptive modal change inside a section;
+- cyclic XY closure, including the bounded one-segment connector form used for changing cross-sections;
 - no unmarked model extrusion;
-- between sections, one positive Z move followed by at most one non-extruding linear XY approach;
+- no motion between sections; every section after the first starts at the previous XYZ endpoint and raises Z through a monotonic positive-E scarf no steeper than 20:1;
 - after the final section, at most one bounded positive Z lift and only allowlisted shutdown commands.
 
 The optional `--allow-unmarked-before-first-section` switch exists for reviewing historical files with a purge before the first marked section. It never permits unmarked extrusion between or after sections.

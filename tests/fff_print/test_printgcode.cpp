@@ -13,6 +13,7 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/SlicesToTriangleMesh.hpp"
 
 #include "test_data.hpp"
 
@@ -197,7 +198,7 @@ TEST_CASE("Continuous slicing permits validated printer-ready G-code export", "[
     std::remove(preview_path.c_str());
 }
 
-TEST_CASE("Continuous slicing exports structurally valid paths with geometric warnings", "[PrintGCode][continuous][advisory]")
+TEST_CASE("Continuous slicing restricts geometric failures to research preview", "[PrintGCode][continuous][safety]")
 {
     DynamicPrintConfig config = strict_continuous_export_config();
     Print print;
@@ -211,13 +212,24 @@ TEST_CASE("Continuous slicing exports structurally valid paths with geometric wa
     REQUIRE_NOTHROW(print.process());
 
     const std::string path = boost::filesystem::unique_path().string();
-    REQUIRE_NOTHROW(print.export_gcode(path, nullptr, nullptr));
-    std::ifstream input(path, std::ios::binary);
-    const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    CHECK(contents.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING") != std::string::npos);
-    CHECK(contents.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
-    CHECK(contents.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
-    std::remove(path.c_str());
+    REQUIRE_THROWS_WITH(
+        print.export_gcode(path, nullptr, nullptr),
+        Catch::Matchers::ContainsSubstring("failed geometric safety certification"));
+    CHECK_FALSE(boost::filesystem::exists(path));
+
+    REQUIRE_NOTHROW(print.export_gcode(
+        path,
+        nullptr,
+        nullptr,
+        GCodeExportPurpose::ContinuousResearchPreview));
+    {
+        std::ifstream input(path, std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        CHECK(contents.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING") != std::string::npos);
+        CHECK(contents.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+        CHECK(contents.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
+    }
+    REQUIRE(std::remove(path.c_str()) == 0);
 }
 
 TEST_CASE("Continuous slicing ignores a wider first-layer line on a 0.4 mm nozzle", "[PrintGCode][continuous][regression]")
@@ -257,7 +269,159 @@ TEST_CASE("Continuous slicing processes a hole-free cylindrical prism", "[PrintG
     REQUIRE(std::count(gcode.begin(), gcode.end(), '\n') > 3);
 }
 
-TEST_CASE("Continuous slicing processes an overlapping pyramid cross-section", "[PrintGCode][continuous][regression]")
+TEST_CASE("Continuous slicing keeps extrusion active through changing cross-sections", "[PrintGCode][continuous][scarf]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    Print print;
+    Model model;
+    std::vector<ExPolygons> slices;
+    slices.reserve(10);
+    for (size_t layer = 0; layer < 10; ++layer) {
+        const double inset = 0.10 * double(layer);
+        const double shift = 0.05 * double(layer);
+        slices.emplace_back(ExPolygons { ExPolygon({
+            Point::new_scale(-20.0 + inset + shift, -20.0 + inset),
+            Point::new_scale( 20.0 - inset + shift, -20.0 + inset),
+            Point::new_scale( 20.0 - inset + shift,  20.0 - inset),
+            Point::new_scale(-20.0 + inset + shift,  20.0 - inset),
+        }) });
+    }
+    ModelObject *object = model.add_object();
+    object->name = "continuous-test-changing-cross-sections.stl";
+    object->add_volume(TriangleMesh(slices_to_mesh(slices, 0.0, 0.2, 0.2)));
+    ModelInstance *instance = object->add_instance();
+    instance->set_offset(Vec3d(60.0, 60.0, 0.0));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.enable_continuous_slicing_development_export_for_tests();
+
+    REQUIRE(print.validate().string.empty());
+    const std::string gcode = Test::gcode(print);
+    size_t sections = 0;
+    size_t scarf_moves = 0;
+    bool inside = false;
+    std::istringstream stream(gcode);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line == ";_CONTINUOUS_FERMAT_BEGIN") {
+            inside = true;
+            ++sections;
+        } else if (line == ";_CONTINUOUS_FERMAT_END") {
+            inside = false;
+        } else if (inside && line.rfind("G1 ", 0) == 0) {
+            const std::string code = line.substr(0, line.find(';'));
+            if (code.find(" X") != std::string::npos && code.find(" Y") != std::string::npos &&
+                code.find(" Z") != std::string::npos && code.find(" E") != std::string::npos)
+                ++scarf_moves;
+        }
+    }
+    REQUIRE_FALSE(inside);
+    REQUIRE(sections == 10);
+    REQUIRE(scarf_moves > 0);
+    CHECK(gcode.find("continuous slicing inter-layer approach") == std::string::npos);
+    CHECK(gcode.find("continuous slicing Z-only layer change") == std::string::npos);
+}
+
+TEST_CASE("Continuous slicing exports an internet corpus model", "[PrintGCode][continuous][continuous-internet-gcode][.]")
+{
+    const char *model_path = std::getenv("CONTINUOUS_FERMAT_GCODE_MODEL");
+    const char *output_path = std::getenv("CONTINUOUS_FERMAT_GCODE_OUTPUT");
+    if (model_path == nullptr || *model_path == '\0' || output_path == nullptr || *output_path == '\0')
+        SKIP("set CONTINUOUS_FERMAT_GCODE_MODEL and CONTINUOUS_FERMAT_GCODE_OUTPUT");
+
+    Model imported = Model::read_from_file(
+        model_path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::Silence);
+    TriangleMesh mesh = imported.mesh();
+    REQUIRE_FALSE(mesh.empty());
+    const BoundingBoxf3 bounds = mesh.bounding_box();
+    REQUIRE(bounds.defined);
+    mesh.translate(float(-bounds.min.x()), float(-bounds.min.y()), float(-bounds.min.z()));
+
+    DynamicPrintConfig config = strict_continuous_export_config();
+    config.set_deserialize_strict("nozzle_diameter", "0.4");
+    config.set("outer_wall_line_width", 0.4);
+    config.set("initial_layer_line_width", 0.4);
+    config.set("continuous_max_line_width", 0.8);
+
+    Print print;
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = model_path;
+    object->add_volume(std::move(mesh));
+    ModelInstance *instance = object->add_instance();
+    instance->set_offset(Vec3d(20.0, 20.0, 0.0));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+
+    REQUIRE(print.validate().string.empty());
+    print.set_status_silent();
+    REQUIRE_NOTHROW(print.process());
+    REQUIRE_NOTHROW(print.export_gcode(output_path, nullptr, nullptr));
+    CHECK_FALSE(boost::filesystem::exists(std::string(output_path) + ".tmp"));
+}
+
+TEST_CASE("Continuous slicing uses certified paths for a two-hole topology", "[PrintGCode][continuous][safety]")
+{
+    const auto point = [](const double x, const double y) { return Point::new_scale(x, y); };
+    const auto clockwise_circle = [&point](const double radius, const Point &center) {
+        Points points;
+        points.reserve(64);
+        for (size_t i = 0; i < 64; ++i) {
+            const double angle = -2.0 * PI * double(i) / 64.0;
+            points.emplace_back(point(
+                unscale<double>(center.x()) + radius * std::cos(angle),
+                unscale<double>(center.y()) + radius * std::sin(angle)));
+        }
+        return points;
+    };
+    ExPolygon two_holes({
+        point(-56.0, -34.0),
+        point( 56.0, -34.0),
+        point( 56.0,  34.0),
+        point(-56.0,  34.0),
+    });
+    two_holes.holes.emplace_back(clockwise_circle(10.0, point(-21.0, 0.0)));
+    two_holes.holes.emplace_back(clockwise_circle(10.0, point( 21.0, 0.0)));
+    const std::vector<ExPolygons> slices(3, ExPolygons { two_holes });
+
+    DynamicPrintConfig config = strict_continuous_export_config();
+    Print print;
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "continuous-test-two-holes.stl";
+    object->add_volume(TriangleMesh(slices_to_mesh(slices, 0.0, 0.2, 0.2)));
+    ModelInstance *instance = object->add_instance();
+    instance->set_offset(Vec3d(100.0, 100.0, 0.0));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+
+    REQUIRE(print.validate().string.empty());
+    print.set_status_silent();
+    print.process();
+
+    REQUIRE(print.objects().size() == 1);
+    REQUIRE(print.objects().front()->layers().size() == 3);
+    for (const Layer *layer : print.objects().front()->layers()) {
+        REQUIRE(layer->regions().size() == 1);
+        const ExtrusionEntityCollection &perimeters = layer->regions().front()->perimeters;
+        REQUIRE(perimeters.entities.size() == 1);
+        const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(perimeters.entities.front());
+        REQUIRE(collection != nullptr);
+        REQUIRE(collection->entities.size() == 1);
+        const auto *path = dynamic_cast<const ExtrusionPath *>(collection->entities.front());
+        REQUIRE(path != nullptr);
+        REQUIRE(path->is_continuous_fermat());
+        REQUIRE(path->continuous_fermat_validation_warning.empty());
+    }
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(std::count(gcode.begin(), gcode.end(), '\n') > 3);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING") == std::string::npos);
+}
+
+TEST_CASE("Continuous slicing rejects an uncertified pyramid at serialization", "[PrintGCode][continuous][regression]")
 {
     DynamicPrintConfig config = strict_continuous_export_config();
     Print print;
@@ -273,9 +437,22 @@ TEST_CASE("Continuous slicing processes an overlapping pyramid cross-section", "
     print.enable_continuous_slicing_development_export_for_tests();
 
     REQUIRE(print.validate().string.empty());
-    const std::string gcode = Test::gcode(print);
-    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
-    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
+    print.set_status_silent();
+    REQUIRE_NOTHROW(print.process());
+    const std::string path = boost::filesystem::unique_path().string();
+    REQUIRE_THROWS_WITH(
+        print.export_gcode(path, nullptr, nullptr),
+        Catch::Matchers::ContainsSubstring("failed geometric safety certification"));
+    CHECK_FALSE(boost::filesystem::exists(path));
+    REQUIRE_THROWS_WITH(
+        print.export_gcode(
+            path,
+            nullptr,
+            nullptr,
+            GCodeExportPurpose::ContinuousResearchPreview),
+        Catch::Matchers::ContainsSubstring("serialized material falls outside the mandatory"));
+    CHECK_FALSE(boost::filesystem::exists(path));
+    CHECK_FALSE(boost::filesystem::exists(path + ".tmp"));
 }
 
 TEST_CASE("Cached Continuous Fermat artifacts remain blocked after the mode is disabled", "[PrintGCode][continuous]")
@@ -292,6 +469,16 @@ TEST_CASE("Cached Continuous Fermat artifacts remain blocked after the mode is d
     REQUIRE_THROWS_WITH(
         print.throw_if_continuous_slicing_artifact_blocked(path),
         Catch::Matchers::ContainsSubstring("cached/imported Continuous Fermat G-code is intentionally disabled"));
+    print.enable_continuous_slicing_development_export_for_tests();
+    CHECK_NOTHROW(print.throw_if_continuous_slicing_artifact_blocked(path));
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::app);
+        REQUIRE(output.is_open());
+        output << ";_CONTINUOUS_FERMAT_VALIDATION_WARNING layer=0 exact_coverage=0.97<0.98\n";
+    }
+    REQUIRE_THROWS_WITH(
+        print.throw_if_continuous_slicing_artifact_blocked(path),
+        Catch::Matchers::ContainsSubstring("geometric safety certification failures is disabled"));
     std::remove(path.c_str());
 }
 
@@ -322,7 +509,8 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
     size_t layer_count = 0;
     bool inside = false;
     bool after_section = false;
-    bool saw_z_transition = false;
+    bool saw_scarf_z_extrusion = false;
+    bool saw_unmarked_z_motion = false;
     bool saw_forbidden_transition_command = false;
     double current_x = std::numeric_limits<double>::quiet_NaN();
     double current_y = std::numeric_limits<double>::quiet_NaN();
@@ -345,7 +533,7 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
             ++layer_count;
         if (line == ";_CONTINUOUS_FERMAT_BEGIN") {
             if (after_section) {
-                CHECK(saw_z_transition);
+                CHECK_FALSE(saw_unmarked_z_motion);
                 CHECK_FALSE(saw_forbidden_transition_command);
             }
             REQUIRE(std::isfinite(current_x));
@@ -359,7 +547,8 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
             section_extrusion_moves = 0;
             inside = true;
             after_section = false;
-            saw_z_transition = false;
+            saw_scarf_z_extrusion = false;
+            saw_unmarked_z_motion = false;
             saw_forbidden_transition_command = false;
             ++begin_count;
             continue;
@@ -369,7 +558,13 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
             REQUIRE(section_extrusion_moves > 0);
             CHECK(current_x == section_start_x);
             CHECK(current_y == section_start_y);
-            CHECK(current_z == section_start_z);
+            if (begin_count == 1) {
+                CHECK(current_z == section_start_z);
+                CHECK_FALSE(saw_scarf_z_extrusion);
+            } else {
+                CHECK(current_z - section_start_z == Catch::Approx(0.2).margin(0.001));
+                CHECK(saw_scarf_z_extrusion);
+            }
             CHECK(section_volume / expected_layer_volume >= 0.980);
             CHECK(section_volume / expected_layer_volume <= 1.020);
             inside = false;
@@ -398,7 +593,6 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
             CHECK_FALSE(g0);
             CHECK(code.rfind("G2 ", 0) != 0);
             CHECK(code.rfind("G3 ", 0) != 0);
-            CHECK_FALSE(has_z);
             if (g1 && (has_x || has_y)) {
                 REQUIRE(has_e);
                 REQUIRE(words.count('E') == 1);
@@ -409,7 +603,16 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
                 REQUIRE(std::isfinite(next_x));
                 REQUIRE(std::isfinite(next_y));
                 REQUIRE(std::isfinite(current_f));
-                const double length = std::hypot(next_x - current_x, next_y - current_y);
+                if (has_z) {
+                    CHECK(begin_count > 1);
+                    CHECK(next_z > current_z);
+                    CHECK(next_z - current_z <=
+                          0.051 * std::hypot(next_x - current_x, next_y - current_y) + 1e-6);
+                    saw_scarf_z_extrusion = true;
+                }
+                const double length = std::hypot(
+                    std::hypot(next_x - current_x, next_y - current_y),
+                    next_z - current_z);
                 INFO("section=" << begin_count << " line='" << line << "' start=" << current_x << "," << current_y <<
                      " end=" << next_x << "," << next_y << " F=" << current_f);
                 REQUIRE(length > 0.0);
@@ -420,10 +623,11 @@ TEST_CASE("Continuous slicing export preserves the serialized section contract",
                 ++section_extrusion_moves;
             } else if (g1) {
                 CHECK_FALSE(has_e);
+                CHECK_FALSE(has_z);
             }
         } else if (after_section) {
             if ((g0 || g1) && has_z && !has_x && !has_y && !has_e)
-                saw_z_transition = true;
+                saw_unmarked_z_motion = true;
             const bool forbidden_motion = (g0 || g1) && (has_x || has_y || has_e);
             saw_forbidden_transition_command |= forbidden_motion ||
                 code.rfind("G10", 0) == 0 || code.rfind("G11", 0) == 0 || code.rfind("G92", 0) == 0;
@@ -643,7 +847,56 @@ TEST_CASE("Continuous slicing first approach cannot Z-hop above the height limit
     CHECK(max_motion_z <= 0.7 + 1e-9);
 }
 
-TEST_CASE("Continuous slicing reports finite serialized layer material deviations", "[PrintGCode][continuous][advisory]")
+TEST_CASE("Continuous slicing merges sub-resolution segments before serialization", "[PrintGCode][continuous][regression]")
+{
+    DynamicPrintConfig config = strict_continuous_export_config();
+    Print print;
+    Model model;
+    apply_continuous_prism(print, model, config);
+    REQUIRE(print.validate().string.empty());
+    print.process();
+
+    LayerRegion *region = print.objects().front()->layers().front()->regions().front();
+    REQUIRE(region->perimeters.entities.size() == 1);
+    auto *collection = dynamic_cast<ExtrusionEntityCollection *>(region->perimeters.entities.front());
+    REQUIRE(collection != nullptr);
+    REQUIRE(collection->entities.size() == 1);
+    auto *path = dynamic_cast<ExtrusionPath *>(collection->entities.front());
+    REQUIRE(path != nullptr);
+    REQUIRE(path->is_continuous_fermat());
+
+    const auto serialized_coordinate = [](const coord_t value) {
+        return std::llround(unscale<double>(value) * 1000.0);
+    };
+    size_t segment = 0;
+    Point inserted;
+    bool found = false;
+    for (; segment + 1 < path->polyline.points.size(); ++segment) {
+        const Point &a = path->polyline.points[segment];
+        const Point &b = path->polyline.points[segment + 1];
+        inserted = Point(
+            a.x() + (b.x() > a.x() ? 1 : b.x() < a.x() ? -1 : 0),
+            a.y() + (b.y() > a.y() ? 1 : b.y() < a.y() ? -1 : 0));
+        if (inserted != a &&
+            serialized_coordinate(inserted.x()) == serialized_coordinate(a.x()) &&
+            serialized_coordinate(inserted.y()) == serialized_coordinate(a.y())) {
+            found = true;
+            break;
+        }
+    }
+    REQUIRE(found);
+    REQUIRE(path->continuous_fermat_extrusion_multipliers.size() + 1 == path->polyline.points.size());
+    const float multiplier = path->continuous_fermat_extrusion_multipliers[segment];
+    path->polyline.points.insert(path->polyline.points.begin() + segment + 1, inserted);
+    path->continuous_fermat_extrusion_multipliers.insert(
+        path->continuous_fermat_extrusion_multipliers.begin() + segment + 1, multiplier);
+
+    const std::string gcode = Test::gcode(print);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_BEGIN") != std::string::npos);
+    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
+}
+
+TEST_CASE("Continuous slicing rejects serialized layer material deviations", "[PrintGCode][continuous][safety]")
 {
     DynamicPrintConfig config = strict_continuous_export_config();
     Print print;
@@ -665,9 +918,9 @@ TEST_CASE("Continuous slicing reports finite serialized layer material deviation
         path->continuous_fermat_extrusion_multipliers.end(),
         0.85f);
 
-    const std::string gcode = Test::gcode(print);
-    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_VALIDATION_WARNING serialized_material_ratio=") != std::string::npos);
-    REQUIRE(gcode.find(";_CONTINUOUS_FERMAT_END") != std::string::npos);
+    REQUIRE_THROWS_WITH(
+        Test::gcode(print),
+        Catch::Matchers::ContainsSubstring("serialized material falls outside the mandatory"));
 }
 
 SCENARIO( "PrintGCode basic functionality", "[PrintGCode][.]") {
